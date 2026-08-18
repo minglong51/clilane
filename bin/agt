@@ -1,0 +1,1223 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import base64
+import fcntl
+import hashlib
+import json
+import os
+import re
+import select
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import uuid
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import BinaryIO, Iterator, Sequence
+
+
+SOCKET = os.environ.get("AGT_TMUX_SOCKET", "agt")
+SESSION_PREFIX = "agt_"
+SERVER_TAG = "agt-v1"
+FIELD_SEPARATOR = "\x1f"
+NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+ENV_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+TRANSIENT_ENV = {
+    "OLDPWD",
+    "PWD",
+    "SHLVL",
+    "TERM",
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "TMUX",
+    "TMUX_PANE",
+    "_",
+}
+TMUX_ENV_KEYS = {
+    "COLORTERM",
+    "HOME",
+    "LANG",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "TERM",
+    "TMPDIR",
+    "TMUX_TMPDIR",
+    "USER",
+}
+LOG_MAX_BYTES = 50 * 1024 * 1024
+
+
+class AgtError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class Task:
+    session: str
+    pane: str
+    id: str
+    name: str
+    command: list[str]
+    cwd: str
+    created: str
+    log: str
+    committed: bool
+    process_started: str | None
+    stop_requested: bool
+    dead: bool
+    exit_code: int | None
+    signal_name: str | None
+    pid: int | None
+    attached: bool
+
+    @property
+    def state(self) -> str:
+        if not self.committed:
+            return "initializing"
+        if not self.dead:
+            return "running"
+        if self.stop_requested:
+            return "stopped"
+        if self.signal_name:
+            return "failed"
+        if self.exit_code == 0:
+            return "succeeded"
+        return "failed"
+
+    @property
+    def result_code(self) -> int:
+        if self.signal_name:
+            number = getattr(signal, self.signal_name, None)
+            if isinstance(number, int):
+                return 128 + number
+            return 1
+        return self.exit_code if self.exit_code is not None else 1
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "state": self.state,
+            "command": self.command,
+            "cwd": self.cwd,
+            "created": self.created,
+            "log": self.log,
+            "pid": self.pid if not self.dead else None,
+            "attached": self.attached,
+            "exit_code": self.exit_code if self.dead else None,
+            "signal": self.signal_name if self.dead else None,
+        }
+
+
+def tmux_binary() -> str:
+    binary = shutil.which("tmux")
+    if not binary:
+        raise AgtError("tmux is required")
+    return binary
+
+
+def tmux_client_environment() -> dict[str, str]:
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key in TMUX_ENV_KEYS or key.startswith("LC_")
+    }
+
+
+def tmux(
+    arguments: Sequence[str],
+    *,
+    input_data: bytes | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[bytes]:
+    completed = subprocess.run(
+        [tmux_binary(), "-L", SOCKET, "-f", "/dev/null", *arguments],
+        input=input_data,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=tmux_client_environment(),
+        check=False,
+    )
+    if check and completed.returncode != 0:
+        detail = completed.stderr.decode(errors="replace").strip()
+        raise AgtError(detail or f"tmux exited {completed.returncode}")
+    return completed
+
+
+def tmux_server_absent(completed: subprocess.CompletedProcess[bytes]) -> bool:
+    detail = completed.stderr.decode(errors="replace").lower()
+    return "no server running" in detail or (
+        "error connecting to " in detail and "no such file or directory" in detail
+    )
+
+
+def state_root() -> Path:
+    configured = os.environ.get("AGT_STATE_HOME")
+    if configured:
+        root = Path(configured).expanduser()
+    elif os.environ.get("XDG_STATE_HOME"):
+        root = Path(os.environ["XDG_STATE_HOME"]).expanduser() / "agt"
+    else:
+        root = Path.home() / ".local" / "state" / "agt"
+    if not root.is_absolute():
+        raise AgtError("AGT_STATE_HOME and XDG_STATE_HOME must be absolute")
+    root = root.resolve()
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return root
+
+
+def control_root() -> Path:
+    root = (Path.home() / ".local" / "state" / "agt" / "control").resolve()
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(root, 0o700)
+    return root
+
+
+@contextmanager
+def registry_lock() -> Iterator[None]:
+    digest = hashlib.sha256(SOCKET.encode()).hexdigest()[:16]
+    path = control_root() / f"{digest}.lock"
+    with path.open("a+b") as handle:
+        os.chmod(path, 0o600)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def acquire_task_lock(task_id: str, exclusive: bool) -> BinaryIO:
+    digest = hashlib.sha256(task_id.encode()).hexdigest()
+    path = control_root() / f"task-{digest}.lock"
+    handle = path.open("a+b")
+    os.chmod(path, 0o600)
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+    return handle
+
+
+def release_task_lock(handle: BinaryIO) -> None:
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
+def validated_log_path(task: Task) -> Path:
+    expected = (state_root() / "logs" / f"{task.id}.log").resolve()
+    actual = Path(task.log).expanduser().resolve()
+    if actual != expected:
+        raise AgtError(f"refusing unexpected log path for {task.name}")
+    return actual
+
+
+def encode_meta(meta: dict[str, object]) -> str:
+    raw = json.dumps(meta, separators=(",", ":"), ensure_ascii=False).encode()
+    return base64.urlsafe_b64encode(raw).decode()
+
+
+def decode_meta(value: str) -> dict[str, object]:
+    try:
+        raw = base64.urlsafe_b64decode(value.encode())
+        decoded = json.loads(raw)
+    except (ValueError, json.JSONDecodeError) as error:
+        raise AgtError("corrupt task metadata") from error
+    if not isinstance(decoded, dict):
+        raise AgtError("corrupt task metadata")
+    return decoded
+
+
+def encode_command(command: Sequence[str]) -> str:
+    return encode_meta({"command": list(command)})
+
+
+def decode_command(value: str) -> list[str]:
+    decoded = decode_meta(value).get("command")
+    if not isinstance(decoded, list) or not all(isinstance(part, str) for part in decoded):
+        raise AgtError("corrupt launcher command")
+    if not decoded:
+        raise AgtError("empty launcher command")
+    return decoded
+
+
+def process_start_time(pid: int) -> str | None:
+    completed = subprocess.run(
+        ["/bin/ps", "-p", str(pid), "-o", "lstart="],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=tmux_client_environment(),
+        check=False,
+    )
+    if completed.returncode != 0:
+        return None
+    value = " ".join(completed.stdout.decode(errors="replace").split())
+    return value or None
+
+
+def session_pids(session_id: int) -> list[int]:
+    completed = subprocess.run(
+        ["/bin/ps", "-axo", "pid="],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=tmux_client_environment(),
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AgtError("unable to inspect managed process session")
+    found: list[int] = []
+    for line in completed.stdout.decode(errors="replace").splitlines():
+        pid = optional_int(line.strip())
+        if pid is not None:
+            with suppress(ProcessLookupError):
+                if os.getsid(pid) == session_id:
+                    found.append(pid)
+    return found
+
+
+def signal_session(session_id: int, sent_signal: signal.Signals, include_leader: bool) -> None:
+    pids = session_pids(session_id)
+    pids.sort(key=lambda pid: pid == session_id)
+    for pid in pids:
+        if pid == session_id and not include_leader:
+            continue
+        with suppress(ProcessLookupError):
+            if os.getsid(pid) == session_id:
+                os.kill(pid, sent_signal)
+
+
+def terminate_session_descendants(
+    session_id: int,
+    grace: float,
+    leader_started: str | None = None,
+) -> None:
+    term_deadline = time.monotonic() + max(0, grace)
+    kill_deadline = term_deadline + 2
+    while True:
+        descendants = [pid for pid in session_pids(session_id) if pid != session_id]
+        if not descendants:
+            return
+        current_started = process_start_time(session_id)
+        if leader_started and current_started and current_started != leader_started:
+            raise AgtError("managed session leader changed with live descendants")
+        now = time.monotonic()
+        sent_signal = signal.SIGTERM if now < term_deadline else signal.SIGKILL
+        if sent_signal == signal.SIGTERM:
+            signal_session(session_id, signal.SIGCONT, include_leader=False)
+        signal_session(session_id, sent_signal, include_leader=False)
+        if now >= kill_deadline:
+            raise AgtError("managed descendants survived SIGKILL")
+        time.sleep(0.05)
+
+
+def terminate_pane_process(
+    pane: str,
+    grace: float,
+    leader_started: str | None = None,
+) -> None:
+    details = tmux(
+        ["display-message", "-p", "-t", pane, f"#{{pane_dead}}{FIELD_SEPARATOR}#{{pane_pid}}"],
+        check=False,
+    )
+    if details.returncode != 0:
+        detail = details.stderr.decode(errors="replace").strip()
+        raise AgtError(detail or f"could not inspect managed pane: {pane}")
+    values = details.stdout.decode().strip().split(FIELD_SEPARATOR)
+    if len(values) != 2:
+        return
+    pid = optional_int(values[1])
+    if pid is None:
+        raise AgtError("managed pane has no process id")
+    if values[0] == "1":
+        descendants = session_pids(pid)
+        if not descendants:
+            return
+        current_started = process_start_time(pid)
+        if current_started and not leader_started:
+            return
+        if leader_started and current_started and current_started != leader_started:
+            return
+        terminate_session_descendants(pid, grace, leader_started)
+        return
+    started = process_start_time(pid)
+    if not started:
+        return
+    if leader_started and started != leader_started:
+        raise AgtError("managed pane process identity changed")
+    try:
+        session_id = os.getsid(pid)
+    except ProcessLookupError:
+        return
+    if session_id != pid:
+        raise AgtError("refusing an unverified managed pane process")
+    with suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGCONT)
+        os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + max(0, grace)
+    while time.monotonic() < deadline:
+        if not session_pids(pid):
+            return
+        time.sleep(0.05)
+    terminate_session_descendants(pid, 0, started)
+    if process_start_time(pid) == started:
+        with suppress(ProcessLookupError):
+            if os.getsid(pid) == pid:
+                os.kill(pid, signal.SIGKILL)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if not session_pids(pid):
+            return
+        time.sleep(0.05)
+    raise AgtError("managed pane process did not terminate")
+
+
+def terminate_incomplete_session(
+    session: str,
+    pane: str,
+    grace: float,
+    leader_started: str | None = None,
+) -> None:
+    panes = [pane] if pane else []
+    if not panes:
+        listed = tmux(["list-panes", "-t", session, "-F", "#{pane_id}"], check=False)
+        if listed.returncode != 0:
+            if tmux_session_absent(session):
+                return
+            detail = listed.stderr.decode(errors="replace").strip()
+            raise AgtError(detail or f"could not inspect managed session: {session}")
+        panes = listed.stdout.decode().split()
+    for target in panes:
+        terminate_pane_process(target, grace, leader_started)
+
+
+def supervise(encoded_command: str) -> int:
+    command = decode_command(encoded_command)
+    pending: list[signal.Signals] = []
+
+    def remember(signum: int, _frame: object) -> None:
+        pending.append(signal.Signals(signum))
+
+    forwarded = (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)
+    for sent_signal in forwarded:
+        signal.signal(sent_signal, remember)
+    child = os.fork()
+    if child == 0:
+        for sent_signal in forwarded:
+            signal.signal(sent_signal, signal.SIG_DFL)
+        try:
+            os.execvpe(command[0], command, os.environ)
+        except OSError as error:
+            print(f"agt: {error}", file=sys.stderr)
+            os._exit(127)
+    status = 0
+    shutdown_deadline: float | None = None
+    while True:
+        while pending:
+            sent_signal = pending.pop(0)
+            if sent_signal == signal.SIGHUP and shutdown_deadline is None:
+                shutdown_deadline = time.monotonic() + 0.5
+            signal_session(os.getpid(), signal.SIGCONT, include_leader=False)
+            signal_session(os.getpid(), sent_signal, include_leader=False)
+        if shutdown_deadline is not None and time.monotonic() >= shutdown_deadline:
+            signal_session(os.getpid(), signal.SIGKILL, include_leader=False)
+        waited, status = os.waitpid(child, os.WNOHANG)
+        if waited == child:
+            break
+        time.sleep(0.05)
+    terminate_session_descendants(os.getpid(), 0.2)
+    result = os.waitstatus_to_exitcode(status)
+    return 128 - result if result < 0 else result
+
+
+def sink_log(path_value: str, max_bytes: int, pane: str) -> int:
+    if max_bytes <= 0:
+        raise AgtError("log size must be positive")
+    path = Path(path_value)
+    previous = path.with_suffix(path.suffix + ".previous")
+    handle = path.open("ab", buffering=0)
+    size = handle.tell()
+    dead_since: float | None = None
+    descriptor = sys.stdin.fileno()
+    try:
+        while True:
+            readable, _, _ = select.select([descriptor], [], [], 1.0)
+            if readable:
+                chunk = os.read(descriptor, 65536)
+                if not chunk:
+                    break
+            else:
+                result = tmux(
+                    ["display-message", "-p", "-t", pane, "#{pane_dead}"],
+                    check=False,
+                )
+                is_dead = result.returncode != 0 or result.stdout.decode().strip() == "1"
+                if is_dead:
+                    dead_since = dead_since or time.monotonic()
+                    if time.monotonic() - dead_since >= 0.5:
+                        break
+                continue
+            if size + len(chunk) > max_bytes:
+                handle.close()
+                previous.unlink(missing_ok=True)
+                os.replace(path, previous)
+                handle = path.open("wb", buffering=0)
+                os.chmod(path, 0o600)
+                size = 0
+            handle.write(chunk)
+            size += len(chunk)
+    finally:
+        handle.close()
+    return 0
+
+
+def optional_int(value: str) -> int | None:
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def normalized_signal(value: str) -> str | None:
+    if not value:
+        return None
+    upper = value.upper()
+    return upper if upper.startswith("SIG") else f"SIG{upper}"
+
+
+def list_tasks() -> list[Task]:
+    fields = [
+        "#{session_name}",
+        "#{@agt_meta}",
+        "#{@agt_committed}",
+        "#{@agt_process_started}",
+        "#{@agt_stop_requested}",
+        "#{pane_id}",
+        "#{pane_dead}",
+        "#{pane_dead_status}",
+        "#{pane_dead_signal}",
+        "#{pane_pid}",
+        "#{session_attached}",
+    ]
+    completed = tmux(
+        ["list-panes", "-a", "-F", FIELD_SEPARATOR.join(fields)],
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.decode(errors="replace")
+        if tmux_server_absent(completed):
+            return []
+        raise AgtError(detail.strip() or f"tmux exited {completed.returncode}")
+    tasks: list[Task] = []
+    for line in completed.stdout.decode(errors="replace").splitlines():
+        values = line.split(FIELD_SEPARATOR)
+        if len(values) != len(fields):
+            continue
+        (
+            session,
+            encoded,
+            committed,
+            process_started,
+            stopped,
+            pane,
+            dead,
+            status,
+            dead_signal,
+            pid,
+            attached,
+        ) = values
+        if not session.startswith(SESSION_PREFIX) or not encoded:
+            continue
+        meta = decode_meta(encoded)
+        command = meta.get("command")
+        if not isinstance(command, list) or not all(isinstance(part, str) for part in command):
+            raise AgtError(f"corrupt task metadata in {session}")
+        tasks.append(
+            Task(
+                session=session,
+                pane=pane,
+                id=str(meta.get("id", "")),
+                name=str(meta.get("name", "")),
+                command=command,
+                cwd=str(meta.get("cwd", "")),
+                created=str(meta.get("created", "")),
+                log=str(meta.get("log", "")),
+                committed=committed == "1",
+                process_started=process_started or None,
+                stop_requested=stopped == "1",
+                dead=dead == "1",
+                exit_code=optional_int(status),
+                signal_name=normalized_signal(dead_signal),
+                pid=optional_int(pid),
+                attached=(optional_int(attached) or 0) > 0,
+            )
+        )
+    return sorted(tasks, key=lambda task: task.created)
+
+
+def resolve_task(target: str) -> Task:
+    tasks = list_tasks()
+    exact = [task for task in tasks if target in {task.name, task.id, task.session}]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        raise AgtError(f"ambiguous task name: {target}")
+    prefixed = [task for task in tasks if task.id.startswith(target)]
+    if len(prefixed) == 1:
+        return prefixed[0]
+    if len(prefixed) > 1:
+        raise AgtError(f"ambiguous task id: {target}")
+    raise AgtError(f"task not found: {target}")
+
+
+def set_task_environment(session: str) -> None:
+    current = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in TRANSIENT_ENV and ENV_PATTERN.fullmatch(key) and "\x00" not in value
+    }
+    shown = tmux(["show-environment", "-t", session]).stdout.decode(errors="replace")
+    existing = set()
+    for line in shown.splitlines():
+        key = line.lstrip("-").split("=", 1)[0]
+        if key and key not in {"TMUX", "TMUX_PANE"}:
+            existing.add(key)
+    for key in sorted(existing - current.keys()):
+        tmux(["set-environment", "-t", session, "-r", key])
+    for key, value in current.items():
+        tmux(["set-environment", "-t", session, key, value])
+
+
+def validate_name(name: str) -> None:
+    if not NAME_PATTERN.fullmatch(name):
+        raise AgtError(
+            "name must be 1-64 characters using letters, numbers, dot, dash, or underscore"
+        )
+
+
+def command_from_remainder(parts: Sequence[str]) -> list[str]:
+    command = list(parts)
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        raise AgtError("missing command after --")
+    return command
+
+
+def run_spec(default_cwd: str, parts: Sequence[str]) -> tuple[str, list[str]]:
+    cwd = default_cwd
+    remaining = list(parts)
+    while remaining and remaining[0] != "--":
+        if remaining[0] in {"-C", "--cwd"}:
+            if len(remaining) < 2:
+                raise AgtError(f"{remaining[0]} requires a directory")
+            cwd = remaining[1]
+            remaining = remaining[2:]
+            continue
+        if remaining[0].startswith("--cwd="):
+            cwd = remaining[0].split("=", 1)[1]
+            remaining = remaining[1:]
+            continue
+        break
+    return cwd, command_from_remainder(remaining)
+
+
+def bind_detach_key() -> None:
+    tmux(["bind-key", "-T", "root", "C-q", "detach-client"])
+
+
+def ensure_server_available() -> None:
+    probe = tmux(["list-sessions"], check=False)
+    if probe.returncode != 0:
+        if tmux_server_absent(probe):
+            return
+        detail = probe.stderr.decode(errors="replace").strip()
+        raise AgtError(detail or f"could not inspect tmux socket: {SOCKET}")
+    tag = tmux(["show-options", "-gqv", "@agt_server"]).stdout.decode().strip()
+    if tag != SERVER_TAG:
+        raise AgtError(f"tmux socket is already owned by another server: {SOCKET}")
+
+
+def tmux_session_absent(session: str) -> bool:
+    probe = tmux(["has-session", "-t", session], check=False)
+    if probe.returncode == 0:
+        return False
+    detail = probe.stderr.decode(errors="replace").lower()
+    if tmux_server_absent(probe) or "can't find session" in detail:
+        return True
+    raise AgtError(detail.strip() or f"could not inspect tmux session: {session}")
+
+
+def kill_managed_session(session: str) -> None:
+    killed = tmux(["kill-session", "-t", session], check=False)
+    if killed.returncode == 0:
+        return
+    if tmux_session_absent(session):
+        return
+    detail = killed.stderr.decode(errors="replace").strip()
+    raise AgtError(detail or f"could not remove tmux session: {session}")
+
+
+def run_task(name: str, cwd_value: str, command: list[str]) -> Task:
+    with registry_lock():
+        ensure_server_available()
+        validate_name(name)
+        if any(task.name == name for task in list_tasks()):
+            raise AgtError(f"task already exists: {name}")
+        cwd = Path(cwd_value).expanduser().resolve()
+        if not cwd.is_dir():
+            raise AgtError(f"not a directory: {cwd}")
+        task_id = str(uuid.uuid4())
+        session = f"{SESSION_PREFIX}{task_id.replace('-', '')[:12]}"
+        log_dir = state_root() / "logs"
+        log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(log_dir, 0o700)
+        log_path = log_dir / f"{task_id}.log"
+        log_path.touch(mode=0o600, exist_ok=False)
+        meta: dict[str, object] = {
+            "id": task_id,
+            "name": name,
+            "command": command,
+            "cwd": str(cwd),
+            "created": datetime.now(timezone.utc).isoformat(),
+            "log": str(log_path),
+        }
+        script = Path(__file__).resolve()
+        committed = False
+        pane = ""
+        started: str | None = None
+        try:
+            created = tmux(
+                [
+                    "start-server",
+                    ";",
+                    "set-option",
+                    "-g",
+                    "history-limit",
+                    "50000",
+                    ";",
+                    "set-option",
+                    "-g",
+                    "@agt_server",
+                    SERVER_TAG,
+                    ";",
+                    "new-session",
+                    "-d",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "-s",
+                    session,
+                    "-c",
+                    str(cwd),
+                    "/bin/sleep",
+                    "2147483647",
+                    ";",
+                    "set-option",
+                    "-w",
+                    "-t",
+                    session,
+                    "remain-on-exit",
+                    "on",
+                    ";",
+                    "set-option",
+                    "-t",
+                    session,
+                    "@agt_meta",
+                    encode_meta(meta),
+                    ";",
+                    "set-option",
+                    "-t",
+                    session,
+                    "@agt_committed",
+                    "0",
+                    ";",
+                    "set-option",
+                    "-t",
+                    session,
+                    "@agt_process_started",
+                    "",
+                    ";",
+                    "set-option",
+                    "-t",
+                    session,
+                    "@agt_stop_requested",
+                    "0",
+                ]
+            )
+            pane = created.stdout.decode().strip()
+            set_task_environment(session)
+            sink = (
+                f"exec {shlex.quote(str(script))} __log "
+                f"{shlex.quote(str(log_path))} {LOG_MAX_BYTES} {shlex.quote(pane)}"
+            )
+            tmux(["pipe-pane", "-t", pane, sink])
+            bind_detach_key()
+            tmux(
+                [
+                    "respawn-pane",
+                    "-k",
+                    "-c",
+                    str(cwd),
+                    "-t",
+                    pane,
+                    "--",
+                    str(script),
+                    "__supervise",
+                    encode_command(command),
+                ]
+            )
+            deadline = time.monotonic() + 0.5
+            started = None
+            while True:
+                process = tmux(
+                    [
+                        "display-message",
+                        "-p",
+                        "-t",
+                        pane,
+                        f"#{{pane_dead}}{FIELD_SEPARATOR}#{{pane_pid}}",
+                    ]
+                ).stdout.decode().strip().split(FIELD_SEPARATOR)
+                dead = len(process) != 2 or process[0] == "1"
+                pid = optional_int(process[1]) if len(process) == 2 else None
+                started = process_start_time(pid) if pid is not None and not dead else None
+                if dead or started:
+                    break
+                if time.monotonic() >= deadline:
+                    raise AgtError("could not bind supervisor process identity")
+                time.sleep(0.02)
+            tmux(["set-option", "-t", session, "@agt_process_started", started or ""])
+            tmux(["set-option", "-t", session, "@agt_committed", "1"])
+            committed = True
+            return resolve_task(task_id)
+        finally:
+            if not committed:
+                terminate_incomplete_session(session, pane, 0.5, started)
+                kill_managed_session(session)
+                log_path.unlink(missing_ok=True)
+                log_path.with_suffix(log_path.suffix + ".previous").unlink(missing_ok=True)
+
+
+def age(created: str) -> str:
+    try:
+        started = datetime.fromisoformat(created)
+    except ValueError:
+        return "?"
+    seconds = max(0, int((datetime.now(timezone.utc) - started).total_seconds()))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def print_tasks(tasks: Sequence[Task], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps([task.as_dict() for task in tasks], indent=2))
+        return
+    if not tasks:
+        print("no tasks")
+        return
+    print(f"{'NAME':<22} {'STATE':<10} {'AGE':<6} {'PID':<8} COMMAND")
+    for task in tasks:
+        pid = str(task.pid) if not task.dead and task.pid is not None else "-"
+        command = shlex.join(task.command)
+        print(f"{task.name:<22.22} {task.state:<10} {age(task.created):<6} {pid:<8} {command}")
+
+
+def print_status(task: Task, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(task.as_dict(), indent=2))
+        return
+    values = task.as_dict()
+    keys = (
+        "name",
+        "id",
+        "state",
+        "pid",
+        "exit_code",
+        "signal",
+        "attached",
+        "created",
+        "cwd",
+        "log",
+    )
+    for key in keys:
+        print(f"{key}: {values[key]}")
+    print(f"command: {shlex.join(task.command)}")
+
+
+def attach_task(task: Task) -> int:
+    bind_detach_key()
+    environment = os.environ.copy()
+    environment.pop("TMUX", None)
+    environment.pop("TMUX_PANE", None)
+    binary = tmux_binary()
+    os.execvpe(
+        binary,
+        [binary, "-L", SOCKET, "-f", "/dev/null", "attach-session", "-t", task.session],
+        environment,
+    )
+    return 1
+
+
+def read_task(task: Task, all_history: bool) -> int:
+    start = "-" if all_history else "-200"
+    captured = tmux(["capture-pane", "-p", "-J", "-S", start, "-t", task.pane])
+    sys.stdout.buffer.write(captured.stdout)
+    return 0
+
+
+def log_task(task: Task, lines: int, follow: bool) -> int:
+    if lines < 0:
+        raise AgtError("lines must be non-negative")
+    tail = shutil.which("tail")
+    if not tail:
+        raise AgtError("tail is required")
+    arguments = [tail, "-n", str(lines)]
+    log_path = validated_log_path(task)
+    if follow:
+        arguments.extend(["-F", str(log_path)])
+    else:
+        previous = log_path.with_suffix(log_path.suffix + ".previous")
+        if previous.exists():
+            arguments.append(str(previous))
+        arguments.append(str(log_path))
+    return subprocess.call(arguments)
+
+
+def send_task(target: str, message: str, enter: bool) -> int:
+    with registry_lock():
+        task = resolve_task(target)
+        if task.dead:
+            raise AgtError(f"task is not running: {task.name}")
+        if not task.committed:
+            raise AgtError(f"task is still initializing: {task.name}")
+        buffer_name = f"agt_{uuid.uuid4().hex}"
+        tmux(["load-buffer", "-b", buffer_name, "-"], input_data=message.encode())
+        try:
+            command = ["paste-buffer", "-b", buffer_name, "-d", "-t", task.pane]
+            if enter:
+                command.extend([";", "send-keys", "-t", task.pane, "Enter"])
+            tmux(command)
+        finally:
+            tmux(["delete-buffer", "-b", buffer_name], check=False)
+        return 0
+
+
+def wait_task(target: str, timeout: float | None) -> int:
+    with registry_lock():
+        task = resolve_task(target)
+        if not task.committed:
+            raise AgtError(f"task initialization is incomplete: {task.name}")
+        lock_handle = acquire_task_lock(task.id, exclusive=False)
+    task_id = task.id
+    started = time.monotonic()
+    try:
+        while True:
+            task = resolve_task(task_id)
+            if task.dead:
+                return task.result_code
+            if timeout is not None and time.monotonic() - started >= timeout:
+                print(f"agt: timeout waiting for {task.name}", file=sys.stderr)
+                return 124
+            time.sleep(0.2)
+    finally:
+        release_task_lock(lock_handle)
+
+
+def validated_supervisor(task: Task) -> int:
+    if task.pid is None:
+        raise AgtError(f"task has no process id: {task.name}")
+    if not task.process_started:
+        raise AgtError(f"task has no process identity: {task.name}")
+    try:
+        session_id = os.getsid(task.pid)
+    except ProcessLookupError as error:
+        raise AgtError(f"task process disappeared: {task.name}") from error
+    if session_id != task.pid:
+        raise AgtError("refusing a task whose supervisor is not its session leader")
+    if process_start_time(task.pid) != task.process_started:
+        raise AgtError("refusing a task whose supervisor identity changed")
+    server_pid = optional_int(tmux(["display-message", "-p", "#{pid}"]).stdout.decode().strip())
+    if server_pid is not None and task.pid == server_pid:
+        raise AgtError("refusing to signal the tmux server")
+    return task.pid
+
+
+def managed_session_empty(task: Task) -> bool:
+    if task.pid is None:
+        return True
+    current_started = process_start_time(task.pid)
+    if task.process_started and current_started and current_started != task.process_started:
+        return True
+    if task.dead and not task.process_started and current_started:
+        return True
+    return not session_pids(task.pid)
+
+
+def terminate_dead_task_descendants(task: Task, grace: float) -> None:
+    if managed_session_empty(task):
+        return
+    if task.pid is None:
+        raise AgtError(f"dead task has unverifiable descendants: {task.name}")
+    terminate_session_descendants(task.pid, grace, task.process_started)
+    if not managed_session_empty(task):
+        raise AgtError(f"dead task descendants did not stop: {task.name}")
+
+
+def stop_task_locked(task: Task, grace: float) -> Task:
+    if grace < 0:
+        raise AgtError("grace must be non-negative")
+    if task.dead:
+        if not managed_session_empty(task):
+            tmux(["set-option", "-t", task.session, "@agt_stop_requested", "1"])
+            terminate_dead_task_descendants(task, grace)
+            return resolve_task(task.id)
+        return task
+    if not task.committed:
+        raise AgtError(f"task is still initializing: {task.name}")
+    tmux(["set-option", "-t", task.session, "@agt_stop_requested", "1"])
+    current = resolve_task(task.id)
+    if current.dead:
+        if not managed_session_empty(current):
+            terminate_dead_task_descendants(current, grace)
+            return resolve_task(task.id)
+        return current
+    supervisor = validated_supervisor(current)
+    try:
+        os.kill(supervisor, signal.SIGCONT)
+        os.kill(supervisor, signal.SIGTERM)
+    except ProcessLookupError:
+        refreshed = resolve_task(task.id)
+        if refreshed.dead and managed_session_empty(refreshed):
+            return refreshed
+        if refreshed.dead:
+            terminate_dead_task_descendants(refreshed, grace)
+            return resolve_task(task.id)
+        raise AgtError(f"task process disappeared: {task.name}")
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        current = resolve_task(task.id)
+        if current.dead and managed_session_empty(current):
+            return current
+        time.sleep(0.1)
+    current = resolve_task(task.id)
+    if current.dead and managed_session_empty(current):
+        return current
+    if not current.dead and validated_supervisor(current) != supervisor:
+        raise AgtError("task supervisor changed while stopping; refusing SIGKILL")
+    terminate_session_descendants(supervisor, 0, current.process_started)
+    if process_start_time(supervisor) == current.process_started:
+        with suppress(ProcessLookupError):
+            if os.getsid(supervisor) == supervisor:
+                os.kill(supervisor, signal.SIGKILL)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        current = resolve_task(task.id)
+        if current.dead and managed_session_empty(current):
+            return current
+        time.sleep(0.1)
+    raise AgtError(f"task did not stop: {task.name}")
+
+
+def stop_task(target: str, grace: float) -> Task:
+    with registry_lock():
+        return stop_task_locked(resolve_task(target), grace)
+
+
+def remove_task_locked(task: Task, force: bool, grace: float) -> None:
+    current = task
+    if not current.committed:
+        if not force:
+            raise AgtError(f"task initialization is incomplete; use --force: {task.name}")
+        log_path = validated_log_path(current) if current.log else None
+        terminate_incomplete_session(
+            current.session,
+            current.pane,
+            grace,
+            current.process_started,
+        )
+        kill_managed_session(current.session)
+        if log_path:
+            log_path.unlink(missing_ok=True)
+            log_path.with_suffix(log_path.suffix + ".previous").unlink(missing_ok=True)
+        return
+    if not current.dead:
+        if not force:
+            raise AgtError(f"task is running; use --force to stop and remove: {task.name}")
+        current = stop_task_locked(current, grace)
+    if not managed_session_empty(current):
+        if not force:
+            raise AgtError(f"refusing removal with live descendants: {current.name}")
+        terminate_dead_task_descendants(current, grace)
+    log_path = validated_log_path(current) if current.log else None
+    kill_managed_session(current.session)
+    if log_path:
+        log_path.unlink(missing_ok=True)
+        log_path.with_suffix(log_path.suffix + ".previous").unlink(missing_ok=True)
+
+
+def remove_task(target: str, force: bool, grace: float) -> Task:
+    with registry_lock():
+        task = resolve_task(target)
+        current = task
+        if current.committed and not current.dead:
+            if not force:
+                raise AgtError(f"task is running; use --force to stop and remove: {task.name}")
+            current = stop_task_locked(current, grace)
+        lock_handle = acquire_task_lock(current.id, exclusive=True)
+        try:
+            remove_task_locked(current, force, grace)
+        finally:
+            release_task_lock(lock_handle)
+        return current
+
+
+def clean_tasks() -> int:
+    with registry_lock():
+        removable = [task for task in list_tasks() if task.dead or not task.committed]
+        for task in removable:
+            lock_handle = acquire_task_lock(task.id, exclusive=True)
+            try:
+                remove_task_locked(task, force=True, grace=0)
+            finally:
+                release_task_lock(lock_handle)
+    print(f"removed {len(removable)} task{'s' if len(removable) != 1 else ''}")
+    return 0
+
+
+def watch_tasks(interval: float) -> int:
+    if interval <= 0:
+        raise AgtError("interval must be positive")
+    while True:
+        sys.stdout.write("\033[2J\033[H")
+        print_tasks(list_tasks(), as_json=False)
+        sys.stdout.flush()
+        time.sleep(interval)
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(prog="agt")
+    commands = root.add_subparsers(dest="action", required=True)
+
+    run = commands.add_parser("run")
+    run.add_argument("name")
+    run.add_argument("-C", "--cwd", default=os.getcwd())
+    run.add_argument("command", nargs=argparse.REMAINDER)
+
+    listing = commands.add_parser("list", aliases=["ls"])
+    listing.add_argument("--json", action="store_true")
+
+    status = commands.add_parser("status")
+    status.add_argument("target")
+    status.add_argument("--json", action="store_true")
+
+    attach = commands.add_parser("attach")
+    attach.add_argument("target")
+
+    read = commands.add_parser("read")
+    read.add_argument("target")
+    read.add_argument("-a", "--all", action="store_true")
+
+    log = commands.add_parser("log")
+    log.add_argument("target")
+    log.add_argument("-n", "--lines", type=int, default=200)
+    log.add_argument("-f", "--follow", action="store_true")
+
+    send = commands.add_parser("send")
+    send.add_argument("target")
+    send.add_argument("message")
+    send.add_argument("--no-enter", action="store_true")
+
+    wait = commands.add_parser("wait")
+    wait.add_argument("target")
+    wait.add_argument("--timeout", type=float)
+
+    stop = commands.add_parser("stop")
+    stop.add_argument("target")
+    stop.add_argument("--grace", type=float, default=3)
+
+    remove = commands.add_parser("rm", aliases=["remove"])
+    remove.add_argument("target")
+    remove.add_argument("--force", action="store_true")
+    remove.add_argument("--grace", type=float, default=3)
+
+    commands.add_parser("clean")
+
+    watch = commands.add_parser("watch")
+    watch.add_argument("--interval", type=float, default=1)
+
+    return root
+
+
+def execute(arguments: argparse.Namespace) -> int:
+    if arguments.action == "run":
+        cwd, command = run_spec(arguments.cwd, arguments.command)
+        task = run_task(arguments.name, cwd, command)
+        print(f"started {task.name} {task.id[:8]}")
+        return 0
+    if arguments.action in {"list", "ls"}:
+        print_tasks(list_tasks(), arguments.json)
+        return 0
+    if arguments.action == "status":
+        print_status(resolve_task(arguments.target), arguments.json)
+        return 0
+    if arguments.action == "attach":
+        return attach_task(resolve_task(arguments.target))
+    if arguments.action == "read":
+        return read_task(resolve_task(arguments.target), arguments.all)
+    if arguments.action == "log":
+        return log_task(resolve_task(arguments.target), arguments.lines, arguments.follow)
+    if arguments.action == "send":
+        return send_task(arguments.target, arguments.message, not arguments.no_enter)
+    if arguments.action == "wait":
+        return wait_task(arguments.target, arguments.timeout)
+    if arguments.action == "stop":
+        task = stop_task(arguments.target, arguments.grace)
+        print(f"{task.state} {task.name}")
+        return 0
+    if arguments.action in {"rm", "remove"}:
+        task = remove_task(arguments.target, arguments.force, arguments.grace)
+        print(f"removed {task.name}")
+        return 0
+    if arguments.action == "clean":
+        return clean_tasks()
+    if arguments.action == "watch":
+        return watch_tasks(arguments.interval)
+    raise AgtError(f"unknown action: {arguments.action}")
+
+
+def main() -> int:
+    try:
+        if len(sys.argv) == 3 and sys.argv[1] == "__supervise":
+            return supervise(sys.argv[2])
+        if len(sys.argv) == 5 and sys.argv[1] == "__log":
+            max_bytes = optional_int(sys.argv[3])
+            if max_bytes is None:
+                raise AgtError("invalid log size")
+            return sink_log(sys.argv[2], max_bytes, sys.argv[4])
+        return execute(parser().parse_args())
+    except AgtError as error:
+        print(f"agt: {error}", file=sys.stderr)
+        return 1
+    except OSError as error:
+        print(f"agt: {error}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
