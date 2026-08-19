@@ -111,23 +111,25 @@ Configure SSH aliases, keys, users, ports, and jump hosts in `~/.ssh/config`.
 Connect to each alias once so strict host-key checking succeeds:
 
 ```bash
-ssh m3max true
+ssh mini true
 ```
 
-Create `~/.config/clilane/fleet.json`:
+Run `fleet` from a controller that is allowed to initiate SSH connections. For
+example, if a MacBook may SSH to a Mini but the Mini must not SSH back, create
+`~/.config/clilane/fleet.json` on the MacBook with this direction:
 
 ```json
 {
   "schema_version": 1,
   "hosts": [
     {
-      "name": "mini",
+      "name": "macbook",
       "transport": "local"
     },
     {
-      "name": "m3max",
+      "name": "mini",
       "transport": "ssh",
-      "destination": "m3max"
+      "destination": "mini"
     }
   ]
 }
@@ -147,9 +149,9 @@ clilane fleet
 ```
 
 ```text
-HOST   NAME            STATE      AGE    PID      PROJECT       COMMAND
-mini   codex-galaxy    running    15h    21686    galaxy-drill  codex
-m3max  kimi-inference  running    4m     8124     inference     kimi
+HOST    NAME           STATE      AGE    PID      PROJECT      COMMAND
+macbook kimi-inference running    4m     8124     inference    kimi
+mini    codex-galaxy   running    15h    21686    galaxy-drill codex
 ```
 
 Override the config or per-host timeout when needed:
@@ -176,14 +178,14 @@ Fleet JSON has this top-level shape:
   "generated_at": "2026-08-19T12:00:00+00:00",
   "hosts": [
     {
-      "name": "mini",
+      "name": "macbook",
       "status": "ok",
       "clilane_version": "0.2.0",
       "tasks": [],
       "error": null
     },
     {
-      "name": "m3max",
+      "name": "mini",
       "status": "error",
       "clilane_version": null,
       "tasks": [],
