@@ -24,7 +24,10 @@ from pathlib import Path
 from typing import BinaryIO, Iterator, Sequence
 
 
-SOCKET = os.environ.get("AGT_TMUX_SOCKET", "agt")
+PROGRAM = "clilane"
+SOCKET = os.environ.get("CLILANE_TMUX_SOCKET") or os.environ.get(
+    "AGT_TMUX_SOCKET", "agt"
+)
 SESSION_PREFIX = "agt_"
 SERVER_TAG = "agt-v1"
 FIELD_SEPARATOR = "\x1f"
@@ -56,7 +59,7 @@ TMUX_ENV_KEYS = {
 LOG_MAX_BYTES = 50 * 1024 * 1024
 
 
-class AgtError(Exception):
+class CliLaneError(Exception):
     pass
 
 
@@ -121,7 +124,7 @@ class Task:
 def tmux_binary() -> str:
     binary = shutil.which("tmux")
     if not binary:
-        raise AgtError("tmux is required")
+        raise CliLaneError("tmux is required")
     return binary
 
 
@@ -149,7 +152,7 @@ def tmux(
     )
     if check and completed.returncode != 0:
         detail = completed.stderr.decode(errors="replace").strip()
-        raise AgtError(detail or f"tmux exited {completed.returncode}")
+        raise CliLaneError(detail or f"tmux exited {completed.returncode}")
     return completed
 
 
@@ -161,22 +164,39 @@ def tmux_server_absent(completed: subprocess.CompletedProcess[bytes]) -> bool:
 
 
 def state_root() -> Path:
-    configured = os.environ.get("AGT_STATE_HOME")
+    configured = os.environ.get("CLILANE_STATE_HOME") or os.environ.get("AGT_STATE_HOME")
     if configured:
         root = Path(configured).expanduser()
     elif os.environ.get("XDG_STATE_HOME"):
-        root = Path(os.environ["XDG_STATE_HOME"]).expanduser() / "agt"
+        root = Path(os.environ["XDG_STATE_HOME"]).expanduser() / PROGRAM
     else:
-        root = Path.home() / ".local" / "state" / "agt"
+        root = Path.home() / ".local" / "state" / PROGRAM
     if not root.is_absolute():
-        raise AgtError("AGT_STATE_HOME and XDG_STATE_HOME must be absolute")
+        raise CliLaneError(
+            "CLILANE_STATE_HOME, AGT_STATE_HOME, and XDG_STATE_HOME must be absolute"
+        )
     root = root.resolve()
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     return root
 
 
+def legacy_state_roots() -> tuple[Path, ...]:
+    roots = [Path.home() / ".local" / "state" / "agt"]
+    configured = os.environ.get("AGT_STATE_HOME")
+    if configured:
+        candidate = Path(configured).expanduser()
+        if candidate.is_absolute():
+            roots.append(candidate)
+    xdg = os.environ.get("XDG_STATE_HOME")
+    if xdg:
+        candidate = Path(xdg).expanduser()
+        if candidate.is_absolute():
+            roots.append(candidate / "agt")
+    return tuple(root.resolve() for root in roots)
+
+
 def control_root() -> Path:
-    root = (Path.home() / ".local" / "state" / "agt" / "control").resolve()
+    root = (state_root() / "control").resolve()
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(root, 0o700)
     return root
@@ -212,10 +232,13 @@ def release_task_lock(handle: BinaryIO) -> None:
 
 
 def validated_log_path(task: Task) -> Path:
-    expected = (state_root() / "logs" / f"{task.id}.log").resolve()
+    expected = {
+        (root / "logs" / f"{task.id}.log").resolve()
+        for root in (state_root(), *legacy_state_roots())
+    }
     actual = Path(task.log).expanduser().resolve()
-    if actual != expected:
-        raise AgtError(f"refusing unexpected log path for {task.name}")
+    if actual not in expected:
+        raise CliLaneError(f"refusing unexpected log path for {task.name}")
     return actual
 
 
@@ -229,9 +252,9 @@ def decode_meta(value: str) -> dict[str, object]:
         raw = base64.urlsafe_b64decode(value.encode())
         decoded = json.loads(raw)
     except (ValueError, json.JSONDecodeError) as error:
-        raise AgtError("corrupt task metadata") from error
+        raise CliLaneError("corrupt task metadata") from error
     if not isinstance(decoded, dict):
-        raise AgtError("corrupt task metadata")
+        raise CliLaneError("corrupt task metadata")
     return decoded
 
 
@@ -242,9 +265,9 @@ def encode_command(command: Sequence[str]) -> str:
 def decode_command(value: str) -> list[str]:
     decoded = decode_meta(value).get("command")
     if not isinstance(decoded, list) or not all(isinstance(part, str) for part in decoded):
-        raise AgtError("corrupt launcher command")
+        raise CliLaneError("corrupt launcher command")
     if not decoded:
-        raise AgtError("empty launcher command")
+        raise CliLaneError("empty launcher command")
     return decoded
 
 
@@ -271,7 +294,7 @@ def session_pids(session_id: int) -> list[int]:
         check=False,
     )
     if completed.returncode != 0:
-        raise AgtError("unable to inspect managed process session")
+        raise CliLaneError("unable to inspect managed process session")
     found: list[int] = []
     for line in completed.stdout.decode(errors="replace").splitlines():
         pid = optional_int(line.strip())
@@ -306,14 +329,14 @@ def terminate_session_descendants(
             return
         current_started = process_start_time(session_id)
         if leader_started and current_started and current_started != leader_started:
-            raise AgtError("managed session leader changed with live descendants")
+            raise CliLaneError("managed session leader changed with live descendants")
         now = time.monotonic()
         sent_signal = signal.SIGTERM if now < term_deadline else signal.SIGKILL
         if sent_signal == signal.SIGTERM:
             signal_session(session_id, signal.SIGCONT, include_leader=False)
         signal_session(session_id, sent_signal, include_leader=False)
         if now >= kill_deadline:
-            raise AgtError("managed descendants survived SIGKILL")
+            raise CliLaneError("managed descendants survived SIGKILL")
         time.sleep(0.05)
 
 
@@ -328,13 +351,13 @@ def terminate_pane_process(
     )
     if details.returncode != 0:
         detail = details.stderr.decode(errors="replace").strip()
-        raise AgtError(detail or f"could not inspect managed pane: {pane}")
+        raise CliLaneError(detail or f"could not inspect managed pane: {pane}")
     values = details.stdout.decode().strip().split(FIELD_SEPARATOR)
     if len(values) != 2:
         return
     pid = optional_int(values[1])
     if pid is None:
-        raise AgtError("managed pane has no process id")
+        raise CliLaneError("managed pane has no process id")
     if values[0] == "1":
         descendants = session_pids(pid)
         if not descendants:
@@ -350,13 +373,13 @@ def terminate_pane_process(
     if not started:
         return
     if leader_started and started != leader_started:
-        raise AgtError("managed pane process identity changed")
+        raise CliLaneError("managed pane process identity changed")
     try:
         session_id = os.getsid(pid)
     except ProcessLookupError:
         return
     if session_id != pid:
-        raise AgtError("refusing an unverified managed pane process")
+        raise CliLaneError("refusing an unverified managed pane process")
     with suppress(ProcessLookupError):
         os.kill(pid, signal.SIGCONT)
         os.kill(pid, signal.SIGTERM)
@@ -375,7 +398,7 @@ def terminate_pane_process(
         if not session_pids(pid):
             return
         time.sleep(0.05)
-    raise AgtError("managed pane process did not terminate")
+    raise CliLaneError("managed pane process did not terminate")
 
 
 def terminate_incomplete_session(
@@ -391,7 +414,7 @@ def terminate_incomplete_session(
             if tmux_session_absent(session):
                 return
             detail = listed.stderr.decode(errors="replace").strip()
-            raise AgtError(detail or f"could not inspect managed session: {session}")
+            raise CliLaneError(detail or f"could not inspect managed session: {session}")
         panes = listed.stdout.decode().split()
     for target in panes:
         terminate_pane_process(target, grace, leader_started)
@@ -414,7 +437,7 @@ def supervise(encoded_command: str) -> int:
         try:
             os.execvpe(command[0], command, os.environ)
         except OSError as error:
-            print(f"agt: {error}", file=sys.stderr)
+            print(f"{PROGRAM}: {error}", file=sys.stderr)
             os._exit(127)
     status = 0
     shutdown_deadline: float | None = None
@@ -438,7 +461,7 @@ def supervise(encoded_command: str) -> int:
 
 def sink_log(path_value: str, max_bytes: int, pane: str) -> int:
     if max_bytes <= 0:
-        raise AgtError("log size must be positive")
+        raise CliLaneError("log size must be positive")
     path = Path(path_value)
     previous = path.with_suffix(path.suffix + ".previous")
     handle = path.open("ab", buffering=0)
@@ -515,7 +538,7 @@ def list_tasks() -> list[Task]:
         detail = completed.stderr.decode(errors="replace")
         if tmux_server_absent(completed):
             return []
-        raise AgtError(detail.strip() or f"tmux exited {completed.returncode}")
+        raise CliLaneError(detail.strip() or f"tmux exited {completed.returncode}")
     tasks: list[Task] = []
     for line in completed.stdout.decode(errors="replace").splitlines():
         values = line.split(FIELD_SEPARATOR)
@@ -539,7 +562,7 @@ def list_tasks() -> list[Task]:
         meta = decode_meta(encoded)
         command = meta.get("command")
         if not isinstance(command, list) or not all(isinstance(part, str) for part in command):
-            raise AgtError(f"corrupt task metadata in {session}")
+            raise CliLaneError(f"corrupt task metadata in {session}")
         tasks.append(
             Task(
                 session=session,
@@ -569,13 +592,13 @@ def resolve_task(target: str) -> Task:
     if len(exact) == 1:
         return exact[0]
     if len(exact) > 1:
-        raise AgtError(f"ambiguous task name: {target}")
+        raise CliLaneError(f"ambiguous task name: {target}")
     prefixed = [task for task in tasks if task.id.startswith(target)]
     if len(prefixed) == 1:
         return prefixed[0]
     if len(prefixed) > 1:
-        raise AgtError(f"ambiguous task id: {target}")
-    raise AgtError(f"task not found: {target}")
+        raise CliLaneError(f"ambiguous task id: {target}")
+    raise CliLaneError(f"task not found: {target}")
 
 
 def set_task_environment(session: str) -> None:
@@ -598,7 +621,7 @@ def set_task_environment(session: str) -> None:
 
 def validate_name(name: str) -> None:
     if not NAME_PATTERN.fullmatch(name):
-        raise AgtError(
+        raise CliLaneError(
             "name must be 1-64 characters using letters, numbers, dot, dash, or underscore"
         )
 
@@ -608,7 +631,7 @@ def command_from_remainder(parts: Sequence[str]) -> list[str]:
     if command and command[0] == "--":
         command = command[1:]
     if not command:
-        raise AgtError("missing command after --")
+        raise CliLaneError("missing command after --")
     return command
 
 
@@ -618,7 +641,7 @@ def run_spec(default_cwd: str, parts: Sequence[str]) -> tuple[str, list[str]]:
     while remaining and remaining[0] != "--":
         if remaining[0] in {"-C", "--cwd"}:
             if len(remaining) < 2:
-                raise AgtError(f"{remaining[0]} requires a directory")
+                raise CliLaneError(f"{remaining[0]} requires a directory")
             cwd = remaining[1]
             remaining = remaining[2:]
             continue
@@ -640,10 +663,10 @@ def ensure_server_available() -> None:
         if tmux_server_absent(probe):
             return
         detail = probe.stderr.decode(errors="replace").strip()
-        raise AgtError(detail or f"could not inspect tmux socket: {SOCKET}")
+        raise CliLaneError(detail or f"could not inspect tmux socket: {SOCKET}")
     tag = tmux(["show-options", "-gqv", "@agt_server"]).stdout.decode().strip()
     if tag != SERVER_TAG:
-        raise AgtError(f"tmux socket is already owned by another server: {SOCKET}")
+        raise CliLaneError(f"tmux socket is already owned by another server: {SOCKET}")
 
 
 def tmux_session_absent(session: str) -> bool:
@@ -653,7 +676,7 @@ def tmux_session_absent(session: str) -> bool:
     detail = probe.stderr.decode(errors="replace").lower()
     if tmux_server_absent(probe) or "can't find session" in detail:
         return True
-    raise AgtError(detail.strip() or f"could not inspect tmux session: {session}")
+    raise CliLaneError(detail.strip() or f"could not inspect tmux session: {session}")
 
 
 def kill_managed_session(session: str) -> None:
@@ -663,7 +686,7 @@ def kill_managed_session(session: str) -> None:
     if tmux_session_absent(session):
         return
     detail = killed.stderr.decode(errors="replace").strip()
-    raise AgtError(detail or f"could not remove tmux session: {session}")
+    raise CliLaneError(detail or f"could not remove tmux session: {session}")
 
 
 def run_task(name: str, cwd_value: str, command: list[str]) -> Task:
@@ -671,10 +694,10 @@ def run_task(name: str, cwd_value: str, command: list[str]) -> Task:
         ensure_server_available()
         validate_name(name)
         if any(task.name == name for task in list_tasks()):
-            raise AgtError(f"task already exists: {name}")
+            raise CliLaneError(f"task already exists: {name}")
         cwd = Path(cwd_value).expanduser().resolve()
         if not cwd.is_dir():
-            raise AgtError(f"not a directory: {cwd}")
+            raise CliLaneError(f"not a directory: {cwd}")
         task_id = str(uuid.uuid4())
         session = f"{SESSION_PREFIX}{task_id.replace('-', '')[:12]}"
         log_dir = state_root() / "logs"
@@ -793,7 +816,7 @@ def run_task(name: str, cwd_value: str, command: list[str]) -> Task:
                 if dead or started:
                     break
                 if time.monotonic() >= deadline:
-                    raise AgtError("could not bind supervisor process identity")
+                    raise CliLaneError("could not bind supervisor process identity")
                 time.sleep(0.02)
             tmux(["set-option", "-t", session, "@agt_process_started", started or ""])
             tmux(["set-option", "-t", session, "@agt_committed", "1"])
@@ -881,10 +904,10 @@ def read_task(task: Task, all_history: bool) -> int:
 
 def log_task(task: Task, lines: int, follow: bool) -> int:
     if lines < 0:
-        raise AgtError("lines must be non-negative")
+        raise CliLaneError("lines must be non-negative")
     tail = shutil.which("tail")
     if not tail:
-        raise AgtError("tail is required")
+        raise CliLaneError("tail is required")
     arguments = [tail, "-n", str(lines)]
     log_path = validated_log_path(task)
     if follow:
@@ -901,9 +924,9 @@ def send_task(target: str, message: str, enter: bool) -> int:
     with registry_lock():
         task = resolve_task(target)
         if task.dead:
-            raise AgtError(f"task is not running: {task.name}")
+            raise CliLaneError(f"task is not running: {task.name}")
         if not task.committed:
-            raise AgtError(f"task is still initializing: {task.name}")
+            raise CliLaneError(f"task is still initializing: {task.name}")
         buffer_name = f"agt_{uuid.uuid4().hex}"
         tmux(["load-buffer", "-b", buffer_name, "-"], input_data=message.encode())
         try:
@@ -920,7 +943,7 @@ def wait_task(target: str, timeout: float | None) -> int:
     with registry_lock():
         task = resolve_task(target)
         if not task.committed:
-            raise AgtError(f"task initialization is incomplete: {task.name}")
+            raise CliLaneError(f"task initialization is incomplete: {task.name}")
         lock_handle = acquire_task_lock(task.id, exclusive=False)
     task_id = task.id
     started = time.monotonic()
@@ -930,7 +953,7 @@ def wait_task(target: str, timeout: float | None) -> int:
             if task.dead:
                 return task.result_code
             if timeout is not None and time.monotonic() - started >= timeout:
-                print(f"agt: timeout waiting for {task.name}", file=sys.stderr)
+                print(f"{PROGRAM}: timeout waiting for {task.name}", file=sys.stderr)
                 return 124
             time.sleep(0.2)
     finally:
@@ -939,20 +962,20 @@ def wait_task(target: str, timeout: float | None) -> int:
 
 def validated_supervisor(task: Task) -> int:
     if task.pid is None:
-        raise AgtError(f"task has no process id: {task.name}")
+        raise CliLaneError(f"task has no process id: {task.name}")
     if not task.process_started:
-        raise AgtError(f"task has no process identity: {task.name}")
+        raise CliLaneError(f"task has no process identity: {task.name}")
     try:
         session_id = os.getsid(task.pid)
     except ProcessLookupError as error:
-        raise AgtError(f"task process disappeared: {task.name}") from error
+        raise CliLaneError(f"task process disappeared: {task.name}") from error
     if session_id != task.pid:
-        raise AgtError("refusing a task whose supervisor is not its session leader")
+        raise CliLaneError("refusing a task whose supervisor is not its session leader")
     if process_start_time(task.pid) != task.process_started:
-        raise AgtError("refusing a task whose supervisor identity changed")
+        raise CliLaneError("refusing a task whose supervisor identity changed")
     server_pid = optional_int(tmux(["display-message", "-p", "#{pid}"]).stdout.decode().strip())
     if server_pid is not None and task.pid == server_pid:
-        raise AgtError("refusing to signal the tmux server")
+        raise CliLaneError("refusing to signal the tmux server")
     return task.pid
 
 
@@ -971,15 +994,15 @@ def terminate_dead_task_descendants(task: Task, grace: float) -> None:
     if managed_session_empty(task):
         return
     if task.pid is None:
-        raise AgtError(f"dead task has unverifiable descendants: {task.name}")
+        raise CliLaneError(f"dead task has unverifiable descendants: {task.name}")
     terminate_session_descendants(task.pid, grace, task.process_started)
     if not managed_session_empty(task):
-        raise AgtError(f"dead task descendants did not stop: {task.name}")
+        raise CliLaneError(f"dead task descendants did not stop: {task.name}")
 
 
 def stop_task_locked(task: Task, grace: float) -> Task:
     if grace < 0:
-        raise AgtError("grace must be non-negative")
+        raise CliLaneError("grace must be non-negative")
     if task.dead:
         if not managed_session_empty(task):
             tmux(["set-option", "-t", task.session, "@agt_stop_requested", "1"])
@@ -987,7 +1010,7 @@ def stop_task_locked(task: Task, grace: float) -> Task:
             return resolve_task(task.id)
         return task
     if not task.committed:
-        raise AgtError(f"task is still initializing: {task.name}")
+        raise CliLaneError(f"task is still initializing: {task.name}")
     tmux(["set-option", "-t", task.session, "@agt_stop_requested", "1"])
     current = resolve_task(task.id)
     if current.dead:
@@ -1006,7 +1029,7 @@ def stop_task_locked(task: Task, grace: float) -> Task:
         if refreshed.dead:
             terminate_dead_task_descendants(refreshed, grace)
             return resolve_task(task.id)
-        raise AgtError(f"task process disappeared: {task.name}")
+        raise CliLaneError(f"task process disappeared: {task.name}")
     deadline = time.monotonic() + grace
     while time.monotonic() < deadline:
         current = resolve_task(task.id)
@@ -1017,7 +1040,7 @@ def stop_task_locked(task: Task, grace: float) -> Task:
     if current.dead and managed_session_empty(current):
         return current
     if not current.dead and validated_supervisor(current) != supervisor:
-        raise AgtError("task supervisor changed while stopping; refusing SIGKILL")
+        raise CliLaneError("task supervisor changed while stopping; refusing SIGKILL")
     terminate_session_descendants(supervisor, 0, current.process_started)
     if process_start_time(supervisor) == current.process_started:
         with suppress(ProcessLookupError):
@@ -1029,7 +1052,7 @@ def stop_task_locked(task: Task, grace: float) -> Task:
         if current.dead and managed_session_empty(current):
             return current
         time.sleep(0.1)
-    raise AgtError(f"task did not stop: {task.name}")
+    raise CliLaneError(f"task did not stop: {task.name}")
 
 
 def stop_task(target: str, grace: float) -> Task:
@@ -1041,7 +1064,7 @@ def remove_task_locked(task: Task, force: bool, grace: float) -> None:
     current = task
     if not current.committed:
         if not force:
-            raise AgtError(f"task initialization is incomplete; use --force: {task.name}")
+            raise CliLaneError(f"task initialization is incomplete; use --force: {task.name}")
         log_path = validated_log_path(current) if current.log else None
         terminate_incomplete_session(
             current.session,
@@ -1056,11 +1079,11 @@ def remove_task_locked(task: Task, force: bool, grace: float) -> None:
         return
     if not current.dead:
         if not force:
-            raise AgtError(f"task is running; use --force to stop and remove: {task.name}")
+            raise CliLaneError(f"task is running; use --force to stop and remove: {task.name}")
         current = stop_task_locked(current, grace)
     if not managed_session_empty(current):
         if not force:
-            raise AgtError(f"refusing removal with live descendants: {current.name}")
+            raise CliLaneError(f"refusing removal with live descendants: {current.name}")
         terminate_dead_task_descendants(current, grace)
     log_path = validated_log_path(current) if current.log else None
     kill_managed_session(current.session)
@@ -1075,7 +1098,7 @@ def remove_task(target: str, force: bool, grace: float) -> Task:
         current = task
         if current.committed and not current.dead:
             if not force:
-                raise AgtError(f"task is running; use --force to stop and remove: {task.name}")
+                raise CliLaneError(f"task is running; use --force to stop and remove: {task.name}")
             current = stop_task_locked(current, grace)
         lock_handle = acquire_task_lock(current.id, exclusive=True)
         try:
@@ -1100,7 +1123,7 @@ def clean_tasks() -> int:
 
 def watch_tasks(interval: float) -> int:
     if interval <= 0:
-        raise AgtError("interval must be positive")
+        raise CliLaneError("interval must be positive")
     while True:
         sys.stdout.write("\033[2J\033[H")
         print_tasks(list_tasks(), as_json=False)
@@ -1109,7 +1132,7 @@ def watch_tasks(interval: float) -> int:
 
 
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(prog="agt")
+    root = argparse.ArgumentParser(prog=PROGRAM)
     commands = root.add_subparsers(dest="action", required=True)
 
     run = commands.add_parser("run")
@@ -1196,7 +1219,7 @@ def execute(arguments: argparse.Namespace) -> int:
         return clean_tasks()
     if arguments.action == "watch":
         return watch_tasks(arguments.interval)
-    raise AgtError(f"unknown action: {arguments.action}")
+    raise CliLaneError(f"unknown action: {arguments.action}")
 
 
 def main() -> int:
@@ -1206,14 +1229,14 @@ def main() -> int:
         if len(sys.argv) == 5 and sys.argv[1] == "__log":
             max_bytes = optional_int(sys.argv[3])
             if max_bytes is None:
-                raise AgtError("invalid log size")
+                raise CliLaneError("invalid log size")
             return sink_log(sys.argv[2], max_bytes, sys.argv[4])
         return execute(parser().parse_args())
-    except AgtError as error:
-        print(f"agt: {error}", file=sys.stderr)
+    except CliLaneError as error:
+        print(f"{PROGRAM}: {error}", file=sys.stderr)
         return 1
     except OSError as error:
-        print(f"agt: {error}", file=sys.stderr)
+        print(f"{PROGRAM}: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         return 130
