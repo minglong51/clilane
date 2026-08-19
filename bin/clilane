@@ -25,6 +25,7 @@ from typing import BinaryIO, Iterator, Sequence
 
 
 PROGRAM = "clilane"
+VERSION = "0.1.0"
 SOCKET = os.environ.get("CLILANE_TMUX_SOCKET") or os.environ.get(
     "AGT_TMUX_SOCKET", "agt"
 )
@@ -598,7 +599,9 @@ def resolve_task(target: str) -> Task:
         return prefixed[0]
     if len(prefixed) > 1:
         raise CliLaneError(f"ambiguous task id: {target}")
-    raise CliLaneError(f"task not found: {target}")
+    raise CliLaneError(
+        f"task not found: {target}; run '{PROGRAM} list' to see managed tasks"
+    )
 
 
 def set_task_environment(session: str) -> None:
@@ -852,11 +855,20 @@ def print_tasks(tasks: Sequence[Task], as_json: bool) -> None:
     if not tasks:
         print("no tasks")
         return
-    print(f"{'NAME':<22} {'STATE':<10} {'AGE':<6} {'PID':<8} COMMAND")
-    for task in tasks:
+    projects = [Path(task.cwd).name or task.cwd for task in tasks]
+    name_width = max(len("NAME"), *(len(task.name) for task in tasks))
+    project_width = max(len("PROJECT"), *(len(project) for project in projects))
+    print(
+        f"{'NAME':<{name_width}} {'STATE':<10} {'AGE':<6} "
+        f"{'PID':<8} {'PROJECT':<{project_width}} COMMAND"
+    )
+    for task, project in zip(tasks, projects):
         pid = str(task.pid) if not task.dead and task.pid is not None else "-"
         command = shlex.join(task.command)
-        print(f"{task.name:<22.22} {task.state:<10} {age(task.created):<6} {pid:<8} {command}")
+        print(
+            f"{task.name:<{name_width}} {task.state:<10} {age(task.created):<6} "
+            f"{pid:<8} {project:<{project_width}} {command}"
+        )
 
 
 def print_status(task: Task, as_json: bool) -> None:
@@ -877,7 +889,12 @@ def print_status(task: Task, as_json: bool) -> None:
         "log",
     )
     for key in keys:
-        print(f"{key}: {values[key]}")
+        value = values[key]
+        if value is None:
+            value = "-"
+        elif isinstance(value, bool):
+            value = "yes" if value else "no"
+        print(f"{key}: {value}")
     print(f"command: {shlex.join(task.command)}")
 
 
@@ -1132,55 +1149,96 @@ def watch_tasks(interval: float) -> int:
 
 
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(prog=PROGRAM)
+    root = argparse.ArgumentParser(
+        prog=PROGRAM,
+        description="Run and manage long-lived CLI tasks on this machine.",
+        epilog="""examples:
+  clilane run codex-galaxy -C ~/projects/galaxy-drill -- codex
+  clilane run kimi-paws -C ~/projects/paws -- kimi
+  clilane list
+  clilane status codex-galaxy
+  clilane attach codex-galaxy
+
+Only tasks started through clilane appear. Press Ctrl-Q to detach from a task.""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    root.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     commands = root.add_subparsers(dest="action", required=True)
 
-    run = commands.add_parser("run")
-    run.add_argument("name")
-    run.add_argument("-C", "--cwd", default=os.getcwd())
-    run.add_argument("command", nargs=argparse.REMAINDER)
+    run = commands.add_parser(
+        "run",
+        help="start a managed task",
+        description="Start a task in the background and return immediately.",
+        usage="clilane run NAME [-C DIR] -- COMMAND [ARG ...]",
+    )
+    run.add_argument("name", help="unique task name")
+    run.add_argument(
+        "-C",
+        "--cwd",
+        metavar="DIR",
+        default=os.getcwd(),
+        help="task working directory (default: current directory)",
+    )
+    run.add_argument(
+        "command",
+        metavar="COMMAND",
+        nargs=argparse.REMAINDER,
+        help="command and arguments, preceded by --",
+    )
 
-    listing = commands.add_parser("list", aliases=["ls"])
-    listing.add_argument("--json", action="store_true")
+    listing = commands.add_parser(
+        "list", aliases=["ls", "ps"], help="list all managed tasks"
+    )
+    listing.add_argument("--json", action="store_true", help="emit JSON")
 
-    status = commands.add_parser("status")
-    status.add_argument("target")
-    status.add_argument("--json", action="store_true")
+    status = commands.add_parser("status", help="show one task in detail")
+    status.add_argument("target", help="task name or ID prefix")
+    status.add_argument("--json", action="store_true", help="emit JSON")
 
-    attach = commands.add_parser("attach")
-    attach.add_argument("target")
+    attach = commands.add_parser("attach", help="attach to a task interactively")
+    attach.add_argument("target", help="task name or ID prefix; Ctrl-Q detaches")
 
-    read = commands.add_parser("read")
-    read.add_argument("target")
-    read.add_argument("-a", "--all", action="store_true")
+    read = commands.add_parser("read", help="print recent terminal output")
+    read.add_argument("target", help="task name or ID prefix")
+    read.add_argument("-a", "--all", action="store_true", help="print all scrollback")
 
-    log = commands.add_parser("log")
-    log.add_argument("target")
-    log.add_argument("-n", "--lines", type=int, default=200)
-    log.add_argument("-f", "--follow", action="store_true")
+    log = commands.add_parser("log", help="read the persistent task log")
+    log.add_argument("target", help="task name or ID prefix")
+    log.add_argument(
+        "-n", "--lines", type=int, default=200, help="lines to show (default: 200)"
+    )
+    log.add_argument("-f", "--follow", action="store_true", help="follow new output")
 
-    send = commands.add_parser("send")
-    send.add_argument("target")
-    send.add_argument("message")
-    send.add_argument("--no-enter", action="store_true")
+    send = commands.add_parser("send", help="send text to a running task")
+    send.add_argument("target", help="task name or ID prefix")
+    send.add_argument("message", help="text to send")
+    send.add_argument("--no-enter", action="store_true", help="do not press Enter")
 
-    wait = commands.add_parser("wait")
-    wait.add_argument("target")
-    wait.add_argument("--timeout", type=float)
+    wait = commands.add_parser("wait", help="wait for a task to finish")
+    wait.add_argument("target", help="task name or ID prefix")
+    wait.add_argument("--timeout", type=float, help="timeout in seconds")
 
-    stop = commands.add_parser("stop")
-    stop.add_argument("target")
-    stop.add_argument("--grace", type=float, default=3)
+    stop = commands.add_parser("stop", help="stop a task without removing it")
+    stop.add_argument("target", help="task name or ID prefix")
+    stop.add_argument(
+        "--grace", type=float, default=3, help="seconds before SIGKILL (default: 3)"
+    )
 
-    remove = commands.add_parser("rm", aliases=["remove"])
-    remove.add_argument("target")
-    remove.add_argument("--force", action="store_true")
-    remove.add_argument("--grace", type=float, default=3)
+    remove = commands.add_parser(
+        "rm", aliases=["remove"], help="remove a stopped or completed task"
+    )
+    remove.add_argument("target", help="task name or ID prefix")
+    remove.add_argument("--force", action="store_true", help="stop first if running")
+    remove.add_argument(
+        "--grace", type=float, default=3, help="seconds before SIGKILL (default: 3)"
+    )
 
-    commands.add_parser("clean")
+    commands.add_parser("clean", help="remove all completed and stopped tasks")
 
-    watch = commands.add_parser("watch")
-    watch.add_argument("--interval", type=float, default=1)
+    watch = commands.add_parser("watch", help="refresh the task list continuously")
+    watch.add_argument(
+        "--interval", type=float, default=1, help="refresh seconds (default: 1)"
+    )
 
     return root
 
@@ -1191,7 +1249,7 @@ def execute(arguments: argparse.Namespace) -> int:
         task = run_task(arguments.name, cwd, command)
         print(f"started {task.name} {task.id[:8]}")
         return 0
-    if arguments.action in {"list", "ls"}:
+    if arguments.action in {"list", "ls", "ps"}:
         print_tasks(list_tasks(), arguments.json)
         return 0
     if arguments.action == "status":
