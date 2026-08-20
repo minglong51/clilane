@@ -201,6 +201,7 @@ jobs:
           ./bin/clilane send ci-keys "" || rc=$?
           test "$rc" = "1"
           ./bin/clilane key ci-keys Escape Up C-c
+          ./bin/clilane wait ci-keys --timeout 10 || true
           ./bin/clilane rm ci-keys --force --grace 0
 
           ./bin/clilane run ci-crash -- sh -c 'echo ci-crash-marker; sleep 300'
