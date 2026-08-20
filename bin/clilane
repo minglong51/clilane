@@ -1683,28 +1683,24 @@ def run_task(name: str, cwd_value: str, command: list[str]) -> Task:
                     "on",
                     ";",
                     "set-option",
-                    "-p",
                     "-t",
                     session,
                     "@agt_meta",
                     encode_meta(meta),
                     ";",
                     "set-option",
-                    "-p",
                     "-t",
                     session,
                     "@agt_committed",
                     "0",
                     ";",
                     "set-option",
-                    "-p",
                     "-t",
                     session,
                     "@agt_process_started",
                     "",
                     ";",
                     "set-option",
-                    "-p",
                     "-t",
                     session,
                     "@agt_stop_requested",
@@ -1753,8 +1749,8 @@ def run_task(name: str, cwd_value: str, command: list[str]) -> Task:
                 if time.monotonic() >= deadline:
                     raise CliLaneError("could not bind supervisor process identity")
                 time.sleep(0.02)
-            tmux(["set-option", "-p", "-t", pane, "@agt_process_started", started or ""])
-            tmux(["set-option", "-p", "-t", pane, "@agt_committed", "1"])
+            tmux(["set-option", "-t", session, "@agt_process_started", started or ""])
+            tmux(["set-option", "-t", session, "@agt_committed", "1"])
             write_record(
                 task_id,
                 name,
@@ -2100,13 +2096,13 @@ def stop_task_locked(task: Task, grace: float) -> Task:
         raise CliLaneError("grace must be non-negative")
     if task.dead:
         if not managed_session_empty(task):
-            tmux(["set-option", "-p", "-t", task.pane, "@agt_stop_requested", "1"])
+            tmux(["set-option", "-t", task.session, "@agt_stop_requested", "1"])
             terminate_dead_task_descendants(task, grace)
             return resolve_task(task.id)
         return task
     if not task.committed:
         raise CliLaneError(f"task is still initializing: {task.name}")
-    tmux(["set-option", "-p", "-t", task.pane, "@agt_stop_requested", "1"])
+    tmux(["set-option", "-t", task.session, "@agt_stop_requested", "1"])
     current = resolve_task(task.id)
     if current.dead:
         if not managed_session_empty(current):
