@@ -66,7 +66,7 @@ jobs:
             "$XDG_CONFIG_HOME/clilane"
           test "$(stat -f '%Lp' "$CLILANE_STATE_HOME")" = "700"
           test "$(stat -f '%Lp' "$TMUX_TMPDIR")" = "700"
-          test "$(./bin/clilane --version)" = "clilane 0.2.1"
+          test "$(./bin/clilane --version)" = "clilane 0.3.0"
           ./bin/clilane --help | grep -F "~/projects/sample-app" >/dev/null
           python3 -c 'import sys; assert sys.version_info >= (3, 10)'
           tmux -V
@@ -142,7 +142,7 @@ jobs:
           host = fleet["hosts"][0]
           assert host["name"] == "ci-local"
           assert host["status"] == "ok"
-          assert host["clilane_version"] == "0.2.1"
+          assert host["clilane_version"] == "0.3.0"
           assert host["error"] is None
           assert len(host["tasks"]) == 1
           assert host["tasks"][0] == status
@@ -174,6 +174,49 @@ jobs:
             echo "isolated tmux server still has a session" >&2
             exit 1
           fi
+
+      - name: Exercise wait, key, and orphan recovery
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cleanup() {
+            ./bin/clilane rm ci-keys --force --grace 0 >/dev/null 2>&1 || true
+            ./bin/clilane rm ci-crash --force --grace 0 >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT HUP INT TERM
+
+          rc=0
+          ./bin/clilane run ci-exit --wait -- /nonexistent/ci-binary || rc=$?
+          test "$rc" = "127"
+          ./bin/clilane rm ci-exit
+          ./bin/clilane run ci-true --wait -- /usr/bin/true
+          ./bin/clilane rm ci-true
+
+          ./bin/clilane run ci-keys -- /bin/cat
+          rc=0
+          ./bin/clilane send ci-keys "$(printf '\033')" || rc=$?
+          test "$rc" = "1"
+          rc=0
+          ./bin/clilane send ci-keys "" || rc=$?
+          test "$rc" = "1"
+          ./bin/clilane key ci-keys Escape Up C-c
+          ./bin/clilane rm ci-keys --force --grace 0
+
+          ./bin/clilane run ci-crash -- sh -c 'echo ci-crash-marker; sleep 300'
+          sleep 1
+          crash_log="$(./bin/clilane status ci-crash --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["log"])')"
+          grep -Fq ci-crash-marker "$crash_log"
+          server_pid="$(tmux -L "$CLILANE_TMUX_SOCKET" -f /dev/null display-message -p '#{pid}')"
+          kill -9 "$server_pid"
+          sleep 1
+          test "$(./bin/clilane list)" = "no tasks"
+          ./bin/clilane orphans | grep -Fq ci-crash
+          ./bin/clilane clean
+          test -f "$crash_log"
+          ./bin/clilane clean --orphans
+          test ! -f "$crash_log"
+          test "$(./bin/clilane orphans)" = "no orphaned tasks"
 
       - name: Clean isolated task
         if: always()

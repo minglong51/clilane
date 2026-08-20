@@ -236,18 +236,20 @@ named `agt` for compatibility with tasks created before the project was renamed.
 
 | Command | Behavior |
 |---|---|
-| `run NAME [-C DIR] -- COMMAND [ARG ...]` | Start a background task. `DIR` defaults to the current directory. |
+| `run NAME [-C DIR] [--wait] -- COMMAND [ARG ...]` | Start a background task. `DIR` defaults to the current directory. `--wait` blocks and returns the command's exit status; `--timeout` returns 124. |
 | `list`, `ls`, `ps` | List tasks on the current host. `--json` emits an array. |
 | `fleet` | Read the configured local and SSH hosts. Supports `--config`, `--timeout`, and `--json`. |
 | `status TARGET` | Show one task by name or unique ID prefix. Supports `--json`. |
 | `attach TARGET` | Attach interactively. `Ctrl-Q` detaches. |
 | `read TARGET` | Print the last 200 terminal lines. `--all` prints retained scrollback. |
 | `log TARGET` | Read persistent output. `--lines` defaults to 200; `--follow` follows rotation. |
-| `send TARGET MESSAGE` | Paste text and press Enter. `--no-enter` only pastes. |
+| `send TARGET MESSAGE` | Paste text and press Enter. `--no-enter` only pastes. Control characters are rejected; use `key`. |
+| `key TARGET KEY [KEY ...]` | Press named keys, such as `Enter`, `Escape`, `Up`, `Tab`, `BTab`, or `C-c`. `--list` prints supported names. |
 | `wait TARGET` | Wait and return the task's exit status. `--timeout` returns 124 on timeout. |
 | `stop TARGET` | Send TERM, then KILL after `--grace` seconds. The default grace is 3 seconds. |
 | `rm`, `remove TARGET` | Remove a finished task and its logs. `--force` stops a running task first. |
-| `clean` | Remove completed, stopped, and incomplete tasks. Running tasks remain. |
+| `clean` | Remove completed, stopped, incomplete, and lost tasks. Running tasks and orphaned logs remain. `--dry-run` reports only; `--orphans` also deletes orphaned logs. |
+| `orphans` | List tasks whose tmux server died but whose logs survive. Supports `--json`. |
 | `watch` | Refresh the current-host task list. `--interval` defaults to 1 second. |
 
 Task names are unique per host. They are 1–64 characters, begin with an ASCII
@@ -288,8 +290,10 @@ running.
 | `XDG_STATE_HOME` | Uses `$XDG_STATE_HOME/clilane` for state. |
 | `AGT_TMUX_SOCKET`, `AGT_STATE_HOME` | Legacy compatibility settings. |
 
-The default state root is `~/.local/state/clilane`. Older logs under
-`~/.local/state/agt` remain readable for compatibility.
+The default state root is `~/.local/state/clilane`. Each task also writes a small
+JSON record under the state root's `registry/` directory so its log can be
+identified and reclaimed after the tmux server or the machine restarts. Older
+logs under `~/.local/state/agt` remain readable for compatibility.
 
 ## Security and logging
 
@@ -305,6 +309,8 @@ The default state root is `~/.local/state/clilane`. Older logs under
 - Control and log directories use mode `0700`; current logs use mode `0600`.
 - Each task retains a 50 MiB current log and one previous rotated log.
 - `stop` retains logs. `rm` and `clean` delete the current and previous logs.
+- After a tmux server crash or reboot, logs survive and are listed by `orphans`;
+  plain `clean` preserves them and `clean --orphans` deletes them.
 - Fleet SSH runs without a PTY, stdin, agent forwarding, X11, or forwarding. It
   uses batch mode, strict known-host checking, one connection attempt, a
   transport timeout, a fixed remote command, and a 256 KiB per-host response
@@ -332,7 +338,8 @@ The default state root is `~/.local/state/clilane`. Older logs under
 
 - Only tasks started through CLI Lane are visible.
 - Each host exposes one Unix user's selected CLI Lane tmux socket.
-- No reboot or CLI Lane tmux-server-crash adoption.
+- No reboot or CLI Lane tmux-server-crash adoption of running tasks; their exit
+  status is lost, though their logs survive and are listed by `orphans`.
 - A descendant that creates a new POSIX session can escape lifecycle control.
 - No cross-host mutation, scheduling, retries, dependency graphs, notifications,
   web UI, or automatic SSH-host discovery.
