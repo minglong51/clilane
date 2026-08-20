@@ -238,7 +238,7 @@ named `agt` for compatibility with tasks created before the project was renamed.
 
 | Command | Behavior |
 |---|---|
-| `run NAME [-C DIR] [--wait] -- COMMAND [ARG ...]` | Start a background task. `DIR` defaults to the current directory. `--wait` blocks and returns the command's exit status; `--timeout` returns 124. |
+| `run NAME [-C DIR] [--on-exit COMMAND] [--wait] -- COMMAND [ARG ...]` | Start a background task. `DIR` defaults to the current directory. `--wait` blocks and returns the command's exit status; `--timeout` returns 124. `--on-exit` runs a shell command after the task exits. |
 | `list`, `ls`, `ps` | List tasks on the current host. `--json` emits an array. |
 | `fleet` | Read the configured local and SSH hosts. Supports `--config`, `--timeout`, and `--json`. |
 | `status TARGET` | Show one task by name or unique ID prefix. Supports `--json`. |
@@ -253,6 +253,15 @@ named `agt` for compatibility with tasks created before the project was renamed.
 | `clean` | Remove completed, stopped, incomplete, and lost tasks. Running tasks and orphaned logs remain. `--dry-run` reports only; `--orphans` also deletes orphaned logs. |
 | `orphans` | List tasks whose tmux server died but whose logs survive. Supports `--json`. |
 | `watch` | Refresh the current-host task list. `--interval` defaults to 1 second. |
+
+The `--on-exit` hook runs through `/bin/sh -c` in the task's working directory
+after the task process exits, with `CLILANE_TASK_NAME`, `CLILANE_TASK_ID`,
+`CLILANE_LOG`, `CLILANE_EXIT_CODE`, and `CLILANE_SIGNAL` (the signal name, or
+empty) in its environment. Hook output is captured in the task log. The hook
+gets 30 seconds, then it is killed; its exit status never changes the task's.
+With `--wait`, the wait returns after the hook finishes. Stopping or removing
+the task while the hook runs delivers TERM to the hook first and kills it after
+the grace period; the task's recorded exit status is unaffected either way.
 
 Task names are unique per host. They are 1–64 characters, begin with an ASCII
 letter or number, and otherwise contain ASCII letters, numbers, dots, dashes, or
