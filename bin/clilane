@@ -41,6 +41,7 @@ SOCKET = os.environ.get("CLILANE_TMUX_SOCKET") or os.environ.get(
 SESSION_PREFIX = "agt_"
 SERVER_TAG = "agt-v1"
 FIELD_SEPARATOR = "|"
+ON_EXIT_TIMEOUT = 30.0
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 ENV_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 KEY_PATTERN = re.compile(r"^(?:C-|M-|C-M-|M-C-)?[\x21-\x3a\x3c-\x7e]$")
@@ -232,6 +233,7 @@ class RunSpec:
     cwd: str
     wait: bool
     timeout: float | None
+    on_exit: str | None
     command: list[str]
 
 
@@ -724,16 +726,37 @@ def decode_meta(value: str) -> dict[str, object]:
     return decoded
 
 
-def encode_command(command: Sequence[str]) -> str:
-    return encode_meta({"command": list(command)})
+def encode_launcher(
+    command: Sequence[str],
+    on_exit: str | None,
+    name: str,
+    task_id: str,
+    log_path: str,
+) -> str:
+    return encode_meta(
+        {
+            "command": list(command),
+            "on_exit": on_exit,
+            "name": name,
+            "id": task_id,
+            "log": log_path,
+        }
+    )
 
 
-def decode_command(value: str) -> list[str]:
-    decoded = decode_meta(value).get("command")
-    if not isinstance(decoded, list) or not all(isinstance(part, str) for part in decoded):
+def decode_launcher(value: str) -> dict[str, object]:
+    decoded = decode_meta(value)
+    command = decoded.get("command")
+    if not isinstance(command, list) or not all(isinstance(part, str) for part in command):
         raise CliLaneError("corrupt launcher command")
-    if not decoded:
+    if not command:
         raise CliLaneError("empty launcher command")
+    on_exit = decoded.get("on_exit")
+    if on_exit is not None and not isinstance(on_exit, str):
+        raise CliLaneError("corrupt launcher hook")
+    for key in ("name", "id", "log"):
+        if not isinstance(decoded.get(key), str):
+            raise CliLaneError("corrupt launcher metadata")
     return decoded
 
 
@@ -912,7 +935,8 @@ def terminate_incomplete_session(
 
 
 def supervise(encoded_command: str) -> int:
-    command = decode_command(encoded_command)
+    launcher = decode_launcher(encoded_command)
+    command = launcher["command"]
     pending: list[signal.Signals] = []
 
     def remember(signum: int, _frame: object) -> None:
@@ -945,9 +969,86 @@ def supervise(encoded_command: str) -> int:
         if waited == child:
             break
         time.sleep(0.05)
-    terminate_session_descendants(os.getpid(), 0.2)
     result = os.waitstatus_to_exitcode(status)
-    return 128 - result if result < 0 else result
+    exit_code = 128 - result if result < 0 else result
+    signal_name = ""
+    if result < 0:
+        try:
+            signal_name = signal.Signals(-result).name
+        except ValueError:
+            signal_name = f"SIG{-result}"
+    record_result(exit_code, signal_name)
+    terminate_session_descendants(os.getpid(), 0.2)
+    try:
+        if shutdown_deadline is None:
+            run_exit_hook(launcher, exit_code, signal_name, pending)
+    finally:
+        terminate_session_descendants(os.getpid(), 0.2)
+    return exit_code
+
+
+def record_result(exit_code: int, signal_name: str) -> None:
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        return
+    tmux(
+        ["set-option", "-p", "-t", pane, "@agt_result", f"{exit_code}:{signal_name}"],
+        check=False,
+    )
+
+
+def report_hook(message: str) -> None:
+    try:
+        print(f"{PROGRAM}: {message}", file=sys.stderr)
+    except OSError:
+        pass
+
+
+def run_exit_hook(
+    launcher: dict[str, object],
+    exit_code: int,
+    signal_name: str,
+    pending: list[signal.Signals],
+) -> None:
+    on_exit = launcher.get("on_exit")
+    if not on_exit:
+        return
+    environment = dict(os.environ)
+    environment.update(
+        CLILANE_TASK_NAME=str(launcher["name"]),
+        CLILANE_TASK_ID=str(launcher["id"]),
+        CLILANE_LOG=str(launcher["log"]),
+        CLILANE_EXIT_CODE=str(exit_code),
+        CLILANE_SIGNAL=signal_name,
+    )
+    try:
+        hook = subprocess.Popen(["/bin/sh", "-c", str(on_exit)], env=environment)
+    except OSError as error:
+        report_hook(f"on-exit hook failed to start: {error}")
+        return
+    deadline = time.monotonic() + ON_EXIT_TIMEOUT
+    shutdown_deadline: float | None = None
+    timed_out = False
+    while True:
+        while pending:
+            sent_signal = pending.pop(0)
+            if sent_signal == signal.SIGHUP and shutdown_deadline is None:
+                shutdown_deadline = time.monotonic() + 0.5
+            signal_session(os.getpid(), signal.SIGCONT, include_leader=False)
+            signal_session(os.getpid(), sent_signal, include_leader=False)
+        if hook.poll() is not None:
+            break
+        now = time.monotonic()
+        if now >= deadline:
+            timed_out = True
+            signal_session(os.getpid(), signal.SIGKILL, include_leader=False)
+        elif shutdown_deadline is not None and now >= shutdown_deadline:
+            signal_session(os.getpid(), signal.SIGKILL, include_leader=False)
+        time.sleep(0.05)
+    if timed_out:
+        report_hook(f"on-exit hook killed after {int(ON_EXIT_TIMEOUT)}s")
+    elif hook.returncode != 0:
+        report_hook(f"on-exit hook exited {hook.returncode}")
 
 
 def sink_log(path_value: str, max_bytes: int, session: str) -> int:
@@ -1014,6 +1115,7 @@ def list_tasks(timeout: float | None = None) -> list[Task]:
         "#{@agt_committed}",
         "#{@agt_process_started}",
         "#{@agt_stop_requested}",
+        "#{@agt_result}",
         "#{pane_id}",
         "#{pane_dead}",
         "#{pane_dead_status}",
@@ -1042,6 +1144,7 @@ def list_tasks(timeout: float | None = None) -> list[Task]:
             committed,
             process_started,
             stopped,
+            recorded,
             pane,
             dead,
             status,
@@ -1055,6 +1158,13 @@ def list_tasks(timeout: float | None = None) -> list[Task]:
         command = meta.get("command")
         if not isinstance(command, list) or not all(isinstance(part, str) for part in command):
             raise CliLaneError(f"corrupt task metadata in {session}")
+        recorded_code: int | None = None
+        recorded_signal: str | None = None
+        if dead == "1" and recorded:
+            code_text, _, signal_text = recorded.partition(":")
+            recorded_code = optional_int(code_text)
+            if recorded_code is not None:
+                recorded_signal = signal_text or None
         tasks.append(
             Task(
                 session=session,
@@ -1069,8 +1179,10 @@ def list_tasks(timeout: float | None = None) -> list[Task]:
                 process_started=process_started or None,
                 stop_requested=stopped == "1",
                 dead=dead == "1",
-                exit_code=optional_int(status),
-                signal_name=normalized_signal(dead_signal),
+                exit_code=recorded_code if recorded_code is not None else optional_int(status),
+                signal_name=recorded_signal
+                if recorded_code is not None
+                else normalized_signal(dead_signal),
                 pid=optional_int(pid),
                 attached=(optional_int(attached) or 0) > 0,
             )
@@ -1528,10 +1640,13 @@ def positive_timeout(value: str) -> float:
     return parsed
 
 
-def run_spec(default_cwd: str, parts: Sequence[str]) -> RunSpec:
+def run_spec(
+    default_cwd: str, default_on_exit: str | None, parts: Sequence[str]
+) -> RunSpec:
     cwd = default_cwd
     wait = False
     timeout: float | None = None
+    on_exit = default_on_exit
     remaining = list(parts)
     while remaining and remaining[0] != "--":
         if remaining[0] in {"-C", "--cwd"}:
@@ -1558,10 +1673,22 @@ def run_spec(default_cwd: str, parts: Sequence[str]) -> RunSpec:
             timeout = positive_timeout(remaining[0].split("=", 1)[1])
             remaining = remaining[1:]
             continue
+        if remaining[0] == "--on-exit":
+            if len(remaining) < 2:
+                raise CliLaneError("--on-exit requires a command")
+            on_exit = remaining[1]
+            remaining = remaining[2:]
+            continue
+        if remaining[0].startswith("--on-exit="):
+            on_exit = remaining[0].split("=", 1)[1]
+            remaining = remaining[1:]
+            continue
         break
     if timeout is not None and not wait:
         raise CliLaneError("--timeout requires --wait")
-    return RunSpec(cwd, wait, timeout, command_from_remainder(remaining))
+    if on_exit is not None and not on_exit.strip():
+        raise CliLaneError("--on-exit requires a command")
+    return RunSpec(cwd, wait, timeout, on_exit, command_from_remainder(remaining))
 
 
 def bind_detach_key() -> None:
@@ -1601,7 +1728,9 @@ def kill_managed_session(session: str) -> None:
     raise CliLaneError(detail or f"could not remove tmux session: {session}")
 
 
-def run_task(name: str, cwd_value: str, command: list[str]) -> Task:
+def run_task(
+    name: str, cwd_value: str, command: list[str], on_exit: str | None = None
+) -> Task:
     with registry_lock():
         ensure_server_available()
         validate_name(name)
@@ -1643,6 +1772,7 @@ def run_task(name: str, cwd_value: str, command: list[str]) -> Task:
             "cwd": str(cwd),
             "created": created_stamp,
             "log": str(log_path),
+            "on_exit": on_exit,
         }
         script = Path(__file__).resolve()
         committed = False
@@ -1726,7 +1856,7 @@ def run_task(name: str, cwd_value: str, command: list[str]) -> Task:
                     "--",
                     str(script),
                     "__supervise",
-                    encode_command(command),
+                    encode_launcher(command, on_exit, name, task_id, str(log_path)),
                 ]
             )
             deadline = time.monotonic() + 0.5
@@ -2422,7 +2552,7 @@ Only tasks started through clilane appear. Press Ctrl-Q to detach from a task.""
         "run",
         help="start a managed task",
         description="Start a task in the background and return immediately.",
-        usage="clilane run NAME [-C DIR] [--wait [--timeout SECONDS]] -- COMMAND [ARG ...]",
+        usage="clilane run NAME [-C DIR] [--on-exit COMMAND] [--wait [--timeout SECONDS]] -- COMMAND [ARG ...]",
     )
     run.add_argument("name", help="unique task name")
     run.add_argument(
@@ -2436,6 +2566,11 @@ Only tasks started through clilane appear. Press Ctrl-Q to detach from a task.""
         "--wait",
         action="store_true",
         help="block until the command exits and return its exit status",
+    )
+    run.add_argument(
+        "--on-exit",
+        metavar="COMMAND",
+        help="shell command to run after the task exits",
     )
     run.add_argument(
         "--timeout",
@@ -2567,14 +2702,14 @@ Only tasks started through clilane appear. Press Ctrl-Q to detach from a task.""
 
 def execute(arguments: argparse.Namespace) -> int:
     if arguments.action == "run":
-        spec = run_spec(arguments.cwd, arguments.command)
+        spec = run_spec(arguments.cwd, arguments.on_exit, arguments.command)
         wait = arguments.wait or spec.wait
         timeout = spec.timeout
         if arguments.timeout is not None:
             timeout = positive_timeout(str(arguments.timeout))
         if timeout is not None and not wait:
             raise CliLaneError("--timeout requires --wait")
-        task = run_task(arguments.name, spec.cwd, spec.command)
+        task = run_task(arguments.name, spec.cwd, spec.command, spec.on_exit)
         print(f"created {task.name} {task.id[:8]}")
         if wait:
             return wait_task(task.id, timeout)
