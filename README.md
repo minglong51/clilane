@@ -1,5 +1,7 @@
 # CLI Lane
 
+[![Smoke](https://github.com/minglong51/clilane/actions/workflows/smoke.yml/badge.svg)](https://github.com/minglong51/clilane/actions/workflows/smoke.yml)
+
 CLI Lane keeps long-running terminal work alive without taking over your terminal.
 Start Codex, Claude Code, Kimi, a development server, or any other command in the
 background. Reconnect later through SSH, Mosh, or Termius to inspect, attach, send
