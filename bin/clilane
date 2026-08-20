@@ -40,7 +40,7 @@ SOCKET = os.environ.get("CLILANE_TMUX_SOCKET") or os.environ.get(
 )
 SESSION_PREFIX = "agt_"
 SERVER_TAG = "agt-v1"
-FIELD_SEPARATOR = "\x1f"
+FIELD_SEPARATOR = "|"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 ENV_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 KEY_PATTERN = re.compile(r"^(?:C-|M-|C-M-|M-C-)?[\x21-\x3a\x3c-\x7e]$")
@@ -950,7 +950,7 @@ def supervise(encoded_command: str) -> int:
     return 128 - result if result < 0 else result
 
 
-def sink_log(path_value: str, max_bytes: int, pane: str) -> int:
+def sink_log(path_value: str, max_bytes: int, session: str) -> int:
     if max_bytes <= 0:
         raise CliLaneError("log size must be positive")
     path = Path(path_value)
@@ -968,7 +968,7 @@ def sink_log(path_value: str, max_bytes: int, pane: str) -> int:
                     break
             else:
                 result = tmux(
-                    ["display-message", "-p", "-t", pane, "#{pane_dead}"],
+                    ["display-message", "-p", "-t", session, "#{pane_dead}"],
                     check=False,
                 )
                 is_dead = result.returncode != 0 or result.stdout.decode().strip() == "1"
@@ -1711,7 +1711,7 @@ def run_task(name: str, cwd_value: str, command: list[str]) -> Task:
             set_task_environment(session)
             sink = (
                 f"exec {shlex.quote(str(script))} __log "
-                f"{shlex.quote(str(log_path))} {LOG_MAX_BYTES} {shlex.quote(pane)}"
+                f"{shlex.quote(str(log_path))} {LOG_MAX_BYTES} {shlex.quote(session)}"
             )
             tmux(["pipe-pane", "-t", pane, sink])
             bind_detach_key()
