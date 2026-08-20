@@ -86,7 +86,7 @@ jobs:
           for path in sys.argv[1:]:
               assert os.stat(path).st_mode & 0o777 == 0o700, path
           PY
-          test "$(./bin/clilane --version)" = "clilane 0.3.0"
+          test "$(./bin/clilane --version)" = "clilane 0.4.0"
           ./bin/clilane --help | grep -F "~/projects/sample-app" >/dev/null
           python3 -c 'import sys; assert sys.version_info >= (3, 10)'
           tmux -V
@@ -162,11 +162,33 @@ jobs:
           host = fleet["hosts"][0]
           assert host["name"] == "ci-local"
           assert host["status"] == "ok"
-          assert host["clilane_version"] == "0.3.0"
+          assert host["clilane_version"] == "0.4.0"
           assert host["error"] is None
           assert len(host["tasks"]) == 1
           assert host["tasks"][0] == status
           PY
+
+          ./bin/clilane fleet --config "$fleet_config" status ci-local:ci-smoke \
+            > "$RUNNER_TEMP/fleet-status.json"
+          python3 - "$RUNNER_TEMP/fleet-status.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          status = json.loads(Path(sys.argv[1]).read_text())
+          assert status["name"] == "ci-smoke"
+          assert status["state"] == "running"
+          PY
+          ./bin/clilane fleet --config "$fleet_config" log ci-local:ci-smoke \
+            --lines 20 | grep -Fq "$marker"
+          rc=0
+          ./bin/clilane fleet --config "$fleet_config" status ci-local:ghost \
+            >/dev/null 2>&1 || rc=$?
+          test "$rc" = "1"
+          rc=0
+          ./bin/clilane fleet --config "$fleet_config" log nohost:ci-smoke \
+            >/dev/null 2>&1 || rc=$?
+          test "$rc" = "1"
 
           ./bin/clilane stop ci-smoke --grace 1
           ./bin/clilane status ci-smoke --json > "$RUNNER_TEMP/stopped.json"
