@@ -29,7 +29,7 @@ from typing import BinaryIO, Iterator, Sequence
 
 
 PROGRAM = "clilane"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 TASK_STATE_INITIALIZING = "initializing"
 TASK_STATE_RUNNING = "running"
 TASK_STATE_STOPPED = "stopped"
@@ -147,16 +147,20 @@ FLEET_TASK_STATES = frozenset(
 )
 FLEET_SENTINEL_LINE = re.compile(rf"(?m)^{re.escape(FLEET_SENTINEL)}\r?\n")
 FLEET_FRAME_WHITESPACE = re.compile(r"\s*")
-FLEET_REMOTE_SCRIPT = (
-    "{ "
-    f"printf \"%s\\n\" {shlex.quote(FLEET_SENTINEL)}; "
-    "clilane --version && clilane list --json; } 2>&1"
-)
-FLEET_REMOTE_COMMAND = "/bin/sh -c " + shlex.quote(
-    "if command -v zsh >/dev/null 2>&1; "
-    f"then exec zsh -lc {shlex.quote(FLEET_REMOTE_SCRIPT)}; "
-    f"fi; exec /bin/sh -lc {shlex.quote(FLEET_REMOTE_SCRIPT)}"
-)
+def fleet_remote_command(script_body: str) -> str:
+    script = (
+        "{ "
+        f"printf \"%s\\n\" {shlex.quote(FLEET_SENTINEL)}; "
+        f"clilane --version && {script_body}; }} 2>&1"
+    )
+    return "/bin/sh -c " + shlex.quote(
+        "if command -v zsh >/dev/null 2>&1; "
+        f"then exec zsh -lc {shlex.quote(script)}; "
+        f"fi; exec /bin/sh -lc {shlex.quote(script)}"
+    )
+
+
+FLEET_REMOTE_COMMAND = fleet_remote_command("clilane list --json")
 TMUX_MIN_VERSION = (3, 3)
 TMUX_VERSION_PATTERN = re.compile(r"(\d+)\.(\d+)")
 
@@ -786,6 +790,29 @@ def process_start_time(pid: int) -> str | None:
     return value or None
 
 
+def process_is_zombie(pid: int) -> bool:
+    if sys.platform == "linux":
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(errors="replace")
+        except OSError:
+            return False
+        _, separator, rest = stat.rpartition(")")
+        if not separator:
+            return False
+        fields = rest.split()
+        return bool(fields) and fields[0] in {"Z", "X", "x"}
+    completed = subprocess.run(
+        ["/bin/ps", "-p", str(pid), "-o", "state="],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=tmux_client_environment(),
+        check=False,
+    )
+    if completed.returncode != 0:
+        return False
+    return completed.stdout.decode(errors="replace").strip().startswith("Z")
+
+
 def all_pids() -> list[int]:
     if sys.platform == "linux":
         try:
@@ -814,7 +841,7 @@ def session_pids(session_id: int) -> list[int]:
     found: list[int] = []
     for pid in all_pids():
         with suppress(ProcessLookupError):
-            if os.getsid(pid) == session_id:
+            if os.getsid(pid) == session_id and not process_is_zombie(pid):
                 found.append(pid)
     return found
 
@@ -1258,18 +1285,41 @@ def validate_fleet_task(host: FleetHost, value: object) -> dict[str, object]:
     return {field: value[field] for field in FLEET_TASK_FIELDS}
 
 
-def parse_fleet_response(host: FleetHost, output: bytes) -> FleetResult:
+def fleet_frame_payload(text: str) -> str:
+    sentinel = FLEET_SENTINEL_LINE.search(text)
+    if not sentinel:
+        return text.strip()
+    position = FLEET_FRAME_WHITESPACE.match(text, sentinel.end()).end()
+    if not text.startswith(f"{PROGRAM} ", position):
+        return text[position:].strip()
+    version_end = text.find("\n", position)
+    if version_end == -1:
+        return ""
+    return text[version_end + 1 :].strip()
+
+
+def split_fleet_frame(
+    host: FleetHost, output: bytes
+) -> tuple[FleetResult | None, str, str]:
     if len(output) > FLEET_MAX_OUTPUT_BYTES:
-        return fleet_error_result(
-            host, "protocol", f"response exceeded {FLEET_OUTPUT_LIMIT_LABEL}"
+        return (
+            fleet_error_result(
+                host, "protocol", f"response exceeded {FLEET_OUTPUT_LIMIT_LABEL}"
+            ),
+            "",
+            "",
         )
     try:
         text = output.decode("utf-8")
     except UnicodeDecodeError:
-        return fleet_error_result(host, "protocol", "response was not UTF-8")
+        return fleet_error_result(host, "protocol", "response was not UTF-8"), "", ""
     sentinel = FLEET_SENTINEL_LINE.search(text)
     if not sentinel:
-        return fleet_error_result(host, "protocol", "response sentinel was missing")
+        return (
+            fleet_error_result(host, "protocol", "response sentinel was missing"),
+            "",
+            "",
+        )
     position = FLEET_FRAME_WHITESPACE.match(text, sentinel.end()).end()
     version_end = text.find("\n", position)
     if version_end == -1:
@@ -1277,12 +1327,28 @@ def parse_fleet_response(host: FleetHost, output: bytes) -> FleetResult:
         payload = ""
     else:
         version_line = text[position:version_end].rstrip("\r")
-        payload = text[version_end + 1 :].strip()
+        payload = text[version_end + 1 :]
     if not version_line.startswith(f"{PROGRAM} "):
-        return fleet_error_result(host, "protocol", "clilane version was missing")
+        return (
+            fleet_error_result(host, "protocol", "clilane version was missing"),
+            "",
+            "",
+        )
     version = version_line[len(PROGRAM) + 1 :].strip()
     if not version:
-        return fleet_error_result(host, "protocol", "clilane version was empty")
+        return (
+            fleet_error_result(host, "protocol", "clilane version was empty"),
+            "",
+            "",
+        )
+    return None, version, payload
+
+
+def parse_fleet_response(host: FleetHost, output: bytes) -> FleetResult:
+    error, version, payload = split_fleet_frame(host, output)
+    if error is not None:
+        return error
+    payload = payload.strip()
     try:
         decoded = json.loads(
             payload,
@@ -1410,8 +1476,23 @@ def collect_remote_fleet_host(
     timeout: float,
     cancel_event: threading.Event | None = None,
 ) -> FleetResult:
+    error, output = fleet_remote_output(
+        host, ssh, timeout, FLEET_REMOTE_COMMAND, cancel_event
+    )
+    if error is not None:
+        return error
+    return parse_fleet_response(host, output)
+
+
+def fleet_remote_output(
+    host: FleetHost,
+    ssh: str,
+    timeout: float,
+    remote_command: str,
+    cancel_event: threading.Event | None = None,
+) -> tuple[FleetResult | None, bytes]:
     if not host.destination:
-        return fleet_error_result(host, "config", "SSH destination was missing")
+        return fleet_error_result(host, "config", "SSH destination was missing"), b""
     command = [
         ssh,
         "-T",
@@ -1452,31 +1533,40 @@ def collect_remote_fleet_host(
         "LogLevel=ERROR",
         "--",
         host.destination,
-        FLEET_REMOTE_COMMAND,
+        remote_command,
     ]
     try:
         completed, exceeded = run_bounded_process(
             command, timeout, FLEET_MAX_OUTPUT_BYTES, cancel_event
         )
     except subprocess.TimeoutExpired:
-        return fleet_error_result(host, "timeout", f"timed out after {timeout:g} seconds")
+        return (
+            fleet_error_result(host, "timeout", f"timed out after {timeout:g} seconds"),
+            b"",
+        )
     except OSError as error:
-        return fleet_error_result(host, "ssh", str(error))
+        return fleet_error_result(host, "ssh", str(error)), b""
     if exceeded:
-        return fleet_error_result(
-            host, "protocol", f"response exceeded {FLEET_OUTPUT_LIMIT_LABEL}"
+        return (
+            fleet_error_result(
+                host, "protocol", f"response exceeded {FLEET_OUTPUT_LIMIT_LABEL}"
+            ),
+            b"",
         )
     if completed.returncode != 0:
         detail = completed.stderr.decode(errors="replace").strip()
         if not detail:
-            detail = completed.stdout.decode(errors="replace").strip()
+            detail = fleet_frame_payload(completed.stdout.decode(errors="replace"))
         kind = "ssh" if completed.returncode == 255 else "remote"
-        return fleet_error_result(
-            host,
-            kind,
-            detail or f"remote command exited {completed.returncode}",
+        return (
+            fleet_error_result(
+                host,
+                kind,
+                detail or f"remote command exited {completed.returncode}",
+            ),
+            b"",
         )
-    return parse_fleet_response(host, completed.stdout)
+    return None, completed.stdout
 
 
 def collect_fleet(hosts: Sequence[FleetHost], timeout: float) -> list[FleetResult]:
@@ -1952,6 +2042,93 @@ def fleet_display_cell(value: str, limit: int | None = None) -> str:
     if limit is None or len(cleaned) <= limit:
         return cleaned
     return cleaned[: limit - 1] + "…"
+
+
+def fleet_verb_target(hosts: Sequence[FleetHost], target: str) -> tuple[FleetHost, str]:
+    host_name, separator, task = target.partition(":")
+    if not separator or not host_name or not task:
+        raise CliLaneError("fleet status/log target must look like HOST:TASK")
+    if not NAME_PATTERN.fullmatch(task):
+        raise CliLaneError(f"invalid task target: {task}")
+    host = next((entry for entry in hosts if entry.name == host_name), None)
+    if host is None:
+        known = ", ".join(entry.name for entry in hosts)
+        raise CliLaneError(f"unknown fleet host: {host_name}; configured hosts: {known}")
+    return host, task
+
+
+def sanitized_log_text(payload: str) -> str:
+    kept = []
+    for character in payload:
+        if character in "\n\t" or character.isprintable():
+            kept.append(character)
+    return "".join(kept)
+
+
+def fleet_verb(
+    configured: str | None, verb: str, target: str, lines: int, timeout: float
+) -> int:
+    if lines <= 0:
+        raise CliLaneError("--lines must be positive")
+    hosts = load_fleet_hosts(configured)
+    host, task = fleet_verb_target(hosts, target)
+    if host.transport == "local":
+        resolved = resolve_task(task)
+        if verb == "status":
+            print(json.dumps(resolved.as_dict(), indent=2, allow_nan=False))
+            return 0
+        return log_task(resolved, lines, False)
+    ssh = shutil.which("ssh")
+    if not ssh:
+        raise CliLaneError("ssh is required for remote fleet hosts")
+    quoted = shlex.quote(task)
+    if verb == "status":
+        script = f"clilane status {quoted} --json"
+    else:
+        script = f"clilane log {quoted} --lines {lines}"
+    error, output = fleet_remote_output(
+        host, ssh, timeout, fleet_remote_command(script)
+    )
+    if error is not None:
+        detail = error.error_message or "remote command failed"
+        if (
+            verb == "log"
+            and error.error_kind == "protocol"
+            and detail.startswith("response exceeded")
+        ):
+            detail = f"{detail}; reduce --lines"
+        raise CliLaneError(f"{host.name}: {detail}")
+    frame_error, _, payload = split_fleet_frame(host, output)
+    if frame_error is not None:
+        raise CliLaneError(f"{host.name}: {frame_error.error_message}")
+    if verb == "status":
+        try:
+            decoded = json.loads(
+                payload.strip(),
+                parse_constant=reject_json_constant,
+                parse_float=finite_json_float,
+                parse_int=bounded_json_int,
+            )
+        except (json.JSONDecodeError, RecursionError, ValueError):
+            raise CliLaneError(f"{host.name}: task JSON was malformed") from None
+        validated = validate_fleet_task(host, decoded)
+        print(json.dumps(validated, indent=2, allow_nan=False))
+        return 0
+    sys.stdout.write(sanitized_log_text(payload))
+    sys.stdout.flush()
+    return 0
+
+
+def watch_fleet(configured: str | None, timeout: float, interval: float) -> int:
+    if not math.isfinite(interval) or interval <= 0:
+        raise CliLaneError("interval must be positive")
+    hosts = load_fleet_hosts(configured)
+    while True:
+        results = collect_fleet(hosts, timeout)
+        sys.stdout.write("\033[2J\033[H")
+        print_fleet_results(results, as_json=False)
+        sys.stdout.flush()
+        time.sleep(interval)
 
 
 def print_fleet_results(results: Sequence[FleetResult], as_json: bool) -> int:
@@ -2609,6 +2786,32 @@ Only tasks started through clilane appear. Press Ctrl-Q to detach from a task.""
         help=f"per-host timeout in seconds (default: {FLEET_DEFAULT_TIMEOUT:g})",
     )
     fleet.add_argument("--json", action="store_true", help="emit JSON")
+    fleet.add_argument(
+        "verb",
+        nargs="?",
+        choices=("status", "log"),
+        help="read one remote task: status or log",
+    )
+    fleet.add_argument(
+        "target",
+        nargs="?",
+        metavar="HOST:TASK",
+        help="fleet host name and task name or ID prefix",
+    )
+    fleet.add_argument(
+        "-n",
+        "--lines",
+        type=int,
+        help="log lines to show with the log verb (default: 200)",
+    )
+    fleet.add_argument(
+        "--watch", action="store_true", help="refresh the fleet table continuously"
+    )
+    fleet.add_argument(
+        "--interval",
+        type=float,
+        help="refresh interval for --watch in seconds (default: 2)",
+    )
 
     status = commands.add_parser("status", help="show one task in detail")
     status.add_argument("target", help="task name or ID prefix")
@@ -2718,6 +2921,33 @@ def execute(arguments: argparse.Namespace) -> int:
         print_tasks(list_tasks(), arguments.json)
         return 0
     if arguments.action == "fleet":
+        if arguments.interval is not None and not arguments.watch:
+            raise CliLaneError("--interval requires --watch")
+        if arguments.lines is not None and arguments.verb != "log":
+            raise CliLaneError("--lines requires the log verb")
+        if arguments.watch:
+            if arguments.verb or arguments.json:
+                raise CliLaneError("--watch takes no verb and no --json")
+            interval = 2.0 if arguments.interval is None else arguments.interval
+            return watch_fleet(arguments.config, arguments.timeout, interval)
+        if arguments.verb:
+            if not arguments.target:
+                raise CliLaneError(
+                    f"usage: {PROGRAM} fleet {arguments.verb} HOST:TASK"
+                )
+            if arguments.json:
+                raise CliLaneError(
+                    "fleet status and fleet log take no --json; "
+                    "fleet status always emits JSON"
+                )
+            lines = 200 if arguments.lines is None else arguments.lines
+            return fleet_verb(
+                arguments.config,
+                arguments.verb,
+                arguments.target,
+                lines,
+                arguments.timeout,
+            )
         hosts = load_fleet_hosts(arguments.config)
         return print_fleet_results(
             collect_fleet(hosts, arguments.timeout), arguments.json

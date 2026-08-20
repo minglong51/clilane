@@ -114,12 +114,15 @@ The named command must already be installed on that host.
 
 ## View tasks across hosts
 
-`clilane fleet` reads a fixed set of hosts concurrently. It is deliberately
-read-only: it cannot start, attach, send to, stop, or remove a remote task.
+`clilane fleet` reads a fixed set of hosts concurrently; `--watch` keeps the
+table refreshing. `clilane fleet status HOST:TASK` and
+`clilane fleet log HOST:TASK` read one task on one host. The fleet surface is
+deliberately read-only: it cannot start, attach, send to, stop, or remove a
+remote task.
 
-Install CLI Lane on every host. A machine running 0.2.0 can query a remote 0.1.0
-installation because the fleet protocol consumes the existing `list --json`
-shape.
+Install CLI Lane on every host. The fleet commands consume the remote side's
+existing `list --json`, `status --json`, and `log` output, so hosts on older
+releases keep answering newer clients.
 
 Configure SSH aliases, keys, users, ports, and jump hosts in `~/.ssh/config`.
 Connect to each alias once so strict host-key checking succeeds:
@@ -197,7 +200,7 @@ Fleet JSON has this top-level shape:
     {
       "name": "workstation",
       "status": "ok",
-      "clilane_version": "0.2.1",
+      "clilane_version": "0.4.0",
       "tasks": [],
       "error": null
     },
@@ -250,7 +253,9 @@ named `agt` for compatibility with tasks created before the project was renamed.
 |---|---|
 | `run NAME [-C DIR] [--on-exit COMMAND] [--wait] -- COMMAND [ARG ...]` | Start a background task. `DIR` defaults to the current directory. `--wait` blocks and returns the command's exit status; `--timeout` returns 124. `--on-exit` runs a shell command after the task exits. |
 | `list`, `ls`, `ps` | List tasks on the current host. `--json` emits an array. |
-| `fleet` | Read the configured local and SSH hosts. Supports `--config`, `--timeout`, and `--json`. |
+| `fleet` | Read the configured local and SSH hosts. Supports `--config`, `--timeout`, `--json`, and `--watch` (`--interval` defaults to 2 seconds). |
+| `fleet status HOST:TASK` | Show one task on a fleet host as JSON. |
+| `fleet log HOST:TASK` | Read a fleet task's persistent log. `--lines` defaults to 200. |
 | `status TARGET` | Show one task by name or unique ID prefix. Supports `--json`. |
 | `attach TARGET` | Attach interactively. `Ctrl-Q` detaches. |
 | `read TARGET` | Print the last 200 terminal lines. `--all` prints retained scrollback. |
@@ -334,7 +339,7 @@ logs under `~/.local/state/agt` remain readable for compatibility.
   plain `clean` preserves them and `clean --orphans` deletes them.
 - Fleet SSH runs without a PTY, stdin, agent forwarding, X11, or forwarding. It
   uses batch mode, strict known-host checking, one connection attempt, a
-  transport timeout, a fixed remote command, and a 256 KiB per-host response
+  transport timeout, a remote command limited to fixed read verbs with a pattern-validated task argument, and a 256 KiB per-host response
   limit.
 - Fleet config cannot inject SSH flags or remote commands. Connection details
   belong in your normal SSH config. Treat that config as trusted: connection
