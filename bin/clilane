@@ -790,6 +790,29 @@ def process_start_time(pid: int) -> str | None:
     return value or None
 
 
+def process_is_zombie(pid: int) -> bool:
+    if sys.platform == "linux":
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(errors="replace")
+        except OSError:
+            return False
+        _, separator, rest = stat.rpartition(")")
+        if not separator:
+            return False
+        fields = rest.split()
+        return bool(fields) and fields[0] in {"Z", "X", "x"}
+    completed = subprocess.run(
+        ["/bin/ps", "-p", str(pid), "-o", "state="],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=tmux_client_environment(),
+        check=False,
+    )
+    if completed.returncode != 0:
+        return False
+    return completed.stdout.decode(errors="replace").strip().startswith("Z")
+
+
 def all_pids() -> list[int]:
     if sys.platform == "linux":
         try:
@@ -818,7 +841,7 @@ def session_pids(session_id: int) -> list[int]:
     found: list[int] = []
     for pid in all_pids():
         with suppress(ProcessLookupError):
-            if os.getsid(pid) == session_id:
+            if os.getsid(pid) == session_id and not process_is_zombie(pid):
                 found.append(pid)
     return found
 
