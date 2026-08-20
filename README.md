@@ -2,10 +2,20 @@
 
 [![Smoke](https://github.com/minglong51/clilane/actions/workflows/smoke.yml/badge.svg)](https://github.com/minglong51/clilane/actions/workflows/smoke.yml)
 
-CLI Lane keeps long-running terminal work alive without taking over your terminal.
-Start Codex, Claude Code, Kimi, a development server, or any other command in the
-background. Reconnect later through SSH, Mosh, or Termius to inspect, attach, send
-input, stop, or remove it.
+CLI Lane runs interactive CLI agents — Codex, Claude Code, Kimi, or any other
+long-running command — in the background, each in its own lane with an identity
+you can still trust days later. Reconnect through SSH, Mosh, or Termius to
+inspect, attach, send input, press keys, stop, or remove a task, or read task
+state across a fleet of hosts.
+
+Plenty of tools keep a process alive; CLI Lane exists for what happens at the
+edges. A task keeps its identity even after its pid is reused, so `stop` and
+`rm` can never touch an innocent process. Logs survive the tmux server dying
+and come back as recoverable orphans, not silent losses. `send` refuses input
+an agent would receive as garbage bytes and `key` presses real keys instead.
+Exit statuses distinguish signals from exit codes, and `--on-exit` reports a
+finished task instead of making you poll. Every destructive path re-verifies
+what it is about to touch before touching it.
 
 CLI Lane is process-agnostic. It manages commands that you launch through
 `clilane`; it does not depend on an agent framework or discover unrelated
