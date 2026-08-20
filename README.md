@@ -183,7 +183,7 @@ Fleet JSON has this top-level shape:
     {
       "name": "workstation",
       "status": "ok",
-      "clilane_version": "0.2.0",
+      "clilane_version": "0.2.1",
       "tasks": [],
       "error": null
     },
