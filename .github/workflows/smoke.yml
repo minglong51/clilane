@@ -15,8 +15,16 @@ concurrency:
 
 jobs:
   smoke:
-    name: macOS / Python 3.10
-    runs-on: macos-15
+    name: ${{ matrix.label }} / Python 3.10
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            label: macOS
+          - os: ubuntu-latest
+            label: Linux
     timeout-minutes: 10
     env:
       CLILANE_TMUX_SOCKET: clilane-ci-${{ github.run_id }}-${{ github.run_attempt }}
@@ -40,7 +48,14 @@ jobs:
           printf 'XDG_CONFIG_HOME=%s\n' "$RUNNER_TEMP/clilane-config" >> "$GITHUB_ENV"
 
       - name: Install tmux
-        run: brew install tmux
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install tmux
+          else
+            sudo apt-get update
+            sudo apt-get install -y tmux
+          fi
 
       - name: Verify isolated environment
         shell: bash
@@ -64,8 +79,13 @@ jobs:
             "$CLILANE_STATE_HOME" \
             "$TMUX_TMPDIR" \
             "$XDG_CONFIG_HOME/clilane"
-          test "$(stat -f '%Lp' "$CLILANE_STATE_HOME")" = "700"
-          test "$(stat -f '%Lp' "$TMUX_TMPDIR")" = "700"
+          python3 - "$CLILANE_STATE_HOME" "$TMUX_TMPDIR" <<'PY'
+          import os
+          import sys
+
+          for path in sys.argv[1:]:
+              assert os.stat(path).st_mode & 0o777 == 0o700, path
+          PY
           test "$(./bin/clilane --version)" = "clilane 0.3.0"
           ./bin/clilane --help | grep -F "~/projects/sample-app" >/dev/null
           python3 -c 'import sys; assert sys.version_info >= (3, 10)'

@@ -27,14 +27,16 @@ Laptop / Termius / another node
 
 ## Requirements
 
-- macOS
+- macOS or Linux
 - Python 3.10 or newer
-- tmux
+- tmux 3.3 or newer
 - `tail` for persistent log reading
 - OpenSSH and key-based host access for `clilane fleet`
 
 CLI Lane uses only the Python standard library. The lifecycle and fleet paths are
-currently verified on macOS; Linux support has not been established.
+verified on macOS and Ubuntu in CI. tmux 3.3 is required because older releases
+do not report the signal that ended a task, which would silently corrupt exit
+statuses; `run` refuses to start on an older tmux.
 
 ## Install
 
@@ -346,7 +348,7 @@ logs under `~/.local/state/agt` remain readable for compatibility.
 - Fleet snapshots are point-in-time; a task can change immediately afterward.
 - Fleet ages assume host clocks are reasonably synchronized.
 - Raw terminal logs are not structured or redacted.
-- Windows is unsupported, and Linux compatibility is not established.
+- Windows is unsupported.
 
 ## License
 

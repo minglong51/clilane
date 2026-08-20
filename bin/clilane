@@ -147,12 +147,17 @@ FLEET_TASK_STATES = frozenset(
 FLEET_SENTINEL_LINE = re.compile(rf"(?m)^{re.escape(FLEET_SENTINEL)}\r?\n")
 FLEET_FRAME_WHITESPACE = re.compile(r"\s*")
 FLEET_REMOTE_SCRIPT = (
-    "set -o pipefail; { "
+    "{ "
     f"printf \"%s\\n\" {shlex.quote(FLEET_SENTINEL)}; "
-    "clilane --version && clilane list --json; } 2>&1 | "
-    f"/usr/bin/head -c {FLEET_MAX_OUTPUT_BYTES + 1}"
+    "clilane --version && clilane list --json; } 2>&1"
 )
-FLEET_REMOTE_COMMAND = f"/bin/zsh -lc {shlex.quote(FLEET_REMOTE_SCRIPT)}"
+FLEET_REMOTE_COMMAND = "/bin/sh -c " + shlex.quote(
+    "if command -v zsh >/dev/null 2>&1; "
+    f"then exec zsh -lc {shlex.quote(FLEET_REMOTE_SCRIPT)}; "
+    f"fi; exec /bin/sh -lc {shlex.quote(FLEET_REMOTE_SCRIPT)}"
+)
+TMUX_MIN_VERSION = (3, 3)
+TMUX_VERSION_PATTERN = re.compile(r"(\d+)\.(\d+)")
 
 
 class CliLaneError(Exception):
@@ -264,6 +269,27 @@ def tmux_binary() -> str:
     if not binary:
         raise CliLaneError("tmux is required")
     return binary
+
+
+def ensure_tmux_version() -> None:
+    completed = subprocess.run(
+        [tmux_binary(), "-V"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=tmux_client_environment(),
+        check=False,
+    )
+    reported = completed.stdout.decode(errors="replace").strip()
+    matched = TMUX_VERSION_PATTERN.search(reported)
+    if completed.returncode != 0 or not matched:
+        raise CliLaneError(f"could not determine the tmux version: {reported!r}")
+    version = (int(matched.group(1)), int(matched.group(2)))
+    if version < TMUX_MIN_VERSION:
+        floor = ".".join(str(part) for part in TMUX_MIN_VERSION)
+        raise CliLaneError(
+            f"tmux {floor} or newer is required for exit-status reporting; "
+            f"found {reported}"
+        )
 
 
 def tmux_client_environment() -> dict[str, str]:
@@ -712,6 +738,18 @@ def decode_command(value: str) -> list[str]:
 
 
 def process_start_time(pid: int) -> str | None:
+    if sys.platform == "linux":
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(errors="replace")
+        except OSError:
+            return None
+        _, separator, rest = stat.rpartition(")")
+        if not separator:
+            return None
+        fields = rest.split()
+        if len(fields) < 20:
+            return None
+        return fields[19]
     completed = subprocess.run(
         ["/bin/ps", "-p", str(pid), "-o", "lstart="],
         stdout=subprocess.PIPE,
@@ -725,7 +763,13 @@ def process_start_time(pid: int) -> str | None:
     return value or None
 
 
-def session_pids(session_id: int) -> list[int]:
+def all_pids() -> list[int]:
+    if sys.platform == "linux":
+        try:
+            entries = os.listdir("/proc")
+        except OSError as error:
+            raise CliLaneError("unable to inspect managed process session") from error
+        return [int(entry) for entry in entries if entry.isdigit()]
     completed = subprocess.run(
         ["/bin/ps", "-axo", "pid="],
         stdout=subprocess.PIPE,
@@ -735,13 +779,20 @@ def session_pids(session_id: int) -> list[int]:
     )
     if completed.returncode != 0:
         raise CliLaneError("unable to inspect managed process session")
-    found: list[int] = []
+    found = []
     for line in completed.stdout.decode(errors="replace").splitlines():
         pid = optional_int(line.strip())
         if pid is not None:
-            with suppress(ProcessLookupError):
-                if os.getsid(pid) == session_id:
-                    found.append(pid)
+            found.append(pid)
+    return found
+
+
+def session_pids(session_id: int) -> list[int]:
+    found: list[int] = []
+    for pid in all_pids():
+        with suppress(ProcessLookupError):
+            if os.getsid(pid) == session_id:
+                found.append(pid)
     return found
 
 
@@ -1518,6 +1569,7 @@ def bind_detach_key() -> None:
 
 
 def ensure_server_available() -> None:
+    ensure_tmux_version()
     probe = tmux(["list-sessions"], check=False)
     if probe.returncode != 0:
         if tmux_server_absent(probe):
@@ -1620,7 +1672,7 @@ def run_task(name: str, cwd_value: str, command: list[str]) -> Task:
                     session,
                     "-c",
                     str(cwd),
-                    "/bin/sleep",
+                    "sleep",
                     "2147483647",
                     ";",
                     "set-option",
