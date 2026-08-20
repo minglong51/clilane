@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import uuid
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -28,7 +29,7 @@ from typing import BinaryIO, Iterator, Sequence
 
 
 PROGRAM = "clilane"
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 TASK_STATE_INITIALIZING = "initializing"
 TASK_STATE_RUNNING = "running"
 TASK_STATE_STOPPED = "stopped"
@@ -42,6 +43,32 @@ SERVER_TAG = "agt-v1"
 FIELD_SEPARATOR = "\x1f"
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 ENV_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+KEY_PATTERN = re.compile(r"^(?:C-|M-|C-M-|M-C-)?[\x21-\x3a\x3c-\x7e]$")
+NAMED_KEYS = frozenset(
+    {
+        "BSpace",
+        "BTab",
+        "DC",
+        "Down",
+        "End",
+        "Enter",
+        "Escape",
+        "Home",
+        "IC",
+        "Left",
+        "NPage",
+        "PPage",
+        "PageDown",
+        "PageUp",
+        "Right",
+        "Space",
+        "Tab",
+        "Up",
+    }
+    | {f"F{number}" for number in range(1, 13)}
+)
+MESSAGE_ALLOWED_CONTROLS = frozenset({"\n", "\t"})
+MESSAGE_REJECTED_CATEGORIES = frozenset({"Cc", "Cs", "Co", "Cn"})
 TRANSIENT_ENV = {
     "OLDPWD",
     "PWD",
@@ -66,6 +93,25 @@ TMUX_ENV_KEYS = {
     "USER",
 }
 LOG_MAX_BYTES = 50 * 1024 * 1024
+RECORD_SCHEMA_VERSION = 1
+RECORD_PHASE_PENDING = "pending"
+RECORD_PHASE_LIVE = "live"
+RECORD_PHASE_REMOVING = "removing"
+RECORD_PHASES = frozenset(
+    {RECORD_PHASE_PENDING, RECORD_PHASE_LIVE, RECORD_PHASE_REMOVING}
+)
+RECORD_FIELDS = (
+    "schema_version",
+    "socket",
+    "session",
+    "id",
+    "name",
+    "command",
+    "cwd",
+    "created",
+    "log",
+    "phase",
+)
 FLEET_CONFIG_SCHEMA_VERSION = 1
 FLEET_OUTPUT_SCHEMA_VERSION = 1
 FLEET_DEFAULT_TIMEOUT = 5.0
@@ -174,6 +220,14 @@ class Task:
             "exit_code": self.exit_code if self.dead else None,
             "signal": self.signal_name if self.dead else None,
         }
+
+
+@dataclass(frozen=True)
+class RunSpec:
+    cwd: str
+    wait: bool
+    timeout: float | None
+    command: list[str]
 
 
 @dataclass(frozen=True)
@@ -410,9 +464,177 @@ def control_root() -> Path:
     return root
 
 
+def socket_digest() -> str:
+    return hashlib.sha256(SOCKET.encode()).hexdigest()[:16]
+
+
+def registry_root() -> Path:
+    root = (state_root() / "registry" / socket_digest()).resolve()
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(root, 0o700)
+    return root
+
+
+@dataclass(frozen=True)
+class TaskRecord:
+    id: str
+    name: str
+    command: list[str]
+    cwd: str
+    created: str
+    log: str
+    session: str
+    socket: str
+    phase: str
+    path: str
+
+
+def write_record(
+    task_id: str,
+    name: str,
+    command: Sequence[str],
+    cwd: str,
+    created: str,
+    log: str,
+    session: str,
+    phase: str,
+) -> None:
+    payload = {
+        "schema_version": RECORD_SCHEMA_VERSION,
+        "socket": SOCKET,
+        "session": session,
+        "id": task_id,
+        "name": name,
+        "command": list(command),
+        "cwd": cwd,
+        "created": created,
+        "log": log,
+        "phase": phase,
+    }
+    root = registry_root()
+    final = root / f"{task_id}.json"
+    temp = root / f".{task_id}.{uuid.uuid4().hex}.tmp"
+    descriptor = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, separators=(",", ":"), allow_nan=False))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, final)
+    finally:
+        temp.unlink(missing_ok=True)
+    directory = os.open(root, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def delete_record(task_id: str) -> None:
+    root = registry_root()
+    (root / f"{task_id}.json").unlink(missing_ok=True)
+    for leftover in root.glob(f".{task_id}.*.tmp"):
+        leftover.unlink(missing_ok=True)
+
+
+def read_record(path: Path) -> TaskRecord:
+    try:
+        decoded = json.loads(
+            path.read_text(encoding="utf-8"),
+            parse_constant=reject_json_constant,
+            parse_float=finite_json_float,
+            parse_int=bounded_json_int,
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as error:
+        raise CliLaneError(f"damaged task record: {str(path)!r}") from error
+    if not isinstance(decoded, dict) or set(decoded) != set(RECORD_FIELDS):
+        raise CliLaneError(f"damaged task record: {str(path)!r}")
+    if decoded["schema_version"] != RECORD_SCHEMA_VERSION:
+        raise CliLaneError(f"unsupported task record schema: {str(path)!r}")
+    for field in ("socket", "session", "id", "name", "cwd", "created", "log", "phase"):
+        if not isinstance(decoded[field], str):
+            raise CliLaneError(f"damaged task record: {str(path)!r}")
+    command = decoded["command"]
+    if not isinstance(command, list) or not command or not all(
+        isinstance(part, str) for part in command
+    ):
+        raise CliLaneError(f"damaged task record: {str(path)!r}")
+    if decoded["phase"] not in RECORD_PHASES:
+        raise CliLaneError(f"damaged task record: {str(path)!r}")
+    if decoded["id"] != path.stem:
+        raise CliLaneError(f"damaged task record: {str(path)!r}")
+    derived = f"{SESSION_PREFIX}{decoded['id'].replace('-', '')[:12]}"
+    if decoded["session"] != derived:
+        raise CliLaneError(f"damaged task record: {str(path)!r}")
+    return TaskRecord(
+        id=decoded["id"],
+        name=decoded["name"],
+        command=command,
+        cwd=decoded["cwd"],
+        created=decoded["created"],
+        log=decoded["log"],
+        session=decoded["session"],
+        socket=decoded["socket"],
+        phase=decoded["phase"],
+        path=str(path),
+    )
+
+
+def read_records() -> tuple[list[TaskRecord], list[Path]]:
+    records: list[TaskRecord] = []
+    damaged: list[Path] = []
+    for path in sorted(registry_root().glob("*.json")):
+        try:
+            record = read_record(path)
+        except CliLaneError:
+            damaged.append(path)
+            continue
+        if record.socket == SOCKET:
+            records.append(record)
+    return records, damaged
+
+
+def claimed_log_paths() -> set[Path]:
+    claimed: set[Path] = set()
+    registry = (state_root() / "registry").resolve()
+    if not registry.is_dir():
+        return claimed
+    for path in registry.glob("*/*.json"):
+        try:
+            decoded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            continue
+        if isinstance(decoded, dict) and isinstance(decoded.get("log"), str):
+            claimed.add(Path(decoded["log"]).expanduser().resolve())
+    return claimed
+
+
+def record_from_task(task: Task, phase: str) -> None:
+    write_record(
+        task.id,
+        task.name,
+        task.command,
+        task.cwd,
+        task.created,
+        task.log,
+        task.session,
+        phase,
+    )
+
+
+def backfill_records(tasks: Sequence[Task]) -> None:
+    on_disk = {record.id: record for record in read_records()[0]}
+    for task in tasks:
+        if not task.committed or not task.id or not task.log:
+            continue
+        existing = on_disk.get(task.id)
+        if existing is None or existing.phase == RECORD_PHASE_PENDING:
+            record_from_task(task, RECORD_PHASE_LIVE)
+
+
 @contextmanager
 def registry_lock() -> Iterator[None]:
-    digest = hashlib.sha256(SOCKET.encode()).hexdigest()[:16]
+    digest = socket_digest()
     path = control_root() / f"{digest}.lock"
     with path.open("a+b") as handle:
         os.chmod(path, 0o600)
@@ -439,14 +661,24 @@ def release_task_lock(handle: BinaryIO) -> None:
         handle.close()
 
 
-def validated_log_path(task: Task) -> Path:
-    expected = {
-        (root / "logs" / f"{task.id}.log").resolve()
+def expected_log_paths(task_id: str) -> set[Path]:
+    return {
+        (root / "logs" / f"{task_id}.log").resolve()
         for root in (state_root(), *legacy_state_roots())
     }
+
+
+def validated_log_path(task: Task) -> Path:
     actual = Path(task.log).expanduser().resolve()
-    if actual not in expected:
+    if actual not in expected_log_paths(task.id):
         raise CliLaneError(f"refusing unexpected log path for {task.name}")
+    return actual
+
+
+def validated_record_log_path(record: TaskRecord) -> Path:
+    actual = Path(record.log).expanduser().resolve()
+    if actual not in expected_log_paths(record.id):
+        raise CliLaneError(f"refusing unexpected log path for {record.name}")
     return actual
 
 
@@ -1235,8 +1467,20 @@ def command_from_remainder(parts: Sequence[str]) -> list[str]:
     return command
 
 
-def run_spec(default_cwd: str, parts: Sequence[str]) -> tuple[str, list[str]]:
+def positive_timeout(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise CliLaneError(f"--timeout requires a number: {value!r}") from error
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise CliLaneError("--timeout must be greater than 0")
+    return parsed
+
+
+def run_spec(default_cwd: str, parts: Sequence[str]) -> RunSpec:
     cwd = default_cwd
+    wait = False
+    timeout: float | None = None
     remaining = list(parts)
     while remaining and remaining[0] != "--":
         if remaining[0] in {"-C", "--cwd"}:
@@ -1249,8 +1493,24 @@ def run_spec(default_cwd: str, parts: Sequence[str]) -> tuple[str, list[str]]:
             cwd = remaining[0].split("=", 1)[1]
             remaining = remaining[1:]
             continue
+        if remaining[0] == "--wait":
+            wait = True
+            remaining = remaining[1:]
+            continue
+        if remaining[0] == "--timeout":
+            if len(remaining) < 2:
+                raise CliLaneError("--timeout requires a number")
+            timeout = positive_timeout(remaining[1])
+            remaining = remaining[2:]
+            continue
+        if remaining[0].startswith("--timeout="):
+            timeout = positive_timeout(remaining[0].split("=", 1)[1])
+            remaining = remaining[1:]
+            continue
         break
-    return cwd, command_from_remainder(remaining)
+    if timeout is not None and not wait:
+        raise CliLaneError("--timeout requires --wait")
+    return RunSpec(cwd, wait, timeout, command_from_remainder(remaining))
 
 
 def bind_detach_key() -> None:
@@ -1293,7 +1553,9 @@ def run_task(name: str, cwd_value: str, command: list[str]) -> Task:
     with registry_lock():
         ensure_server_available()
         validate_name(name)
-        if any(task.name == name for task in list_tasks()):
+        existing = list_tasks()
+        backfill_records(existing)
+        if any(task.name == name for task in existing):
             raise CliLaneError(f"task already exists: {name}")
         cwd = Path(cwd_value).expanduser().resolve()
         if not cwd.is_dir():
@@ -1304,13 +1566,30 @@ def run_task(name: str, cwd_value: str, command: list[str]) -> Task:
         log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(log_dir, 0o700)
         log_path = log_dir / f"{task_id}.log"
-        log_path.touch(mode=0o600, exist_ok=False)
+        created_stamp = datetime.now(timezone.utc).isoformat()
+        write_record(
+            task_id,
+            name,
+            command,
+            str(cwd),
+            created_stamp,
+            str(log_path),
+            session,
+            RECORD_PHASE_PENDING,
+        )
+        log_created = False
+        try:
+            log_path.touch(mode=0o600, exist_ok=False)
+            log_created = True
+        except OSError:
+            delete_record(task_id)
+            raise
         meta: dict[str, object] = {
             "id": task_id,
             "name": name,
             "command": command,
             "cwd": str(cwd),
-            "created": datetime.now(timezone.utc).isoformat(),
+            "created": created_stamp,
             "log": str(log_path),
         }
         script = Path(__file__).resolve()
@@ -1420,14 +1699,26 @@ def run_task(name: str, cwd_value: str, command: list[str]) -> Task:
                 time.sleep(0.02)
             tmux(["set-option", "-t", session, "@agt_process_started", started or ""])
             tmux(["set-option", "-t", session, "@agt_committed", "1"])
+            write_record(
+                task_id,
+                name,
+                command,
+                str(cwd),
+                created_stamp,
+                str(log_path),
+                session,
+                RECORD_PHASE_LIVE,
+            )
             committed = True
             return resolve_task(task_id)
         finally:
             if not committed:
                 terminate_incomplete_session(session, pane, 0.5, started)
                 kill_managed_session(session)
-                log_path.unlink(missing_ok=True)
-                log_path.with_suffix(log_path.suffix + ".previous").unlink(missing_ok=True)
+                if log_created:
+                    log_path.unlink(missing_ok=True)
+                    log_path.with_suffix(log_path.suffix + ".previous").unlink(missing_ok=True)
+                delete_record(task_id)
 
 
 def age(created: str) -> str:
@@ -1605,13 +1896,36 @@ def log_task(task: Task, lines: int, follow: bool) -> int:
     return subprocess.call(arguments)
 
 
+def live_task(target: str) -> Task:
+    task = resolve_task(target)
+    if task.dead:
+        raise CliLaneError(f"task is not running: {task.name}")
+    if not task.committed:
+        raise CliLaneError(f"task is still initializing: {task.name}")
+    return task
+
+
 def send_task(target: str, message: str, enter: bool) -> int:
+    if not message:
+        raise CliLaneError(
+            f"message is empty; use '{PROGRAM} key TARGET Enter' to press a key"
+        )
+    rejected = sorted(
+        {
+            character
+            for character in message
+            if unicodedata.category(character) in MESSAGE_REJECTED_CATEGORIES
+            and character not in MESSAGE_ALLOWED_CONTROLS
+        }
+    )
+    if rejected:
+        listed = ", ".join(ascii(character) for character in rejected)
+        raise CliLaneError(
+            f"message contains control characters ({listed}); they would reach "
+            f"the task as raw bytes, not keypresses; use '{PROGRAM} key' instead"
+        )
     with registry_lock():
-        task = resolve_task(target)
-        if task.dead:
-            raise CliLaneError(f"task is not running: {task.name}")
-        if not task.committed:
-            raise CliLaneError(f"task is still initializing: {task.name}")
+        task = live_task(target)
         buffer_name = f"agt_{uuid.uuid4().hex}"
         tmux(["load-buffer", "-b", buffer_name, "-"], input_data=message.encode())
         try:
@@ -1622,6 +1936,46 @@ def send_task(target: str, message: str, enter: bool) -> int:
         finally:
             tmux(["delete-buffer", "-b", buffer_name], check=False)
         return 0
+
+
+def is_key_name(value: str) -> bool:
+    return (
+        value in NAMED_KEYS
+        or value.lower() in {name.lower() for name in NAMED_KEYS}
+        or bool(KEY_PATTERN.fullmatch(value))
+    )
+
+
+def validated_keys(keys: Sequence[str]) -> list[str]:
+    if not keys:
+        raise CliLaneError(f"missing key; run '{PROGRAM} key --list' to see keys")
+    aliases = {name.lower(): name for name in NAMED_KEYS}
+    validated = []
+    for key in keys:
+        if key in NAMED_KEYS or KEY_PATTERN.fullmatch(key):
+            validated.append(key)
+        elif key.lower() in aliases:
+            validated.append(aliases[key.lower()])
+        else:
+            raise CliLaneError(
+                f"unsupported key: {key!r}; run '{PROGRAM} key --list' to see keys"
+            )
+    return validated
+
+
+def print_key_names() -> int:
+    named = sorted(NAMED_KEYS, key=str.lower)
+    print(" ".join(named))
+    print("modifiers: C- (Ctrl), M- (Alt), applied to one printable character")
+    return 0
+
+
+def key_task(target: str, keys: Sequence[str]) -> int:
+    validated = validated_keys(keys)
+    with registry_lock():
+        task = live_task(target)
+        tmux(["send-keys", "-t", task.pane, "--", *validated])
+    return 0
 
 
 def wait_task(target: str, timeout: float | None) -> int:
@@ -1750,6 +2104,8 @@ def remove_task_locked(task: Task, force: bool, grace: float) -> None:
     if not current.committed:
         if not force:
             raise CliLaneError(f"task initialization is incomplete; use --force: {task.name}")
+        if current.id and current.log:
+            record_from_task(current, RECORD_PHASE_REMOVING)
         log_path = validated_log_path(current) if current.log else None
         terminate_incomplete_session(
             current.session,
@@ -1761,6 +2117,8 @@ def remove_task_locked(task: Task, force: bool, grace: float) -> None:
         if log_path:
             log_path.unlink(missing_ok=True)
             log_path.with_suffix(log_path.suffix + ".previous").unlink(missing_ok=True)
+        if current.id:
+            delete_record(current.id)
         return
     if not current.dead:
         if not force:
@@ -1770,11 +2128,15 @@ def remove_task_locked(task: Task, force: bool, grace: float) -> None:
         if not force:
             raise CliLaneError(f"refusing removal with live descendants: {current.name}")
         terminate_dead_task_descendants(current, grace)
+    if current.id and current.log:
+        record_from_task(current, RECORD_PHASE_REMOVING)
     log_path = validated_log_path(current) if current.log else None
     kill_managed_session(current.session)
     if log_path:
         log_path.unlink(missing_ok=True)
         log_path.with_suffix(log_path.suffix + ".previous").unlink(missing_ok=True)
+    if current.id:
+        delete_record(current.id)
 
 
 def remove_task(target: str, force: bool, grace: float) -> Task:
@@ -1793,16 +2155,183 @@ def remove_task(target: str, force: bool, grace: float) -> Task:
         return current
 
 
-def clean_tasks() -> int:
+def classify_records(
+    records: Sequence[TaskRecord], tasks: Sequence[Task]
+) -> dict[str, list[TaskRecord]]:
+    live_ids = {task.id for task in tasks if task.id}
+    classified: dict[str, list[TaskRecord]] = {
+        "live": [],
+        "aborted": [],
+        "interrupted": [],
+        "superseded": [],
+        "orphan": [],
+    }
+    for record in records:
+        if record.id in live_ids:
+            classified["live"].append(record)
+        elif record.phase == RECORD_PHASE_PENDING:
+            classified["aborted"].append(record)
+        elif record.phase == RECORD_PHASE_REMOVING:
+            classified["interrupted"].append(record)
+        elif not Path(record.log).expanduser().is_file():
+            classified["superseded"].append(record)
+        else:
+            classified["orphan"].append(record)
+    return classified
+
+
+def confirm_server_absent(tasks: Sequence[Task], records: Sequence[TaskRecord]) -> None:
+    disk_only = [record for record in records if record.id not in {task.id for task in tasks}]
+    if tasks or not disk_only:
+        return
+    probe = tmux(["list-sessions"], check=False)
+    if probe.returncode == 0 or not tmux_server_absent(probe):
+        raise CliLaneError("could not confirm the tmux server is absent; not reclaiming")
+
+
+def reap_record(record: TaskRecord, live_sessions: frozenset[str]) -> None:
+    if record.session in live_sessions:
+        raise CliLaneError(f"record session belongs to a live task: {record.name}")
+    log_path = validated_record_log_path(record)
+    kill_managed_session(record.session)
+    log_path.unlink(missing_ok=True)
+    log_path.with_suffix(log_path.suffix + ".previous").unlink(missing_ok=True)
+    delete_record(record.id)
+
+
+def unclaimed_logs(tasks: Sequence[Task]) -> list[Path]:
+    log_dir = state_root() / "logs"
+    if not log_dir.is_dir():
+        return []
+    claimed = claimed_log_paths()
+    for task in tasks:
+        if task.log:
+            claimed.add(Path(task.log).expanduser().resolve())
+    unclaimed = []
+    for path in sorted(log_dir.glob("*.log")):
+        if path.resolve() not in claimed:
+            unclaimed.append(path)
+    return unclaimed
+
+
+def clean_tasks(dry_run: bool, orphans: bool) -> int:
+    failures: list[str] = []
+    reclaimed = 0
+    orphans_kept = 0
+    reclaimed_logs = 0
     with registry_lock():
-        removable = [task for task in list_tasks() if task.dead or not task.committed]
+        ensure_server_available()
+        tasks = list_tasks()
+        if not dry_run:
+            backfill_records(tasks)
+        removable = [task for task in tasks if task.dead or not task.committed]
+        removed = 0
         for task in removable:
+            if dry_run:
+                removed += 1
+                continue
             lock_handle = acquire_task_lock(task.id, exclusive=True)
             try:
                 remove_task_locked(task, force=True, grace=0)
+                removed += 1
+            except CliLaneError as error:
+                failures.append(str(error))
             finally:
                 release_task_lock(lock_handle)
-    print(f"removed {len(removable)} task{'s' if len(removable) != 1 else ''}")
+        records, damaged = read_records()
+        classified = classify_records(records, tasks)
+        live_sessions = frozenset(task.session for task in tasks)
+        stale = classified["aborted"] + classified["interrupted"] + classified["superseded"]
+        if orphans:
+            stale += classified["orphan"]
+        else:
+            orphans_kept = len(classified["orphan"])
+        leftover = unclaimed_logs(tasks)
+        reap_leftover = orphans and leftover and not tasks
+        if stale or reap_leftover:
+            confirm_server_absent(tasks, records)
+        for record in stale:
+            if dry_run:
+                reclaimed += 1
+                continue
+            lock_handle = acquire_task_lock(record.id, exclusive=True)
+            try:
+                reap_record(record, live_sessions)
+                reclaimed += 1
+            except CliLaneError as error:
+                failures.append(str(error))
+            finally:
+                release_task_lock(lock_handle)
+        if reap_leftover:
+            for path in leftover:
+                if not dry_run:
+                    path.unlink(missing_ok=True)
+                    path.with_suffix(path.suffix + ".previous").unlink(missing_ok=True)
+                reclaimed_logs += 1
+            leftover = []
+    verb = "would remove" if dry_run else "removed"
+    print(f"{verb} {removed} task{'s' if removed != 1 else ''}")
+    if reclaimed:
+        print(f"{verb} {reclaimed} lost task record{'s' if reclaimed != 1 else ''}")
+    if reclaimed_logs:
+        print(f"{verb} {reclaimed_logs} unclaimed log{'s' if reclaimed_logs != 1 else ''}")
+    if orphans_kept:
+        print(
+            f"{PROGRAM}: kept {orphans_kept} orphaned log{'s' if orphans_kept != 1 else ''};"
+            f" run '{PROGRAM} orphans' to inspect or '{PROGRAM} clean --orphans' to delete",
+            file=sys.stderr,
+        )
+    for path in leftover:
+        print(f"{PROGRAM}: unclaimed log left in place: {path}", file=sys.stderr)
+    for failure in failures:
+        print(f"{PROGRAM}: {failure}", file=sys.stderr)
+    for path in damaged:
+        print(f"{PROGRAM}: damaged task record left in place: {path}", file=sys.stderr)
+    return 1 if failures else 0
+
+
+def print_orphans(as_json: bool) -> int:
+    with registry_lock():
+        tasks = list_tasks()
+        records, damaged = read_records()
+        unclaimed = unclaimed_logs(tasks)
+    orphans = classify_records(records, tasks)["orphan"]
+    if as_json:
+        payload = {
+            "schema_version": 1,
+            "orphans": [
+                {
+                    "id": record.id,
+                    "name": record.name,
+                    "command": record.command,
+                    "cwd": record.cwd,
+                    "created": record.created,
+                    "log": record.log,
+                }
+                for record in orphans
+            ],
+            "unclaimed_logs": [str(path) for path in unclaimed],
+        }
+        print(json.dumps(payload, indent=2, allow_nan=False))
+    elif not orphans:
+        print("no orphaned tasks")
+    else:
+        projects = [Path(record.cwd).name or record.cwd for record in orphans]
+        name_width = max(len("NAME"), *(len(record.name) for record in orphans))
+        project_width = max(len("PROJECT"), *(len(project) for project in projects))
+        print(
+            f"{'NAME':<{name_width}} {'AGE':<6} {'PROJECT':<{project_width}} COMMAND"
+        )
+        for record, project in zip(orphans, projects):
+            print(
+                f"{record.name:<{name_width}} {age(record.created):<6} "
+                f"{project:<{project_width}} {shlex.join(record.command)}"
+            )
+    if not as_json:
+        for path in unclaimed:
+            print(f"{PROGRAM}: unclaimed log: {path}", file=sys.stderr)
+    for path in damaged:
+        print(f"{PROGRAM}: damaged task record left in place: {path}", file=sys.stderr)
     return 0
 
 
@@ -1841,7 +2370,7 @@ Only tasks started through clilane appear. Press Ctrl-Q to detach from a task.""
         "run",
         help="start a managed task",
         description="Start a task in the background and return immediately.",
-        usage="clilane run NAME [-C DIR] -- COMMAND [ARG ...]",
+        usage="clilane run NAME [-C DIR] [--wait [--timeout SECONDS]] -- COMMAND [ARG ...]",
     )
     run.add_argument("name", help="unique task name")
     run.add_argument(
@@ -1850,6 +2379,16 @@ Only tasks started through clilane appear. Press Ctrl-Q to detach from a task.""
         metavar="DIR",
         default=os.getcwd(),
         help="task working directory (default: current directory)",
+    )
+    run.add_argument(
+        "--wait",
+        action="store_true",
+        help="block until the command exits and return its exit status",
+    )
+    run.add_argument(
+        "--timeout",
+        type=float,
+        help="seconds to wait with --wait before returning 124",
     )
     run.add_argument(
         "command",
@@ -1907,6 +2446,19 @@ Only tasks started through clilane appear. Press Ctrl-Q to detach from a task.""
     send.add_argument("message", help="text to send")
     send.add_argument("--no-enter", action="store_true", help="do not press Enter")
 
+    key = commands.add_parser(
+        "key",
+        help="press keys in a running task",
+        description=(
+            "Press one or more keys in a task's terminal, such as Enter, Escape, "
+            "Up, Tab, BTab, or C-c."
+        ),
+        usage="clilane key TARGET KEY [KEY ...]",
+    )
+    key.add_argument("target", nargs="?", help="task name or ID prefix")
+    key.add_argument("keys", metavar="KEY", nargs="*", help="key names to press in order")
+    key.add_argument("--list", action="store_true", help="print supported key names")
+
     wait = commands.add_parser("wait", help="wait for a task to finish")
     wait.add_argument("target", help="task name or ID prefix")
     wait.add_argument("--timeout", type=float, help="timeout in seconds")
@@ -1926,7 +2478,32 @@ Only tasks started through clilane appear. Press Ctrl-Q to detach from a task.""
         "--grace", type=float, default=3, help="seconds before SIGKILL (default: 3)"
     )
 
-    commands.add_parser("clean", help="remove all completed and stopped tasks")
+    clean = commands.add_parser(
+        "clean",
+        help="remove completed, stopped, and lost tasks",
+        description=(
+            "Remove completed and stopped tasks, and reclaim records left behind "
+            "by an interrupted removal or a lost tmux server."
+        ),
+    )
+    clean.add_argument(
+        "--dry-run", action="store_true", help="report without removing anything"
+    )
+    clean.add_argument(
+        "--orphans",
+        action="store_true",
+        help="also delete orphaned logs preserved from a lost tmux server",
+    )
+
+    orphans = commands.add_parser(
+        "orphans",
+        help="list tasks orphaned by a lost tmux server",
+        description=(
+            "List tasks whose tmux server died but whose logs survive. "
+            "Read their logs with normal file tools; delete with 'clean --orphans'."
+        ),
+    )
+    orphans.add_argument("--json", action="store_true", help="emit JSON")
 
     watch = commands.add_parser("watch", help="refresh the task list continuously")
     watch.add_argument(
@@ -1938,9 +2515,17 @@ Only tasks started through clilane appear. Press Ctrl-Q to detach from a task.""
 
 def execute(arguments: argparse.Namespace) -> int:
     if arguments.action == "run":
-        cwd, command = run_spec(arguments.cwd, arguments.command)
-        task = run_task(arguments.name, cwd, command)
-        print(f"started {task.name} {task.id[:8]}")
+        spec = run_spec(arguments.cwd, arguments.command)
+        wait = arguments.wait or spec.wait
+        timeout = spec.timeout
+        if arguments.timeout is not None:
+            timeout = positive_timeout(str(arguments.timeout))
+        if timeout is not None and not wait:
+            raise CliLaneError("--timeout requires --wait")
+        task = run_task(arguments.name, spec.cwd, spec.command)
+        print(f"created {task.name} {task.id[:8]}")
+        if wait:
+            return wait_task(task.id, timeout)
         return 0
     if arguments.action in {"list", "ls", "ps"}:
         print_tasks(list_tasks(), arguments.json)
@@ -1961,6 +2546,18 @@ def execute(arguments: argparse.Namespace) -> int:
         return log_task(resolve_task(arguments.target), arguments.lines, arguments.follow)
     if arguments.action == "send":
         return send_task(arguments.target, arguments.message, not arguments.no_enter)
+    if arguments.action == "key":
+        if arguments.list:
+            if arguments.target or arguments.keys:
+                raise CliLaneError("--list takes no other arguments")
+            return print_key_names()
+        if not arguments.target:
+            raise CliLaneError("missing task target")
+        if not arguments.keys and is_key_name(arguments.target):
+            raise CliLaneError(
+                f"missing task target; usage: {PROGRAM} key TARGET KEY [KEY ...]"
+            )
+        return key_task(arguments.target, arguments.keys)
     if arguments.action == "wait":
         return wait_task(arguments.target, arguments.timeout)
     if arguments.action == "stop":
@@ -1972,7 +2569,9 @@ def execute(arguments: argparse.Namespace) -> int:
         print(f"removed {task.name}")
         return 0
     if arguments.action == "clean":
-        return clean_tasks()
+        return clean_tasks(arguments.dry_run, arguments.orphans)
+    if arguments.action == "orphans":
+        return print_orphans(arguments.json)
     if arguments.action == "watch":
         return watch_tasks(arguments.interval)
     raise CliLaneError(f"unknown action: {arguments.action}")
