@@ -28,7 +28,7 @@ from typing import BinaryIO, Iterator, Sequence
 
 
 PROGRAM = "clilane"
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 TASK_STATE_INITIALIZING = "initializing"
 TASK_STATE_RUNNING = "running"
 TASK_STATE_STOPPED = "stopped"
@@ -1824,12 +1824,12 @@ def parser() -> argparse.ArgumentParser:
             "configured fleet."
         ),
         epilog="""examples:
-  clilane run codex-galaxy -C ~/projects/galaxy-drill -- codex
-  clilane run kimi-paws -C ~/projects/paws -- kimi
+  clilane run codex-app -C ~/projects/sample-app -- codex
+  clilane run kimi-research -C ~/projects/research -- kimi
   clilane list
   clilane fleet
-  clilane status codex-galaxy
-  clilane attach codex-galaxy
+  clilane status codex-app
+  clilane attach codex-app
 
 Only tasks started through clilane appear. Press Ctrl-Q to detach from a task.""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
