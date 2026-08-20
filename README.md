@@ -10,7 +10,7 @@ CLI Lane is process-agnostic. It manages commands that you launch through
 processes.
 
 ```text
-MacBook / Termius / another node
+Laptop / Termius / another node
               │
           SSH or Mosh
               │
@@ -91,9 +91,9 @@ clilane rm demo
 Agent CLIs use the same lifecycle:
 
 ```bash
-clilane run codex-galaxy -C ~/projects/galaxy-drill -- codex
-clilane run kimi-paws -C ~/projects/paws -- kimi
-clilane run claude-app -C ~/projects/app -- claude
+clilane run codex-app -C ~/projects/sample-app -- codex
+clilane run kimi-research -C ~/projects/research -- kimi
+clilane run claude-api -C ~/projects/api -- claude
 ```
 
 The named command must already be installed on that host.
@@ -111,25 +111,28 @@ Configure SSH aliases, keys, users, ports, and jump hosts in `~/.ssh/config`.
 Connect to each alias once so strict host-key checking succeeds:
 
 ```bash
-ssh mini true
+ssh agent-host true
 ```
 
-Run `fleet` from a controller that is allowed to initiate SSH connections. For
-example, if a MacBook may SSH to a Mini but the Mini must not SSH back, create
-`~/.config/clilane/fleet.json` on the MacBook with this direction:
+On the machine where you run `fleet`, mark that machine as `local` and add any
+hosts it can reach as `ssh`. The names are display labels, and each destination
+is an SSH alias. CLI Lane has no built-in knowledge of your machines, roles, or
+network topology.
+
+Create `~/.config/clilane/fleet.json`:
 
 ```json
 {
   "schema_version": 1,
   "hosts": [
     {
-      "name": "macbook",
+      "name": "workstation",
       "transport": "local"
     },
     {
-      "name": "mini",
+      "name": "agent-host",
       "transport": "ssh",
-      "destination": "mini"
+      "destination": "agent-host"
     }
   ]
 }
@@ -149,9 +152,9 @@ clilane fleet
 ```
 
 ```text
-HOST    NAME           STATE      AGE    PID      PROJECT      COMMAND
-macbook kimi-inference running    4m     8124     inference    kimi
-mini    codex-galaxy   running    15h    21686    galaxy-drill codex
+HOST        NAME          STATE      AGE    PID      PROJECT    COMMAND
+workstation kimi-research running    4m     8124     research   kimi
+agent-host  codex-project running    15h    21686    sample-app codex
 ```
 
 Override the config or per-host timeout when needed:
@@ -178,14 +181,14 @@ Fleet JSON has this top-level shape:
   "generated_at": "2026-08-19T12:00:00+00:00",
   "hosts": [
     {
-      "name": "macbook",
+      "name": "workstation",
       "status": "ok",
       "clilane_version": "0.2.0",
       "tasks": [],
       "error": null
     },
     {
-      "name": "mini",
+      "name": "agent-host",
       "status": "error",
       "clilane_version": null,
       "tasks": [],
@@ -210,16 +213,16 @@ while that host and CLI Lane's dedicated tmux server remain alive.
 From an interactive remote login:
 
 ```bash
-ssh mini
+ssh agent-host
 clilane ps
-clilane attach codex-galaxy
+clilane attach codex-project
 ```
 
 For a one-shot command whose non-login PATH does not include CLI Lane or Homebrew,
 invoke a login shell:
 
 ```bash
-ssh mini 'zsh -lc "clilane ps"'
+ssh agent-host 'zsh -lc "clilane ps"'
 ```
 
 `attach` removes inherited outer-tmux variables before connecting to CLI Lane's
