@@ -367,8 +367,11 @@ logs under `~/.local/state/agt` remain readable for compatibility.
 - No reboot or CLI Lane tmux-server-crash adoption of running tasks; their exit
   status is lost, though their logs survive and are listed by `orphans`.
 - A descendant that creates a new POSIX session can escape lifecycle control.
-- No cross-host mutation, scheduling, retries, dependency graphs, notifications,
-  web UI, or automatic SSH-host discovery.
+- No queueing, by design: a task starts immediately or not at all. Sequential
+  workflows compose from `run --wait` and `--on-exit`; anything beyond that
+  belongs in a real scheduler running above CLI Lane, not inside it.
+- No cross-host mutation, retries, dependency graphs, notifications beyond
+  `--on-exit`, web UI, or automatic SSH-host discovery.
 - Fleet snapshots are point-in-time; a task can change immediately afterward.
 - Fleet ages assume host clocks are reasonably synchronized.
 - Raw terminal logs are not structured or redacted.
