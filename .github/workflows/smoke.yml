@@ -208,7 +208,14 @@ jobs:
 
           rc=0
           ./bin/clilane run ci-exit --wait -- /nonexistent/ci-binary || rc=$?
-          test "$rc" = "127"
+          if [ "$rc" != "127" ]; then
+            echo "DEBUG rc=$rc" >&2
+            tmux -L "$CLILANE_TMUX_SOCKET" -f /dev/null list-sessions >&2 || true
+            tmux -L "$CLILANE_TMUX_SOCKET" -f /dev/null list-panes -a \
+              -F '#{session_name} #{pane_dead} #{pane_dead_status} [#{@agt_meta}] [#{@agt_committed}]' >&2 || true
+            ./bin/clilane list --json >&2 || true
+            exit 1
+          fi
           ./bin/clilane rm ci-exit
           ./bin/clilane run ci-true --wait -- /usr/bin/true
           ./bin/clilane rm ci-true
