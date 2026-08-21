@@ -306,7 +306,11 @@ jobs:
                       "agents": [
                           {
                               "name": "demo",
-                              "command": ["/bin/sh", "-c", "sleep 300"],
+                              "command": [
+                                  "/bin/sh",
+                                  "-c",
+                                  "echo adopted=$CI_HUB_ENV; sleep 300",
+                              ],
                               "dir": sys.argv[2],
                           }
                       ],
@@ -322,7 +326,20 @@ jobs:
 
           slot=@agt_hub_name_0123abcd
           tmux -L "$CLILANE_TMUX_SOCKET" -f /dev/null set-option -g "$slot" ci-hub
+          rc=0
+          ./bin/clilane __hub-run "$hub_config" 0 no-such-client "$slot" \
+            >/dev/null 2>&1 || rc=$?
+          test "$rc" = "1"
+
+          hub_env="$(python3 -c 'import base64, json, os; print(base64.urlsafe_b64encode(json.dumps({"CI_HUB_ENV": "adopted", "PATH": os.environ["PATH"]}).encode()).decode())')"
+          tmux -L "$CLILANE_TMUX_SOCKET" -f /dev/null set-option -g @agt_hub_env "$hub_env"
+          tmux -L "$CLILANE_TMUX_SOCKET" -f /dev/null set-option -g "$slot" ci-hub
           ./bin/clilane __hub-run "$hub_config" 0 no-such-client "$slot"
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if ./bin/clilane log ci-hub | grep -Fq 'adopted=adopted'; then break; fi
+            sleep 1
+          done
+          ./bin/clilane log ci-hub | grep -Fq 'adopted=adopted' 
           ./bin/clilane status ci-hub --json > "$RUNNER_TEMP/hub-status.json"
           python3 - "$RUNNER_TEMP/hub-status.json" "$RUNNER_TEMP" <<'PY'
           import json
@@ -331,7 +348,7 @@ jobs:
 
           status = json.loads(Path(sys.argv[1]).read_text())
           assert status["state"] == "running", status
-          assert status["command"][-1] == "exec /bin/sh -c 'sleep 300'", status
+          assert status["command"][0] == "/bin/sh", status
           assert status["cwd"] == sys.argv[2], status
           PY
           test -z "$(tmux -L "$CLILANE_TMUX_SOCKET" -f /dev/null show-options -gqv "$slot")"

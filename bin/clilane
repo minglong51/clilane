@@ -44,6 +44,8 @@ HUB_SESSION = "hub"
 HUB_MAX_PRESETS = 9
 HUB_MAX_JUMPS = 20
 HUB_NAME_OPTION = "@agt_hub_name"
+HUB_ENV_OPTION = "@agt_hub_env"
+HUB_ENV_MAX_BYTES = 256 * 1024
 HUB_SLOT_PATTERN = re.compile(r"@agt_hub_name_[0-9a-f]{8}")
 HUB_CONFIG_SCHEMA_VERSION = 1
 FIELD_SEPARATOR = "|"
@@ -2426,12 +2428,39 @@ def hub_menu(client: str, configured: str) -> int:
     return 0
 
 
-def login_command(command: list[str]) -> list[str]:
-    shell = os.environ.get("SHELL") or ""
-    if not shell or Path(shell).name in {"sh", "dash"}:
-        return command
-    joined = " ".join(shlex.quote(part) for part in command)
-    return [shell, "-lc", f"exec {joined}"]
+def portable_environment() -> dict[str, str]:
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key not in TRANSIENT_ENV and ENV_PATTERN.fullmatch(key) and "\x00" not in value
+    }
+
+
+def capture_hub_environment() -> None:
+    encoded = encode_meta(dict(portable_environment()))
+    if len(encoded) > HUB_ENV_MAX_BYTES:
+        raise CliLaneError("the environment is too large to hand to the hub")
+    tmux(["set-option", "-g", HUB_ENV_OPTION, encoded])
+
+
+def adopt_hub_environment() -> None:
+    encoded = tmux(["show-options", "-gqv", HUB_ENV_OPTION]).stdout.decode().strip()
+    if not encoded:
+        raise CliLaneError(
+            f"the hub has no recorded environment; start it again with {PROGRAM} hub"
+        )
+    decoded = decode_meta(encoded)
+    pinned = {
+        key: value
+        for key, value in os.environ.items()
+        if key in {"CLILANE_TMUX_SOCKET", "CLILANE_STATE_HOME", "TMUX_TMPDIR"}
+    }
+    adopted = {
+        key: value for key, value in decoded.items() if isinstance(value, str)
+    }
+    os.environ.clear()
+    os.environ.update(adopted)
+    os.environ.update(pinned)
 
 
 def hub_ensure(client: str) -> int:
@@ -2453,7 +2482,8 @@ def hub_run(configured: str, index_text: str, client: str, slot: str) -> int:
         raise CliLaneError("no task name was given")
     preset = presets[index]
     try:
-        task = run_task(name, str(preset["dir"]), login_command(list(preset["command"])))
+        adopt_hub_environment()
+        task = run_task(name, str(preset["dir"]), list(preset["command"]))
     except CliLaneError as error:
         tmux(["display-message", "-c", client, f"{PROGRAM}: {error}"], check=False)
         raise
@@ -2504,6 +2534,7 @@ def hub_command(configured: str | None) -> int:
     load_hub_presets(configured)
     ensure_server_available()
     ensure_hub_session()
+    capture_hub_environment()
     bind_detach_key()
     bind_hub_keys(config)
     environment = os.environ.copy()

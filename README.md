@@ -266,10 +266,12 @@ whatever is already running.
 `list`, `log`, `stop`, and the fleet commands all see it, and the task's tmux
 window carries its name.
 
-Presets start through your login shell, so an agent launched from the menu gets
-the same environment as one you start by typing in the hub — API keys and PATH
-from your profile included. `clilane run` is unaffected: it keeps inheriting the
-environment of the shell you run it from.
+An agent started from the menu inherits the environment of the shell you ran
+`clilane hub` in — the same environment `clilane run` would have given it. This
+matters more than it sounds: tools installed by a version manager, or on a PATH
+your shell builds interactively, are invisible to the tmux server that runs the
+menu, so without this a preset for such a tool would fail to launch at all. The
+environment is captured when you start the hub; start it again to refresh it.
 
 The hub runs on CLI Lane's own tmux server, so it nests safely inside your normal
 tmux: your prefix, configuration, and other panes are untouched, and both survive a
