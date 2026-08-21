@@ -86,7 +86,7 @@ jobs:
           for path in sys.argv[1:]:
               assert os.stat(path).st_mode & 0o777 == 0o700, path
           PY
-          test "$(./bin/clilane --version)" = "clilane 0.4.0"
+          test "$(./bin/clilane --version)" = "clilane 0.5.0"
           ./bin/clilane --help | grep -F "~/projects/sample-app" >/dev/null
           python3 -c 'import sys; assert sys.version_info >= (3, 10)'
           tmux -V
@@ -162,7 +162,7 @@ jobs:
           host = fleet["hosts"][0]
           assert host["name"] == "ci-local"
           assert host["status"] == "ok"
-          assert host["clilane_version"] == "0.4.0"
+          assert host["clilane_version"] == "0.5.0"
           assert host["error"] is None
           assert len(host["tasks"]) == 1
           assert host["tasks"][0] == status
@@ -289,6 +289,98 @@ jobs:
           ./bin/clilane clean --orphans
           test ! -f "$crash_log"
           test "$(./bin/clilane orphans)" = "no orphaned tasks"
+
+      - name: Exercise the hub surface
+        shell: bash
+        run: |
+          hub_config="$RUNNER_TEMP/hub.json"
+          python3 - "$hub_config" "$RUNNER_TEMP" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          Path(sys.argv[1]).write_text(
+              json.dumps(
+                  {
+                      "schema_version": 1,
+                      "agents": [
+                          {
+                              "name": "demo",
+                              "command": [
+                                  "/bin/sh",
+                                  "-c",
+                                  "echo adopted=$CI_HUB_ENV; sleep 300",
+                              ],
+                              "dir": sys.argv[2],
+                          }
+                      ],
+                  }
+              )
+          )
+          PY
+          ./bin/clilane hub --help >/dev/null
+
+          ./bin/clilane run ci-seed -- /bin/sh -c 'sleep 300'
+          tmux -L "$CLILANE_TMUX_SOCKET" -f /dev/null list-windows -a \
+            -F '#{window_name}' | grep -Fqx ci-seed
+
+          slot=@agt_hub_name_0123abcd
+          tmux -L "$CLILANE_TMUX_SOCKET" -f /dev/null set-option -g "$slot" ci-hub
+          rc=0
+          ./bin/clilane __hub-run "$hub_config" 0 no-such-client "$slot" \
+            >/dev/null 2>&1 || rc=$?
+          test "$rc" = "1"
+
+          hub_env="$(python3 -c 'import base64, json, os; print(base64.urlsafe_b64encode(json.dumps({"CI_HUB_ENV": "adopted", "PATH": os.environ["PATH"]}).encode()).decode())')"
+          tmux -L "$CLILANE_TMUX_SOCKET" -f /dev/null set-option -g @agt_hub_env "$hub_env"
+          tmux -L "$CLILANE_TMUX_SOCKET" -f /dev/null set-option -g "$slot" ci-hub
+          ./bin/clilane __hub-run "$hub_config" 0 no-such-client "$slot"
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if ./bin/clilane log ci-hub | grep -Fq 'adopted=adopted'; then break; fi
+            sleep 1
+          done
+          ./bin/clilane log ci-hub | grep -Fq 'adopted=adopted' 
+          ./bin/clilane status ci-hub --json > "$RUNNER_TEMP/hub-status.json"
+          python3 - "$RUNNER_TEMP/hub-status.json" "$RUNNER_TEMP" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          status = json.loads(Path(sys.argv[1]).read_text())
+          assert status["state"] == "running", status
+          assert status["command"][0] == "/bin/sh", status
+          assert status["cwd"] == sys.argv[2], status
+          PY
+          test -z "$(tmux -L "$CLILANE_TMUX_SOCKET" -f /dev/null show-options -gqv "$slot")"
+
+          rc=0
+          ./bin/clilane __hub-run "$hub_config" 0 no-such-client "$slot" \
+            >/dev/null 2>&1 || rc=$?
+          test "$rc" = "1"
+          rc=0
+          ./bin/clilane __hub-run "$hub_config" 0 no-such-client not-a-slot \
+            >/dev/null 2>&1 || rc=$?
+          test "$rc" = "1"
+          tmux -L "$CLILANE_TMUX_SOCKET" -f /dev/null set-option -g "$slot" ci-ghost
+          rc=0
+          ./bin/clilane __hub-run "$hub_config" 9 no-such-client "$slot" \
+            >/dev/null 2>&1 || rc=$?
+          test "$rc" = "1"
+          printf 'not json\n' > "$RUNNER_TEMP/hub-bad.json"
+          rc=0
+          ./bin/clilane __hub-run "$RUNNER_TEMP/hub-bad.json" 0 no-such-client "$slot" \
+            >/dev/null 2>&1 || rc=$?
+          test "$rc" = "1"
+          tmux -L "$CLILANE_TMUX_SOCKET" -f /dev/null set-option -gu "$slot"
+
+          tmux -L "$CLILANE_TMUX_SOCKET" -f /dev/null new-session -d -s hub sleep 300
+          test "$(./bin/clilane list --json | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')" = "2"
+          ./bin/clilane clean
+          tmux -L "$CLILANE_TMUX_SOCKET" -f /dev/null has-session -t hub
+          ./bin/clilane rm ci-hub --force --grace 0
+          ./bin/clilane rm ci-seed --force --grace 0
+          tmux -L "$CLILANE_TMUX_SOCKET" -f /dev/null has-session -t hub
+          tmux -L "$CLILANE_TMUX_SOCKET" -f /dev/null kill-session -t hub
 
       - name: Clean isolated task
         if: always()

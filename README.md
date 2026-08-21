@@ -222,6 +222,61 @@ Fleet scope is explicit rather than inferred: “complete” means every host in
 config answered successfully. It does not mean every computer or process on your
 network was discovered.
 
+## One view for every agent
+
+`clilane hub` attaches to a persistent `hub` session on CLI Lane's dedicated tmux
+server: a shell for typing CLI Lane commands, plus prefix-less keys for reaching
+every running agent.
+
+```bash
+clilane hub
+```
+
+| Key | Behavior |
+| --- | --- |
+| `M-n` | Open the menu: start a preset agent, or jump to a running one. |
+| `M-h` | Return to the hub from whichever agent you are in. |
+| `Ctrl-Q` | Detach and leave every agent running. |
+
+The menu lists presets first, then every running task by name and state. Starting
+one prompts for a task name; jumping switches straight to it.
+
+`M-n` acts only while the hub is in front, so an attached agent keeps receiving it
+as an ordinary key. `M-h` is deliberately global — a reliable way back matters more
+than the one key it takes, and CLI Lane already reserves `Ctrl-Q` the same way. It
+rebuilds the hub session if you have closed it, so it never becomes a dead key.
+
+Presets come from an optional file. Without one the hub is still a working
+launcher: type `clilane run ...` in its shell, or press `M-n` to jump between
+whatever is already running.
+
+```json
+{
+  "schema_version": 1,
+  "agents": [
+    { "name": "claude", "command": ["claude"], "dir": "~/projects/app" },
+    { "name": "codex", "command": ["codex"], "dir": "~/projects/app" },
+    { "name": "kimi", "command": ["kimi"], "dir": "~/projects/web" },
+    { "name": "hermes", "command": ["hermes"], "dir": "~" }
+  ]
+}
+```
+
+`dir` must be absolute after `~` expansion. A preset starts an ordinary task, so
+`list`, `log`, `stop`, and the fleet commands all see it, and the task's tmux
+window carries its name.
+
+An agent started from the menu inherits the environment of the shell you ran
+`clilane hub` in — the same environment `clilane run` would have given it. This
+matters more than it sounds: tools installed by a version manager, or on a PATH
+your shell builds interactively, are invisible to the tmux server that runs the
+menu, so without this a preset for such a tool would fail to launch at all. The
+environment is captured when you start the hub; start it again to refresh it.
+
+The hub runs on CLI Lane's own tmux server, so it nests safely inside your normal
+tmux: your prefix, configuration, and other panes are untouched, and both survive a
+dropped connection independently.
+
 ## SSH, Mosh, and tmux
 
 Tasks live on the host, so disconnecting SSH, Mosh, or Termius does not stop them
@@ -258,6 +313,7 @@ named `agt` for compatibility with tasks created before the project was renamed.
 | `fleet log HOST:TASK` | Read a fleet task's persistent log. `--lines` defaults to 200. |
 | `status TARGET` | Show one task by name or unique ID prefix. Supports `--json`. |
 | `attach TARGET` | Attach interactively. `Ctrl-Q` detaches. |
+| `hub` | Attach to the hub session: every agent in one view, with `M-n` for the start-or-jump menu, `M-h` to return, and `Ctrl-Q` to detach. `--config` overrides the presets file. |
 | `read TARGET` | Print the last 200 terminal lines. `--all` prints retained scrollback. |
 | `log TARGET` | Read persistent output. `--lines` defaults to 200; `--follow` follows rotation. |
 | `send TARGET MESSAGE` | Paste text and press Enter. `--no-enter` only pastes. Control characters are rejected; use `key`. |
@@ -310,7 +366,8 @@ running.
 | Setting | Purpose |
 |---|---|
 | `~/.config/clilane/fleet.json` | Default versioned fleet inventory. |
-| `XDG_CONFIG_HOME` | Moves the default fleet config to `$XDG_CONFIG_HOME/clilane/fleet.json`. |
+| `~/.config/clilane/hub.json` | Optional hub launcher presets, up to nine agents. |
+| `XDG_CONFIG_HOME` | Moves the default fleet and hub configs under `$XDG_CONFIG_HOME/clilane/`. |
 | `CLILANE_TMUX_SOCKET` | Overrides the dedicated local tmux socket. |
 | `CLILANE_STATE_HOME` | Overrides the local state root; it must be absolute. |
 | `XDG_STATE_HOME` | Uses `$XDG_STATE_HOME/clilane` for state. |
