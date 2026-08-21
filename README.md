@@ -243,7 +243,8 @@ one prompts for a task name; jumping switches straight to it.
 
 `M-n` acts only while the hub is in front, so an attached agent keeps receiving it
 as an ordinary key. `M-h` is deliberately global — a reliable way back matters more
-than the one key it takes, and CLI Lane already reserves `Ctrl-Q` the same way.
+than the one key it takes, and CLI Lane already reserves `Ctrl-Q` the same way. It
+rebuilds the hub session if you have closed it, so it never becomes a dead key.
 
 Presets come from an optional file. Without one the hub is still a working
 launcher: type `clilane run ...` in its shell, or press `M-n` to jump between
@@ -264,6 +265,11 @@ whatever is already running.
 `dir` must be absolute after `~` expansion. A preset starts an ordinary task, so
 `list`, `log`, `stop`, and the fleet commands all see it, and the task's tmux
 window carries its name.
+
+Presets start through your login shell, so an agent launched from the menu gets
+the same environment as one you start by typing in the hub — API keys and PATH
+from your profile included. `clilane run` is unaffected: it keeps inheriting the
+environment of the shell you run it from.
 
 The hub runs on CLI Lane's own tmux server, so it nests safely inside your normal
 tmux: your prefix, configuration, and other panes are untouched, and both survive a

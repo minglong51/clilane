@@ -331,7 +331,7 @@ jobs:
 
           status = json.loads(Path(sys.argv[1]).read_text())
           assert status["state"] == "running", status
-          assert status["command"] == ["/bin/sh", "-c", "sleep 300"], status
+          assert status["command"][-1] == "exec /bin/sh -c 'sleep 300'", status
           assert status["cwd"] == sys.argv[2], status
           PY
           test -z "$(tmux -L "$CLILANE_TMUX_SOCKET" -f /dev/null show-options -gqv "$slot")"

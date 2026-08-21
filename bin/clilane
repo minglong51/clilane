@@ -2249,6 +2249,10 @@ def attach_task(task: Task) -> int:
     return 1
 
 
+def tmux_literal(text: str, expansions: int) -> str:
+    return text.replace("#", "#" * (2 ** max(0, expansions)))
+
+
 def tmux_quoted(text: str) -> str:
     escaped = text.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
     return f'"{escaped}"'
@@ -2259,6 +2263,10 @@ def load_hub_presets(configured: str | None) -> list[dict[str, object]]:
     try:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
+        if configured:
+            raise CliLaneError(
+                f"hub config not found: {str(path)!r}; create it or omit --config"
+            ) from None
         return []
     except UnicodeDecodeError as error:
         raise CliLaneError(f"hub config is not UTF-8: {str(path)!r}") from error
@@ -2331,15 +2339,40 @@ def hub_environment_prefix() -> str:
 
 def hub_menu_command(config: Path) -> str:
     script = shlex.quote(str(Path(__file__).resolve()))
-    return (
+    body = (
         f"{hub_environment_prefix()} {script} __hub-menu "
         f"'#{{client_name}}' {shlex.quote(str(config))}"
     )
+    return tmux_literal_command(body, 1)
+
+
+def tmux_literal_command(body: str, expansions: int) -> str:
+    guard = "#{client_name}"
+    parts = body.split(guard)
+    return guard.join(tmux_literal(part, expansions) for part in parts)
+
+
+def hub_ensure_command() -> str:
+    script = shlex.quote(str(Path(__file__).resolve()))
+    body = f"{hub_environment_prefix()} {script} __hub-ensure '#{{client_name}}'"
+    return tmux_literal_command(body, 1)
 
 
 def bind_hub_keys(config: Path) -> None:
     guard = f"#{{==:#{{session_name}},{HUB_SESSION}}}"
-    tmux(["bind-key", "-T", "root", "M-h", "switch-client", "-t", HUB_SESSION])
+    tmux(
+        [
+            "bind-key",
+            "-T",
+            "root",
+            "M-h",
+            "if-shell",
+            "-F",
+            guard,
+            "display-message 'already in the hub'",
+            f"run-shell -b {tmux_quoted(hub_ensure_command())}",
+        ]
+    )
     tmux(
         [
             "bind-key",
@@ -2362,9 +2395,10 @@ def hub_menu(client: str, configured: str) -> int:
     for index, preset in enumerate(presets):
         name = str(preset["name"])
         slot = f"{HUB_NAME_OPTION}_{uuid.uuid4().hex[:8]}"
-        launch = (
+        launch = tmux_literal(
             f"{hub_environment_prefix()} {script} __hub-run "
-            f"{shlex.quote(configured)} {index} {shlex.quote(client)} {slot}"
+            f"{shlex.quote(configured)} {index} {shlex.quote(client)} {slot}",
+            2,
         )
         capture = f"set-option -g {slot} '%1'"
         template = f"{capture} ; run-shell -b {tmux_quoted(launch)}"
@@ -2392,6 +2426,20 @@ def hub_menu(client: str, configured: str) -> int:
     return 0
 
 
+def login_command(command: list[str]) -> list[str]:
+    shell = os.environ.get("SHELL") or ""
+    if not shell or Path(shell).name in {"sh", "dash"}:
+        return command
+    joined = " ".join(shlex.quote(part) for part in command)
+    return [shell, "-lc", f"exec {joined}"]
+
+
+def hub_ensure(client: str) -> int:
+    ensure_hub_session()
+    tmux(["switch-client", "-c", client, "-t", HUB_SESSION])
+    return 0
+
+
 def hub_run(configured: str, index_text: str, client: str, slot: str) -> int:
     if not HUB_SLOT_PATTERN.fullmatch(slot):
         raise CliLaneError("invalid hub name slot")
@@ -2405,7 +2453,7 @@ def hub_run(configured: str, index_text: str, client: str, slot: str) -> int:
         raise CliLaneError("no task name was given")
     preset = presets[index]
     try:
-        task = run_task(name, str(preset["dir"]), list(preset["command"]))
+        task = run_task(name, str(preset["dir"]), login_command(list(preset["command"])))
     except CliLaneError as error:
         tmux(["display-message", "-c", client, f"{PROGRAM}: {error}"], check=False)
         raise
@@ -2413,10 +2461,7 @@ def hub_run(configured: str, index_text: str, client: str, slot: str) -> int:
     return 0
 
 
-def hub_command(configured: str | None) -> int:
-    config = hub_config_path(configured)
-    load_hub_presets(configured)
-    ensure_server_available()
+def ensure_hub_session() -> None:
     if tmux_session_absent(HUB_SESSION):
         shell = os.environ.get("SHELL") or "/bin/sh"
         tmux(
@@ -2452,6 +2497,13 @@ def hub_command(configured: str | None) -> int:
             " M-n menu  M-h hub  C-q detach ",
         ]
     )
+
+
+def hub_command(configured: str | None) -> int:
+    config = hub_config_path(configured)
+    load_hub_presets(configured)
+    ensure_server_available()
+    ensure_hub_session()
     bind_detach_key()
     bind_hub_keys(config)
     environment = os.environ.copy()
@@ -2779,9 +2831,14 @@ def confirm_server_absent(tasks: Sequence[Task], records: Sequence[TaskRecord]) 
     disk_only = [record for record in records if record.id not in {task.id for task in tasks}]
     if tasks or not disk_only:
         return
-    probe = tmux(["list-sessions"], check=False)
-    if probe.returncode == 0 or not tmux_server_absent(probe):
+    probe = tmux(["list-sessions", "-F", "#{session_name}"], check=False)
+    if probe.returncode != 0:
+        if tmux_server_absent(probe):
+            return
         raise CliLaneError("could not confirm the tmux server is absent; not reclaiming")
+    names = probe.stdout.decode(errors="replace").split()
+    if any(name.startswith(SESSION_PREFIX) for name in names):
+        raise CliLaneError("the tmux server still holds task sessions; not reclaiming")
 
 
 def reap_record(record: TaskRecord, live_sessions: frozenset[str]) -> None:
@@ -3245,6 +3302,8 @@ def main() -> int:
     try:
         if len(sys.argv) == 3 and sys.argv[1] == "__supervise":
             return supervise(sys.argv[2])
+        if len(sys.argv) == 3 and sys.argv[1] == "__hub-ensure":
+            return hub_ensure(sys.argv[2])
         if len(sys.argv) == 4 and sys.argv[1] == "__hub-menu":
             return hub_menu(sys.argv[2], sys.argv[3])
         if len(sys.argv) == 6 and sys.argv[1] == "__hub-run":
