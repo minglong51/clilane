@@ -29,7 +29,7 @@ from typing import BinaryIO, Iterator, Sequence
 
 
 PROGRAM = "clilane"
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 TASK_STATE_INITIALIZING = "initializing"
 TASK_STATE_RUNNING = "running"
 TASK_STATE_STOPPED = "stopped"
@@ -40,6 +40,9 @@ SOCKET = os.environ.get("CLILANE_TMUX_SOCKET") or os.environ.get(
 )
 SESSION_PREFIX = "agt_"
 SERVER_TAG = "agt-v1"
+HUB_SESSION = "hub"
+HUB_MAX_PRESETS = 9
+HUB_CONFIG_SCHEMA_VERSION = 1
 FIELD_SEPARATOR = "|"
 ON_EXIT_TIMEOUT = 30.0
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -355,7 +358,7 @@ def state_root() -> Path:
     return root
 
 
-def fleet_config_path(configured: str | None) -> Path:
+def config_file_path(configured: str | None, filename: str) -> Path:
     if configured:
         return Path(configured).expanduser().resolve()
     xdg = os.environ.get("XDG_CONFIG_HOME")
@@ -365,7 +368,15 @@ def fleet_config_path(configured: str | None) -> Path:
             raise CliLaneError("XDG_CONFIG_HOME must be absolute")
     else:
         root = Path.home() / ".config"
-    return (root / PROGRAM / "fleet.json").resolve()
+    return (root / PROGRAM / filename).resolve()
+
+
+def fleet_config_path(configured: str | None) -> Path:
+    return config_file_path(configured, "fleet.json")
+
+
+def hub_config_path(configured: str | None) -> Path:
+    return config_file_path(configured, "hub.json")
 
 
 def fleet_name(value: object, field: str) -> str:
@@ -2230,6 +2241,204 @@ def attach_task(task: Task) -> int:
     return 1
 
 
+def tmux_quoted(text: str) -> str:
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
+    return f'"{escaped}"'
+
+
+def load_hub_presets(configured: str | None) -> list[dict[str, object]]:
+    path = hub_config_path(configured)
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        return []
+    except OSError as error:
+        raise CliLaneError(f"could not read hub config: {error}") from error
+    try:
+        decoded = json.loads(
+            raw,
+            parse_constant=reject_json_constant,
+            parse_float=finite_json_float,
+            parse_int=bounded_json_int,
+        )
+    except (json.JSONDecodeError, RecursionError, ValueError):
+        raise CliLaneError(f"hub config is not valid JSON: {path}") from None
+    if (
+        not isinstance(decoded, dict)
+        or decoded.get("schema_version") != HUB_CONFIG_SCHEMA_VERSION
+    ):
+        raise CliLaneError(
+            f'hub config must be an object with "schema_version": '
+            f"{HUB_CONFIG_SCHEMA_VERSION}"
+        )
+    agents = decoded.get("agents")
+    if not isinstance(agents, list) or len(agents) > HUB_MAX_PRESETS:
+        raise CliLaneError(
+            f"hub config needs an agents list with at most {HUB_MAX_PRESETS} entries"
+        )
+    presets: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for entry in agents:
+        if not isinstance(entry, dict):
+            raise CliLaneError("each hub preset must be an object")
+        name = fleet_name(entry.get("name"), "hub preset name")
+        if name in seen:
+            raise CliLaneError(f"duplicate hub preset: {name}")
+        seen.add(name)
+        command = entry.get("command")
+        if (
+            not isinstance(command, list)
+            or not command
+            or not all(isinstance(part, str) and part for part in command)
+        ):
+            raise CliLaneError(f"hub preset command must be a list of strings: {name}")
+        directory = entry.get("dir", "~")
+        if not isinstance(directory, str) or not directory:
+            raise CliLaneError(f"hub preset dir must be a string: {name}")
+        presets.append({"name": name, "command": command, "dir": directory})
+    return presets
+
+
+def hub_environment_prefix() -> str:
+    pairs = [
+        ("CLILANE_TMUX_SOCKET", SOCKET),
+        ("CLILANE_STATE_HOME", str(state_root())),
+    ]
+    tmpdir = os.environ.get("TMUX_TMPDIR")
+    if tmpdir:
+        pairs.append(("TMUX_TMPDIR", tmpdir))
+    return " ".join(f"{key}={shlex.quote(value)}" for key, value in pairs)
+
+
+def hub_menu_command(config: Path) -> str:
+    script = shlex.quote(str(Path(__file__).resolve()))
+    return (
+        f"{hub_environment_prefix()} {script} __hub-menu "
+        f"'#{{client_name}}' {shlex.quote(str(config))}"
+    )
+
+
+def bind_hub_keys(config: Path) -> None:
+    guard = f"#{{==:#{{session_name}},{HUB_SESSION}}}"
+    tmux(["bind-key", "-T", "root", "M-h", "switch-client", "-t", HUB_SESSION])
+    tmux(
+        [
+            "bind-key",
+            "-T",
+            "root",
+            "M-s",
+            "if-shell",
+            "-F",
+            guard,
+            "choose-tree -s",
+            "send-keys M-s",
+        ]
+    )
+    tmux(
+        [
+            "bind-key",
+            "-T",
+            "root",
+            "M-n",
+            "if-shell",
+            "-F",
+            guard,
+            f"run-shell -b {tmux_quoted(hub_menu_command(config))}",
+            "send-keys M-n",
+        ]
+    )
+
+
+def hub_menu(client: str, configured: str) -> int:
+    presets = load_hub_presets(configured)
+    script = shlex.quote(str(Path(__file__).resolve()))
+    items: list[str] = []
+    for index, preset in enumerate(presets):
+        name = str(preset["name"])
+        launch = (
+            f"{hub_environment_prefix()} {script} __hub-run "
+            f"{shlex.quote(configured)} {index} {shlex.quote(client)} '%1'"
+        )
+        template = f"run-shell -b {tmux_quoted(launch)}"
+        action = (
+            f"command-prompt -p {tmux_quoted(f'{name} task name:')} "
+            f"-I {tmux_quoted(f'{name}-')} {tmux_quoted(template)}"
+        )
+        items.extend([name, str(index + 1), action])
+    items.extend(["jump to task", "j", "choose-tree -s"])
+    items.extend(["detach", "d", "detach-client"])
+    shown = tmux(["display-menu", "-c", client, "-T", PROGRAM, *items], check=False)
+    if shown.returncode != 0:
+        detail = shown.stderr.decode(errors="replace").strip()
+        raise CliLaneError(detail or "could not display the hub menu")
+    return 0
+
+
+def hub_run(configured: str, index_text: str, client: str, name: str) -> int:
+    presets = load_hub_presets(configured)
+    index = optional_int(index_text)
+    if index is None or not 0 <= index < len(presets):
+        raise CliLaneError("unknown hub preset")
+    preset = presets[index]
+    directory = str(Path(str(preset["dir"])).expanduser())
+    task = run_task(name.strip(), directory, list(preset["command"]))
+    tmux(["display-message", "-c", client, f"created {task.name}"], check=False)
+    return 0
+
+
+def hub_command(configured: str | None) -> int:
+    config = hub_config_path(configured)
+    load_hub_presets(configured)
+    ensure_server_available()
+    if tmux_session_absent(HUB_SESSION):
+        shell = os.environ.get("SHELL") or "/bin/sh"
+        tmux(
+            [
+                "start-server",
+                ";",
+                "set-option",
+                "-g",
+                "history-limit",
+                "50000",
+                ";",
+                "set-option",
+                "-g",
+                "@agt_server",
+                SERVER_TAG,
+                ";",
+                "new-session",
+                "-d",
+                "-s",
+                HUB_SESSION,
+                "-c",
+                str(Path.home()),
+                shell,
+                "-l",
+            ]
+        )
+    tmux(
+        [
+            "set-option",
+            "-t",
+            HUB_SESSION,
+            "status-right",
+            " M-n new  M-s jump  C-q detach ",
+        ]
+    )
+    bind_detach_key()
+    bind_hub_keys(config)
+    environment = os.environ.copy()
+    environment.pop("TMUX", None)
+    environment.pop("TMUX_PANE", None)
+    binary = tmux_binary()
+    os.execvpe(
+        binary,
+        [binary, "-L", SOCKET, "-f", "/dev/null", "attach-session", "-t", HUB_SESSION],
+        environment,
+    )
+    return 1
+
+
 def read_task(task: Task, all_history: bool) -> int:
     start = "-" if all_history else "-200"
     captured = tmux(["capture-pane", "-p", "-J", "-S", start, "-t", task.pane])
@@ -2820,6 +3029,15 @@ Only tasks started through clilane appear. Press Ctrl-Q to detach from a task.""
     attach = commands.add_parser("attach", help="attach to a task interactively")
     attach.add_argument("target", help="task name or ID prefix; Ctrl-Q detaches")
 
+    hub = commands.add_parser("hub", help="attach to the hub: all agents in one view")
+    hub.add_argument(
+        "--config",
+        help=(
+            "hub presets file (default: $XDG_CONFIG_HOME/clilane/hub.json or "
+            "~/.config/clilane/hub.json)"
+        ),
+    )
+
     read = commands.add_parser("read", help="print recent terminal output")
     read.add_argument("target", help="task name or ID prefix")
     read.add_argument("-a", "--all", action="store_true", help="print all scrollback")
@@ -2957,6 +3175,8 @@ def execute(arguments: argparse.Namespace) -> int:
         return 0
     if arguments.action == "attach":
         return attach_task(resolve_task(arguments.target))
+    if arguments.action == "hub":
+        return hub_command(arguments.config)
     if arguments.action == "read":
         return read_task(resolve_task(arguments.target), arguments.all)
     if arguments.action == "log":
@@ -2998,6 +3218,10 @@ def main() -> int:
     try:
         if len(sys.argv) == 3 and sys.argv[1] == "__supervise":
             return supervise(sys.argv[2])
+        if len(sys.argv) == 4 and sys.argv[1] == "__hub-menu":
+            return hub_menu(sys.argv[2], sys.argv[3])
+        if len(sys.argv) == 6 and sys.argv[1] == "__hub-run":
+            return hub_run(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
         if len(sys.argv) == 5 and sys.argv[1] == "__log":
             max_bytes = optional_int(sys.argv[3])
             if max_bytes is None:
