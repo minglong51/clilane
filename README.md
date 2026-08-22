@@ -8,6 +8,8 @@ you can still trust days later. Reconnect through SSH, Mosh, or Termius to
 inspect, attach, send input, press keys, stop, or remove a task, or read task
 state across a fleet of hosts.
 
+![clilane list — three agent CLIs running in their lanes and a finished batch job](docs/list.png)
+
 Plenty of tools keep a process alive; CLI Lane exists for what happens at the
 edges. A task keeps its identity even after its pid is reused, so `stop` and
 `rm` can never touch an innocent process. Logs survive the tmux server dying
