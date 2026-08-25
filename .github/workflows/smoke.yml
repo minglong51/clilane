@@ -5,13 +5,15 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
 
 permissions:
   contents: read
 
 concurrency:
   group: smoke-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   smoke:
@@ -86,10 +88,20 @@ jobs:
           for path in sys.argv[1:]:
               assert os.stat(path).st_mode & 0o777 == 0o700, path
           PY
-          test "$(./bin/clilane --version)" = "clilane 0.7.0"
+          reported_version="$(./bin/clilane --version)"
+          version="${reported_version#clilane }"
+          test "$reported_version" = "clilane $version"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          printf 'CLILANE_VERSION=%s\n' "$version" >> "$GITHUB_ENV"
           ./bin/clilane --help | grep -F "~/projects/sample-app" >/dev/null
           python3 -c 'import sys; assert sys.version_info >= (3, 10)'
           tmux -V
+
+      - name: Exercise clean profiles
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v tests.test_profiles
+
+      - name: Exercise release workflow contract
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v tests.test_release
 
       - name: Exercise lifecycle and local fleet
         shell: bash
@@ -151,6 +163,7 @@ jobs:
 
           python3 - "$RUNNER_TEMP/status.json" "$RUNNER_TEMP/fleet.json" <<'PY'
           import json
+          import os
           import sys
           from pathlib import Path
 
@@ -162,7 +175,7 @@ jobs:
           host = fleet["hosts"][0]
           assert host["name"] == "ci-local"
           assert host["status"] == "ok"
-          assert host["clilane_version"] == "0.7.0"
+          assert host["clilane_version"] == os.environ["CLILANE_VERSION"]
           assert host["error"] is None
           assert len(host["tasks"]) == 1
           assert host["tasks"][0] == status
@@ -304,3 +317,138 @@ jobs:
           if test -x ./bin/clilane; then
             ./bin/clilane rm ci-smoke --force --grace 0 >/dev/null 2>&1 || true
           fi
+
+  release:
+    name: Publish immutable release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release identity
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          reported_version="$(./bin/clilane --version)"
+          version="${reported_version#clilane }"
+          if [ "$reported_version" != "clilane $version" ] || \
+             [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "invalid executable version: $reported_version" >&2
+            exit 1
+          fi
+          tag="v$version"
+          if [ "$GITHUB_REF" != "refs/tags/$tag" ] || \
+             [ "$GITHUB_REF_NAME" != "$tag" ]; then
+            echo "release tag $GITHUB_REF_NAME does not match executable version $version" >&2
+            exit 1
+          fi
+          head_commit="$(git rev-parse 'HEAD^{commit}')"
+          ref_commit="$(git rev-parse "$GITHUB_REF^{commit}")"
+          if [ "$head_commit" != "$GITHUB_SHA" ] || \
+             [ "$ref_commit" != "$GITHUB_SHA" ]; then
+            echo "release ref does not resolve to checked-out commit $GITHUB_SHA" >&2
+            exit 1
+          fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Build deterministic release assets
+        id: assets
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.identity.outputs.version }}
+        run: |
+          set -euo pipefail
+          release_dir="$RUNNER_TEMP/release"
+          archive_name="clilane-$RELEASE_VERSION.tar.gz"
+          archive="$release_dir/$archive_name"
+          verification="$RUNNER_TEMP/$archive_name.verification"
+          checksum="$archive.sha256"
+          install -d -m 0700 "$release_dir"
+          LC_ALL=C git -c tar.umask=0022 archive --format=tar \
+            --prefix="clilane-$RELEASE_VERSION/" "$GITHUB_SHA" | \
+            gzip -n -9 > "$archive"
+          LC_ALL=C git -c tar.umask=0022 archive --format=tar \
+            --prefix="clilane-$RELEASE_VERSION/" "$GITHUB_SHA" | \
+            gzip -n -9 > "$verification"
+          if ! cmp -s "$archive" "$verification"; then
+            echo "release archive is not deterministic" >&2
+            exit 1
+          fi
+          python3 - "$archive" "$checksum" "$archive_name" <<'PY'
+          import hashlib
+          import sys
+          from pathlib import Path
+
+          archive = Path(sys.argv[1])
+          checksum = Path(sys.argv[2])
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          checksum.write_text(f"{digest}  {sys.argv[3]}\n", encoding="ascii")
+          PY
+          printf 'artifact=%s\n' "$archive" >> "$GITHUB_OUTPUT"
+          printf 'checksum=%s\n' "$checksum" >> "$GITHUB_OUTPUT"
+          printf 'artifact_name=%s\n' "$archive_name" >> "$GITHUB_OUTPUT"
+          printf 'checksum_name=%s\n' "$archive_name.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse release conflicts
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.identity.outputs.tag }}
+          RELEASE_ARTIFACT_NAME: ${{ steps.assets.outputs.artifact_name }}
+          RELEASE_CHECKSUM_NAME: ${{ steps.assets.outputs.checksum_name }}
+        run: |
+          set -euo pipefail
+          releases="$RUNNER_TEMP/releases.json"
+          gh api --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$releases"
+          python3 - "$releases" "$RELEASE_TAG" \
+            "$RELEASE_ARTIFACT_NAME" "$RELEASE_CHECKSUM_NAME" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          pages = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          releases = [release for page in pages for release in page]
+          tag, artifact, checksum = sys.argv[2:]
+          conflicts = []
+          for release in releases:
+              if release.get("tag_name") == tag:
+                  state = "draft" if release.get("draft") else "release"
+                  conflicts.append(f"existing {state} {tag}")
+              names = {asset.get("name") for asset in release.get("assets", [])}
+              conflicts.extend(
+                  f"existing asset {name}"
+                  for name in (artifact, checksum)
+                  if name in names
+              )
+          if conflicts:
+              raise SystemExit("release publication refused: " + ", ".join(conflicts))
+          PY
+
+      - name: Publish immutable release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.identity.outputs.tag }}
+          RELEASE_ARTIFACT: ${{ steps.assets.outputs.artifact }}
+          RELEASE_CHECKSUM: ${{ steps.assets.outputs.checksum }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
+            "$RELEASE_ARTIFACT" "$RELEASE_CHECKSUM" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TAG" \
+            --notes "Immutable CLI Lane release $RELEASE_TAG. Homebrew update remains manual."

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 import concurrent.futures
+import errno
 import fcntl
 import hashlib
 import json
@@ -15,6 +16,7 @@ import select
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import termios
@@ -27,11 +29,11 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import BinaryIO, Iterator, Sequence
+from typing import BinaryIO, Iterator, Mapping, Sequence
 
 
 PROGRAM = "clilane"
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 TASK_STATE_INITIALIZING = "initializing"
 TASK_STATE_RUNNING = "running"
 TASK_STATE_STOPPED = "stopped"
@@ -40,6 +42,8 @@ TASK_STATE_FAILED = "failed"
 SOCKET = os.environ.get("CLILANE_TMUX_SOCKET") or os.environ.get(
     "AGT_TMUX_SOCKET", "agt"
 )
+TMUX_BINARY_OVERRIDE: str | None = None
+TMUX_SOCKET_OVERRIDE: str | None = None
 SESSION_PREFIX = "agt_"
 SERVER_TAG = "agt-v1"
 HUB_SESSION = "hub"
@@ -47,8 +51,8 @@ HUB_MAX_PRESETS = 9
 HUB_CONTEXT_OPTION_PREFIX = "@agt_hub_context_"
 HUB_CLIENT_CONTEXT_OPTION_PREFIX = "@agt_hub_client_"
 HUB_ENV_MAX_BYTES = 256 * 1024
-HUB_CONFIG_SCHEMA_VERSION = 1
-HUB_CONTEXT_SCHEMA_VERSION = 1
+HUB_CONFIG_SCHEMA_VERSIONS = frozenset({1, 2})
+HUB_CONTEXT_SCHEMA_VERSION = 2
 HUB_REFRESH_SECONDS = 0.5
 HUB_PROMPT_MAX_CHARS = 8000
 HUB_PROMPT_AGENT_ORDER = ("codex", "kimi", "claude")
@@ -136,6 +140,24 @@ FLEET_MAX_OUTPUT_BYTES = 256 * 1024
 FLEET_OUTPUT_LIMIT_LABEL = "256 KiB"
 FLEET_MAX_TASKS_PER_HOST = 512
 FLEET_MAX_INTEGER_DIGITS = 64
+CONFIG_MAX_BYTES = 256 * 1024
+EXEC_FOOTPRINT_MAX_BYTES = 64 * 1024
+CONTROL_SOCKET_RESERVE_BYTES = 1024
+PROFILE_CONFIG_SCHEMA_VERSION = 1
+PROFILE_BASELINE_ENV = (
+    "HOME",
+    "PATH",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+)
+PROFILE_OWNED_EXACT_ENV = frozenset({"TERM", "TMUX", "TMUX_PANE"})
+PROFILE_OWNED_ENV_PREFIXES = ("CLILANE_", "AGT_")
+PROFILE_SECRET_SUFFIXES = ("_TOKEN", "_KEY", "_SECRET", "_PASSWORD")
 FLEET_SENTINEL = "__CLILANE_FLEET_V1__"
 FLEET_TASK_FIELDS = (
     "id",
@@ -248,12 +270,54 @@ class Task:
 
 
 @dataclass(frozen=True)
-class RunSpec:
-    cwd: str
+class RunRequest:
+    name: str
+    cwd: str | None
+    cwd_explicit: bool
     wait: bool
     timeout: float | None
     on_exit: str | None
-    command: list[str]
+    profile: str | None
+    command: tuple[str, ...] | None
+
+
+@dataclass(frozen=True)
+class Profile:
+    name: str
+    provider: str
+    command: tuple[str, ...]
+    cwd_mode: str
+    cwd_path: str | None
+    inherit: tuple[str, ...]
+    env_set: tuple[tuple[str, str], ...]
+
+    def canonical_value(self) -> dict[str, object]:
+        cwd: dict[str, str] = {"mode": self.cwd_mode}
+        if self.cwd_path is not None:
+            cwd["path"] = self.cwd_path
+        return {
+            "name": self.name,
+            "provider": self.provider,
+            "command": list(self.command),
+            "cwd": cwd,
+            "env": {
+                "inherit": list(self.inherit),
+                "set": dict(self.env_set),
+            },
+        }
+
+
+@dataclass(frozen=True)
+class LaunchSpec:
+    name: str
+    cwd: str
+    command: tuple[str, ...]
+    wait: bool
+    timeout: float | None
+    on_exit: str | None
+    environment: dict[str, str]
+    profile: str | None
+    provider: str | None
 
 
 @dataclass(frozen=True)
@@ -286,10 +350,21 @@ class FleetResult:
 
 
 def tmux_binary() -> str:
+    if TMUX_BINARY_OVERRIDE is not None:
+        return TMUX_BINARY_OVERRIDE
     binary = shutil.which("tmux")
     if not binary:
         raise CliLaneError("tmux is required")
     return binary
+
+
+def tmux_socket_arguments() -> list[str]:
+    socket_path = TMUX_SOCKET_OVERRIDE or SOCKET
+    return ["-S", socket_path] if Path(socket_path).is_absolute() else ["-L", socket_path]
+
+
+def tmux_command_argument(value: str) -> str:
+    return value[:-1] + "\\;" if value.endswith(";") else value
 
 
 def ensure_tmux_version() -> None:
@@ -330,7 +405,7 @@ def tmux(
 ) -> subprocess.CompletedProcess[bytes]:
     try:
         completed = subprocess.run(
-            [tmux_binary(), "-L", SOCKET, "-f", "/dev/null", *arguments],
+            [tmux_binary(), *tmux_socket_arguments(), "-f", "/dev/null", *arguments],
             input=input_data,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -346,6 +421,14 @@ def tmux(
     return completed
 
 
+def configure_tmux_control(binary: str, socket_path: str) -> None:
+    global TMUX_BINARY_OVERRIDE, TMUX_SOCKET_OVERRIDE
+    if not Path(binary).is_absolute() or not Path(socket_path).is_absolute():
+        raise CliLaneError("invalid managed tmux control path")
+    TMUX_BINARY_OVERRIDE = binary
+    TMUX_SOCKET_OVERRIDE = socket_path
+
+
 def tmux_server_absent(completed: subprocess.CompletedProcess[bytes]) -> bool:
     detail = completed.stderr.decode(errors="replace").lower()
     return "no server running" in detail or (
@@ -353,7 +436,7 @@ def tmux_server_absent(completed: subprocess.CompletedProcess[bytes]) -> bool:
     )
 
 
-def state_root() -> Path:
+def state_root_path() -> Path:
     configured = os.environ.get("CLILANE_STATE_HOME") or os.environ.get("AGT_STATE_HOME")
     if configured:
         root = Path(configured).expanduser()
@@ -365,7 +448,11 @@ def state_root() -> Path:
         raise CliLaneError(
             "CLILANE_STATE_HOME, AGT_STATE_HOME, and XDG_STATE_HOME must be absolute"
         )
-    root = root.resolve()
+    return root.resolve()
+
+
+def state_root() -> Path:
+    root = state_root_path()
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     return root
 
@@ -389,6 +476,21 @@ def fleet_config_path(configured: str | None) -> Path:
 
 def hub_config_path(configured: str | None) -> Path:
     return config_file_path(configured, "hub.json")
+
+
+def profiles_config_path(environment: Mapping[str, str] | None = None) -> Path:
+    source = os.environ if environment is None else environment
+    xdg = source.get("XDG_CONFIG_HOME")
+    if xdg:
+        root = Path(xdg).expanduser()
+        if not root.is_absolute():
+            raise CliLaneError("XDG_CONFIG_HOME must be absolute")
+    else:
+        home = source.get("HOME")
+        root = (Path(home).expanduser() if home else Path.home()) / ".config"
+        if not root.is_absolute():
+            raise CliLaneError("HOME must be absolute")
+    return root / PROGRAM / "profiles.json"
 
 
 def fleet_name(value: object, field: str) -> str:
@@ -415,6 +517,213 @@ def bounded_json_int(value: str) -> int:
     if len(value.removeprefix("-")) > FLEET_MAX_INTEGER_DIGITS:
         raise ValueError("JSON integer is too large")
     return int(value)
+
+
+def unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    decoded: dict[str, object] = {}
+    for key, value in pairs:
+        if key in decoded:
+            raise ValueError(f"duplicate JSON field: {key!r}")
+        decoded[key] = value
+    return decoded
+
+
+def strict_json(raw: bytes, path: Path, label: str) -> object:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise CliLaneError(f"{label} is not UTF-8: {str(path)!r}") from error
+    try:
+        decoded = json.loads(
+            text,
+            object_pairs_hook=unique_json_object,
+            parse_constant=reject_json_constant,
+            parse_float=finite_json_float,
+            parse_int=bounded_json_int,
+        )
+        validate_json_strings(decoded)
+        return decoded
+    except (json.JSONDecodeError, RecursionError, UnicodeEncodeError, ValueError) as error:
+        raise CliLaneError(f"invalid {label} JSON: {str(path)!r}: {error}") from error
+
+
+def validate_json_strings(value: object) -> None:
+    if isinstance(value, str):
+        value.encode("utf-8")
+        return
+    if isinstance(value, list):
+        for item in value:
+            validate_json_strings(item)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key.encode("utf-8")
+            validate_json_strings(item)
+
+
+def secure_profile_bytes(path: Path) -> bytes:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise CliLaneError("this platform cannot safely open profile files")
+    flags = (
+        os.O_RDONLY
+        | nofollow
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        if error.errno in {errno.ELOOP, errno.EMLINK}:
+            raise CliLaneError(f"profiles file must not be a symlink: {str(path)!r}") from None
+        if error.errno == errno.ENOENT:
+            raise CliLaneError(f"profiles file not found: {str(path)!r}") from None
+        raise CliLaneError(f"could not open profiles file: {error}") from error
+    try:
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode):
+            raise CliLaneError(f"profiles file must be a regular file: {str(path)!r}")
+        if details.st_uid != os.getuid():
+            raise CliLaneError(f"profiles file must be owned by the current user: {str(path)!r}")
+        if details.st_mode & 0o022:
+            raise CliLaneError(
+                f"profiles file must not be writable by group or others: {str(path)!r}"
+            )
+        if details.st_size > CONFIG_MAX_BYTES:
+            raise CliLaneError(f"profiles file exceeds the 256 KiB limit: {str(path)!r}")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            raw = handle.read(CONFIG_MAX_BYTES + 1)
+    finally:
+        os.close(descriptor)
+    if len(raw) > CONFIG_MAX_BYTES:
+        raise CliLaneError(f"profiles file exceeds the 256 KiB limit: {str(path)!r}")
+    return raw
+
+
+def exact_fields(value: object, expected: set[str], label: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise CliLaneError(f"{label} must be an object")
+    unexpected = set(value) - expected
+    if unexpected:
+        raise CliLaneError(f"unexpected {label} field: {sorted(unexpected)[0]!r}")
+    missing = expected - set(value)
+    if missing:
+        raise CliLaneError(f"missing {label} field: {sorted(missing)[0]!r}")
+    return value
+
+
+def validated_argv(value: object, label: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value:
+        raise CliLaneError(f"{label} must be a non-empty array of strings")
+    command: list[str] = []
+    for part in value:
+        if not isinstance(part, str) or not part or "\x00" in part:
+            raise CliLaneError(f"{label} entries must be non-empty strings without NUL")
+        command.append(part)
+    return tuple(command)
+
+
+def validated_environment_name(value: object, label: str) -> str:
+    if not isinstance(value, str) or not ENV_PATTERN.fullmatch(value):
+        raise CliLaneError(f"{label} is not a valid environment name")
+    return value
+
+
+def profile_owned_environment(name: str) -> bool:
+    return name in PROFILE_OWNED_EXACT_ENV or name.startswith(
+        PROFILE_OWNED_ENV_PREFIXES
+    )
+
+
+def validate_profile_environment_name(name: str, label: str) -> None:
+    if profile_owned_environment(name):
+        raise CliLaneError(f"{label} is reserved by CLI Lane: {name}")
+
+
+def parse_profile(name_value: object, value: object) -> Profile:
+    name = fleet_name(name_value, "profile name")
+    entry = exact_fields(
+        value, {"provider", "command", "cwd", "env"}, f"profile {name!r}"
+    )
+    provider = fleet_name(entry["provider"], f"profile {name!r} provider")
+    command = validated_argv(entry["command"], f"profile {name!r} command")
+
+    cwd_value = entry["cwd"]
+    if not isinstance(cwd_value, dict):
+        raise CliLaneError(f"profile {name!r} cwd must be an object")
+    mode = cwd_value.get("mode")
+    if mode == "explicit":
+        exact_fields(cwd_value, {"mode"}, f"profile {name!r} cwd")
+        cwd_path = None
+    elif mode == "fixed":
+        exact_fields(cwd_value, {"mode", "path"}, f"profile {name!r} cwd")
+        path_value = cwd_value["path"]
+        if (
+            not isinstance(path_value, str)
+            or not path_value
+            or "\x00" in path_value
+            or not Path(path_value).is_absolute()
+        ):
+            raise CliLaneError(f"profile {name!r} fixed cwd path must be absolute")
+        cwd_path = path_value
+    else:
+        raise CliLaneError(f"profile {name!r} cwd mode must be 'explicit' or 'fixed'")
+
+    env = exact_fields(entry["env"], {"inherit", "set"}, f"profile {name!r} env")
+    inherit_value = env["inherit"]
+    if not isinstance(inherit_value, list):
+        raise CliLaneError(f"profile {name!r} env.inherit must be an array")
+    inherit: list[str] = []
+    seen_inherit: set[str] = set()
+    for item in inherit_value:
+        inherited = validated_environment_name(item, f"profile {name!r} env.inherit entry")
+        validate_profile_environment_name(inherited, f"profile {name!r} env.inherit")
+        if inherited in seen_inherit:
+            raise CliLaneError(f"profile {name!r} env.inherit contains duplicate {inherited!r}")
+        seen_inherit.add(inherited)
+        inherit.append(inherited)
+
+    set_value = env["set"]
+    if not isinstance(set_value, dict):
+        raise CliLaneError(f"profile {name!r} env.set must be an object")
+    assignments: list[tuple[str, str]] = []
+    for key, item in set_value.items():
+        assigned = validated_environment_name(key, f"profile {name!r} env.set key")
+        validate_profile_environment_name(assigned, f"profile {name!r} env.set")
+        if assigned.upper().endswith(PROFILE_SECRET_SUFFIXES):
+            raise CliLaneError(
+                f"profile {name!r} env.set secret-looking key must use env.inherit: {assigned}"
+            )
+        if not isinstance(item, str) or "\x00" in item:
+            raise CliLaneError(f"profile {name!r} env.set values must be strings without NUL")
+        assignments.append((assigned, item))
+
+    return Profile(
+        name=name,
+        provider=provider,
+        command=command,
+        cwd_mode=mode,
+        cwd_path=cwd_path,
+        inherit=tuple(inherit),
+        env_set=tuple(assignments),
+    )
+
+
+def load_profiles(path: Path | None = None) -> dict[str, Profile]:
+    selected_path = profiles_config_path() if path is None else path
+    decoded = strict_json(secure_profile_bytes(selected_path), selected_path, "profiles file")
+    root = exact_fields(decoded, {"schema_version", "profiles"}, "profiles file")
+    schema_version = root["schema_version"]
+    if type(schema_version) is not int or schema_version != PROFILE_CONFIG_SCHEMA_VERSION:
+        raise CliLaneError(f"unsupported profiles schema_version: {schema_version!r}")
+    entries = root["profiles"]
+    if not isinstance(entries, dict):
+        raise CliLaneError("profiles must be an object")
+    profiles: dict[str, Profile] = {}
+    for name, value in entries.items():
+        profile = parse_profile(name, value)
+        profiles[profile.name] = profile
+    return profiles
 
 
 def load_fleet_hosts(configured: str | None) -> list[FleetHost]:
@@ -519,8 +828,12 @@ def control_root() -> Path:
     return root
 
 
+def socket_identity() -> str:
+    return SOCKET
+
+
 def socket_digest() -> str:
-    return hashlib.sha256(SOCKET.encode()).hexdigest()[:16]
+    return hashlib.sha256(socket_identity().encode()).hexdigest()[:16]
 
 
 def registry_root() -> Path:
@@ -556,7 +869,7 @@ def write_record(
 ) -> None:
     payload = {
         "schema_version": RECORD_SCHEMA_VERSION,
-        "socket": SOCKET,
+        "socket": socket_identity(),
         "session": session,
         "id": task_id,
         "name": name,
@@ -644,7 +957,7 @@ def read_records() -> tuple[list[TaskRecord], list[Path]]:
         except CliLaneError:
             damaged.append(path)
             continue
-        if record.socket == SOCKET:
+        if record.socket == socket_identity():
             records.append(record)
     return records, damaged
 
@@ -759,6 +1072,7 @@ def encode_launcher(
     name: str,
     task_id: str,
     log_path: str,
+    environment_keys: Sequence[str],
 ) -> str:
     return encode_meta(
         {
@@ -767,6 +1081,7 @@ def encode_launcher(
             "name": name,
             "id": task_id,
             "log": log_path,
+            "environment_keys": list(environment_keys),
         }
     )
 
@@ -784,6 +1099,15 @@ def decode_launcher(value: str) -> dict[str, object]:
     for key in ("name", "id", "log"):
         if not isinstance(decoded.get(key), str):
             raise CliLaneError("corrupt launcher metadata")
+    environment_keys = decoded.get("environment_keys")
+    if (
+        not isinstance(environment_keys, list)
+        or not all(isinstance(key, str) for key in environment_keys)
+        or environment_keys != sorted(set(environment_keys))
+    ):
+        raise CliLaneError("corrupt launcher environment")
+    for key in environment_keys:
+        validated_environment_name(key, "launcher environment key")
     return decoded
 
 
@@ -984,9 +1308,66 @@ def terminate_incomplete_session(
         terminate_pane_process(target, grace, leader_started)
 
 
+def parse_tmux_environment_script(value: str) -> dict[str, str]:
+    lexer = shlex.shlex(value, posix=True, punctuation_chars=";")
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        tokens = list(lexer)
+    except ValueError as error:
+        raise CliLaneError("could not decode managed tmux environment") from error
+    environment: dict[str, str] = {}
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "unset":
+            if index + 2 >= len(tokens) or tokens[index + 2] != ";":
+                raise CliLaneError("could not decode managed tmux environment")
+            validated_environment_name(tokens[index + 1], "managed tmux environment key")
+            index += 3
+            continue
+        if "=" not in token or index + 4 >= len(tokens):
+            raise CliLaneError("could not decode managed tmux environment")
+        key, item = token.split("=", 1)
+        validated_environment_name(key, "managed tmux environment key")
+        if (
+            tokens[index + 1] != ";"
+            or tokens[index + 2] != "export"
+            or tokens[index + 3] != key
+            or tokens[index + 4] != ";"
+            or "\x00" in item
+        ):
+            raise CliLaneError("could not decode managed tmux environment")
+        environment[key] = item
+        index += 5
+    return environment
+
+
+def managed_child_environment(expected_keys: Sequence[str]) -> dict[str, str]:
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        raise CliLaneError("managed supervisor has no tmux pane")
+    shown = tmux(["show-environment", "-s", "-t", pane]).stdout.decode(
+        "utf-8", errors="surrogateescape"
+    )
+    session_environment = parse_tmux_environment_script(shown)
+    environment: dict[str, str] = {}
+    for key in expected_keys:
+        if key not in session_environment:
+            raise CliLaneError(f"managed tmux environment is missing: {key}")
+        environment[key] = session_environment[key]
+    for key in ("TERM", "TMUX", "TMUX_PANE"):
+        value = os.environ.get(key)
+        if value is not None:
+            environment[key] = value
+    return environment
+
+
 def supervise(encoded_command: str) -> int:
     launcher = decode_launcher(encoded_command)
     command = launcher["command"]
+    environment_keys = launcher["environment_keys"]
+    child_environment = managed_child_environment(environment_keys)
     pending: list[signal.Signals] = []
 
     def remember(signum: int, _frame: object) -> None:
@@ -1000,7 +1381,7 @@ def supervise(encoded_command: str) -> int:
         for sent_signal in forwarded:
             signal.signal(sent_signal, signal.SIG_DFL)
         try:
-            os.execvpe(command[0], command, os.environ)
+            os.execvpe(command[0], command, child_environment)
         except OSError as error:
             print(f"{PROGRAM}: {error}", file=sys.stderr)
             os._exit(127)
@@ -1031,7 +1412,13 @@ def supervise(encoded_command: str) -> int:
     terminate_session_descendants(os.getpid(), 0.2)
     try:
         if shutdown_deadline is None:
-            run_exit_hook(launcher, exit_code, signal_name, pending)
+            run_exit_hook(
+                launcher,
+                exit_code,
+                signal_name,
+                pending,
+                child_environment,
+            )
     finally:
         terminate_session_descendants(os.getpid(), 0.2)
     return exit_code
@@ -1059,11 +1446,12 @@ def run_exit_hook(
     exit_code: int,
     signal_name: str,
     pending: list[signal.Signals],
+    child_environment: Mapping[str, str],
 ) -> None:
     on_exit = launcher.get("on_exit")
     if not on_exit:
         return
-    environment = dict(os.environ)
+    environment = dict(child_environment)
     environment.update(
         CLILANE_TASK_NAME=str(launcher["name"]),
         CLILANE_TASK_ID=str(launcher["id"]),
@@ -1711,22 +2099,42 @@ def resolve_task(target: str) -> Task:
     )
 
 
-def set_task_environment(session: str) -> None:
-    current = {
-        key: value
-        for key, value in os.environ.items()
-        if key not in TRANSIENT_ENV and ENV_PATTERN.fullmatch(key) and "\x00" not in value
-    }
-    shown = tmux(["show-environment", "-t", session]).stdout.decode(errors="replace")
-    existing = set()
-    for line in shown.splitlines():
-        key = line.lstrip("-").split("=", 1)[0]
-        if key and key not in {"TMUX", "TMUX_PANE"}:
-            existing.add(key)
+def task_environment_queue(
+    session: str,
+    environment: Mapping[str, str],
+    existing: set[str],
+) -> list[str]:
+    current = dict(environment)
+    queue: list[str] = []
+
+    def append_command(command: list[str]) -> None:
+        if queue:
+            queue.append(";")
+        queue.extend(command)
+
     for key in sorted(existing - current.keys()):
-        tmux(["set-environment", "-t", session, "-r", key])
-    for key, value in current.items():
-        tmux(["set-environment", "-t", session, key, value])
+        append_command(["set-environment", "-t", session, "-r", key])
+    for key in sorted(current):
+        append_command(
+            [
+                "set-environment",
+                "-t",
+                session,
+                key,
+                tmux_command_argument(current[key]),
+            ]
+        )
+    return queue
+
+
+def set_task_environment(
+    session: str,
+    environment: Mapping[str, str],
+    existing: set[str],
+) -> None:
+    queue = task_environment_queue(session, environment, existing)
+    if queue:
+        tmux(queue)
 
 
 def validate_name(name: str) -> None:
@@ -1735,15 +2143,6 @@ def validate_name(name: str) -> None:
             "name must be 1-64 characters, beginning with a letter or number and "
             "using only letters, numbers, dot, dash, or underscore"
         )
-
-
-def command_from_remainder(parts: Sequence[str]) -> list[str]:
-    command = list(parts)
-    if command and command[0] == "--":
-        command = command[1:]
-    if not command:
-        raise CliLaneError("missing command after --")
-    return command
 
 
 def positive_timeout(value: str) -> float:
@@ -1756,55 +2155,457 @@ def positive_timeout(value: str) -> float:
     return parsed
 
 
-def run_spec(
-    default_cwd: str, default_on_exit: str | None, parts: Sequence[str]
-) -> RunSpec:
-    cwd = default_cwd
+def parse_run_request(parts: Sequence[str]) -> RunRequest:
+    tokens = list(parts)
+    sentinel = tokens.index("--") if "--" in tokens else None
+    prefix = tokens if sentinel is None else tokens[:sentinel]
+    raw_command = None if sentinel is None else tokens[sentinel + 1 :]
+
+    name: str | None = None
+    cwd: str | None = None
+    cwd_explicit = False
     wait = False
     timeout: float | None = None
-    on_exit = default_on_exit
-    remaining = list(parts)
-    while remaining and remaining[0] != "--":
-        if remaining[0] in {"-C", "--cwd"}:
-            if len(remaining) < 2:
-                raise CliLaneError(f"{remaining[0]} requires a directory")
-            cwd = remaining[1]
-            remaining = remaining[2:]
+    on_exit: str | None = None
+    profile: str | None = None
+    seen: set[str] = set()
+    index = 0
+    while index < len(prefix):
+        token = prefix[index]
+        if token in {"-C", "--cwd"}:
+            if "cwd" in seen:
+                raise CliLaneError("-C/--cwd may be supplied only once")
+            if index + 1 >= len(prefix):
+                raise CliLaneError(f"{token} requires a directory")
+            seen.add("cwd")
+            cwd = prefix[index + 1]
+            cwd_explicit = True
+            index += 2
             continue
-        if remaining[0].startswith("--cwd="):
-            cwd = remaining[0].split("=", 1)[1]
-            remaining = remaining[1:]
+        if token.startswith("--cwd="):
+            if "cwd" in seen:
+                raise CliLaneError("-C/--cwd may be supplied only once")
+            seen.add("cwd")
+            cwd = token.split("=", 1)[1]
+            cwd_explicit = True
+            index += 1
             continue
-        if remaining[0] == "--wait":
+        if token == "--wait":
+            if "wait" in seen:
+                raise CliLaneError("--wait may be supplied only once")
+            seen.add("wait")
             wait = True
-            remaining = remaining[1:]
+            index += 1
             continue
-        if remaining[0] == "--timeout":
-            if len(remaining) < 2:
+        if token == "--timeout":
+            if "timeout" in seen:
+                raise CliLaneError("--timeout may be supplied only once")
+            if index + 1 >= len(prefix):
                 raise CliLaneError("--timeout requires a number")
-            timeout = positive_timeout(remaining[1])
-            remaining = remaining[2:]
+            seen.add("timeout")
+            timeout = positive_timeout(prefix[index + 1])
+            index += 2
             continue
-        if remaining[0].startswith("--timeout="):
-            timeout = positive_timeout(remaining[0].split("=", 1)[1])
-            remaining = remaining[1:]
+        if token.startswith("--timeout="):
+            if "timeout" in seen:
+                raise CliLaneError("--timeout may be supplied only once")
+            seen.add("timeout")
+            timeout = positive_timeout(token.split("=", 1)[1])
+            index += 1
             continue
-        if remaining[0] == "--on-exit":
-            if len(remaining) < 2:
+        if token == "--on-exit":
+            if "on_exit" in seen:
+                raise CliLaneError("--on-exit may be supplied only once")
+            if index + 1 >= len(prefix):
                 raise CliLaneError("--on-exit requires a command")
-            on_exit = remaining[1]
-            remaining = remaining[2:]
+            seen.add("on_exit")
+            on_exit = prefix[index + 1]
+            index += 2
             continue
-        if remaining[0].startswith("--on-exit="):
-            on_exit = remaining[0].split("=", 1)[1]
-            remaining = remaining[1:]
+        if token.startswith("--on-exit="):
+            if "on_exit" in seen:
+                raise CliLaneError("--on-exit may be supplied only once")
+            seen.add("on_exit")
+            on_exit = token.split("=", 1)[1]
+            index += 1
             continue
-        break
+        if token == "--profile":
+            if "profile" in seen:
+                raise CliLaneError("--profile may be supplied only once")
+            if index + 1 >= len(prefix):
+                raise CliLaneError("--profile requires a profile name")
+            seen.add("profile")
+            profile = prefix[index + 1]
+            index += 2
+            continue
+        if token.startswith("--profile="):
+            if "profile" in seen:
+                raise CliLaneError("--profile may be supplied only once")
+            seen.add("profile")
+            profile = token.split("=", 1)[1]
+            index += 1
+            continue
+        if token.startswith("-"):
+            raise CliLaneError(f"unknown run option: {token}")
+        if name is not None:
+            raise CliLaneError(f"unexpected run argument: {token}")
+        name = token
+        index += 1
+
+    if name is None:
+        raise CliLaneError("missing task name")
+    validate_name(name)
+    if cwd is not None and (not cwd or "\x00" in cwd):
+        raise CliLaneError("-C/--cwd requires a directory without NUL")
+    if profile is not None:
+        fleet_name(profile, "profile name")
+        if raw_command is not None:
+            raise CliLaneError("--profile and a raw -- COMMAND are mutually exclusive")
+        command = None
+    else:
+        if raw_command is None:
+            raise CliLaneError("missing command after -- or --profile")
+        command = validated_argv(raw_command, "raw command")
     if timeout is not None and not wait:
         raise CliLaneError("--timeout requires --wait")
-    if on_exit is not None and not on_exit.strip():
+    if on_exit is not None and (not on_exit.strip() or "\x00" in on_exit):
         raise CliLaneError("--on-exit requires a command")
-    return RunSpec(cwd, wait, timeout, on_exit, command_from_remainder(remaining))
+    return RunRequest(
+        name=name,
+        cwd=cwd,
+        cwd_explicit=cwd_explicit,
+        wait=wait,
+        timeout=timeout,
+        on_exit=on_exit,
+        profile=profile,
+        command=command,
+    )
+
+
+def legacy_launch_environment(source: Mapping[str, str]) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in source.items()
+        if key not in TRANSIENT_ENV
+        and ENV_PATTERN.fullmatch(key)
+        and "\x00" not in value
+    }
+
+
+def profile_launch_environment(
+    profile: Profile, source: Mapping[str, str]
+) -> dict[str, str]:
+    environment: dict[str, str] = {}
+    for key in PROFILE_BASELINE_ENV:
+        value = source.get(key)
+        if value is None:
+            continue
+        if "\x00" in value:
+            raise CliLaneError(f"profile baseline environment contains NUL: {key}")
+        environment[key] = value
+    inherited: dict[str, str] = {}
+    for key in profile.inherit:
+        if key not in source:
+            raise CliLaneError(f"profile {profile.name!r} requires missing environment key: {key}")
+        value = source[key]
+        if "\x00" in value:
+            raise CliLaneError(f"profile {profile.name!r} inherited value contains NUL: {key}")
+        inherited[key] = value
+    environment.update(inherited)
+    environment.update(dict(profile.env_set))
+    return environment
+
+
+def complete_launch_spec(
+    *,
+    name: str,
+    cwd_value: str,
+    command: Sequence[str],
+    wait: bool,
+    timeout: float | None,
+    on_exit: str | None,
+    environment: Mapping[str, str],
+    profile: str | None,
+    provider: str | None,
+) -> LaunchSpec:
+    validate_name(name)
+    if type(wait) is not bool:
+        raise CliLaneError("launch wait must be a boolean")
+    validated_command = validated_argv(list(command), "launch command")
+    if not isinstance(cwd_value, str) or not cwd_value or "\x00" in cwd_value:
+        raise CliLaneError("launch cwd must be a non-empty path without NUL")
+    cwd = Path(cwd_value).expanduser().resolve()
+    if not cwd.is_dir():
+        raise CliLaneError(f"not a directory: {cwd}")
+    if timeout is not None:
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(float(timeout))
+            or timeout <= 0
+        ):
+            raise CliLaneError("--timeout must be a finite number greater than 0")
+        if not wait:
+            raise CliLaneError("--timeout requires --wait")
+    if on_exit is not None and (
+        not isinstance(on_exit, str) or not on_exit.strip() or "\x00" in on_exit
+    ):
+        raise CliLaneError("--on-exit requires a command")
+    if (profile is None) != (provider is None):
+        raise CliLaneError("launch profile and provider must be set together")
+    validated_profile = None if profile is None else fleet_name(profile, "profile name")
+    validated_provider = None if provider is None else fleet_name(provider, "provider name")
+    validated_environment: dict[str, str] = {}
+    for key, value in environment.items():
+        validated_key = validated_environment_name(key, "launch environment key")
+        if validated_profile is not None and profile_owned_environment(validated_key):
+            raise CliLaneError(f"launch environment key is reserved: {validated_key}")
+        if not isinstance(value, str) or "\x00" in value:
+            raise CliLaneError(f"launch environment value contains NUL: {validated_key}")
+        validated_environment[validated_key] = value
+    return LaunchSpec(
+        name=name,
+        cwd=str(cwd),
+        command=validated_command,
+        wait=wait,
+        timeout=None if timeout is None else float(timeout),
+        on_exit=on_exit,
+        environment=validated_environment,
+        profile=validated_profile,
+        provider=validated_provider,
+    )
+
+
+def resolve_run_request(
+    request: RunRequest,
+    source_environment: Mapping[str, str],
+    default_cwd: str,
+) -> LaunchSpec:
+    if request.profile is None:
+        if request.command is None:
+            raise CliLaneError("raw launch is missing a command")
+        return complete_launch_spec(
+            name=request.name,
+            cwd_value=request.cwd if request.cwd_explicit else default_cwd,
+            command=request.command,
+            wait=request.wait,
+            timeout=request.timeout,
+            on_exit=request.on_exit,
+            environment=legacy_launch_environment(source_environment),
+            profile=None,
+            provider=None,
+        )
+
+    profiles = load_profiles(profiles_config_path(source_environment))
+    profile = profiles.get(request.profile)
+    if profile is None:
+        raise CliLaneError(f"profile not found: {request.profile}")
+    if profile.cwd_mode == "explicit":
+        if not request.cwd_explicit or request.cwd is None:
+            raise CliLaneError(f"profile {profile.name!r} requires -C/--cwd")
+        cwd_value = request.cwd
+    else:
+        if request.cwd_explicit:
+            raise CliLaneError(f"profile {profile.name!r} has fixed cwd and forbids -C/--cwd")
+        if profile.cwd_path is None:
+            raise CliLaneError(f"profile {profile.name!r} has no fixed cwd path")
+        cwd_value = profile.cwd_path
+    return complete_launch_spec(
+        name=request.name,
+        cwd_value=cwd_value,
+        command=profile.command,
+        wait=request.wait,
+        timeout=request.timeout,
+        on_exit=request.on_exit,
+        environment=profile_launch_environment(profile, source_environment),
+        profile=profile.name,
+        provider=profile.provider,
+    )
+
+
+def native_process_bytes(value: str, label: str) -> int:
+    try:
+        return len(os.fsencode(value)) + 1
+    except UnicodeEncodeError as error:
+        raise CliLaneError(f"{label} is not encodable for this platform") from error
+
+
+def process_footprint(
+    arguments: Sequence[str], environment: Mapping[str, str]
+) -> int:
+    strings = sum(
+        native_process_bytes(argument, "process argument") for argument in arguments
+    )
+    strings += sum(
+        native_process_bytes(f"{key}={value}", f"environment entry {key}")
+        for key, value in environment.items()
+    )
+    return strings + (len(arguments) + len(environment) + 2) * 8
+
+
+def require_portable_footprint(
+    label: str,
+    arguments: Sequence[str],
+    environment: Mapping[str, str],
+) -> None:
+    size = process_footprint(arguments, environment)
+    if size > EXEC_FOOTPRINT_MAX_BYTES:
+        raise CliLaneError(
+            f"{label} exceeds the portable {EXEC_FOOTPRINT_MAX_BYTES // 1024} KiB "
+            f"launch budget ({size} bytes)"
+        )
+
+
+def reserved_control_socket() -> str:
+    selected = TMUX_SOCKET_OVERRIDE or SOCKET
+    if Path(selected).is_absolute():
+        return selected
+    return "/" + "s" * (CONTROL_SOCKET_RESERVE_BYTES - 2)
+
+
+def preflight_runtime_environment(spec: LaunchSpec) -> tuple[dict[str, str], str, str]:
+    task_id = "00000000-0000-0000-0000-000000000000"
+    root = state_root_path()
+    log_path = root / "logs" / f"{task_id}.log"
+    environment = dict(spec.environment)
+    environment.update(
+        CLILANE_TMUX_SOCKET=reserved_control_socket(),
+        CLILANE_STATE_HOME=str(root),
+        CLILANE_TASK_NAME=spec.name,
+        CLILANE_TASK_ID=task_id,
+        CLILANE_LOG=str(log_path),
+    )
+    return environment, task_id, str(log_path)
+
+
+def anticipated_tmux_environment() -> dict[str, str]:
+    shown = tmux(["show-environment", "-gs"], check=False)
+    if shown.returncode == 0:
+        decoded = shown.stdout.decode("utf-8", errors="surrogateescape")
+        return parse_tmux_environment_script(decoded)
+    elif tmux_server_absent(shown):
+        return tmux_client_environment()
+    else:
+        detail = shown.stderr.decode(errors="replace").strip()
+        raise CliLaneError(detail or "could not inspect the tmux global environment")
+
+
+def preflight_launch(spec: LaunchSpec, inspect_tmux: bool = True) -> set[str]:
+    environment, task_id, log_path = preflight_runtime_environment(spec)
+    child_environment = dict(environment)
+    child_environment.update(
+        TERM="x" * 64,
+        TMUX="x" * (CONTROL_SOCKET_RESERVE_BYTES + 64),
+        TMUX_PANE="%0000000000",
+    )
+    require_portable_footprint("launch command", spec.command, child_environment)
+    if spec.on_exit is not None:
+        hook_environment = dict(child_environment)
+        hook_environment.update(CLILANE_EXIT_CODE="255", CLILANE_SIGNAL="SIGKILL")
+        require_portable_footprint(
+            "on-exit hook",
+            ["/bin/sh", "-c", spec.on_exit],
+            hook_environment,
+        )
+
+    script = str(Path(__file__).resolve())
+    python_binary = str(Path(sys.executable).resolve())
+    client_binary = tmux_binary()
+    control_binary = str(Path(client_binary).resolve())
+    client_environment = tmux_client_environment()
+    require_portable_footprint(
+        "tmux client environment",
+        [client_binary, "-V"],
+        client_environment,
+    )
+    control_socket = reserved_control_socket()
+    session = f"{SESSION_PREFIX}{'0' * 12}"
+    pane = "%0000000000"
+    launcher = encode_launcher(
+        spec.command,
+        spec.on_exit,
+        spec.name,
+        task_id,
+        log_path,
+        sorted(environment),
+    )
+    supervisor_arguments = [
+        python_binary,
+        script,
+        "__supervise",
+        control_binary,
+        control_socket,
+        launcher,
+    ]
+    supervisor_environment = dict(child_environment)
+    if "PATH" in client_environment:
+        supervisor_environment["PATH"] = client_environment["PATH"]
+    require_portable_footprint(
+        "managed supervisor", supervisor_arguments, supervisor_environment
+    )
+    require_portable_footprint(
+        "tmux replacement placeholder",
+        ["sleep", "2147483647"],
+        supervisor_environment,
+    )
+
+    tmux_prefix = [client_binary, *tmux_socket_arguments(), "-f", "/dev/null"]
+    if inspect_tmux:
+        ensure_server_available()
+        global_environment = anticipated_tmux_environment()
+    else:
+        global_environment = {}
+    existing = set(global_environment)
+    environment_queue = task_environment_queue(session, environment, existing)
+    require_portable_footprint(
+        "tmux environment update",
+        [*tmux_prefix, *environment_queue],
+        client_environment,
+    )
+    placeholder_environment = dict(global_environment)
+    placeholder_environment.update(
+        TERM="x" * 64,
+        TMUX="x" * (CONTROL_SOCKET_RESERVE_BYTES + 64),
+        TMUX_PANE="%0000000000",
+    )
+    if "PATH" in client_environment:
+        placeholder_environment["PATH"] = client_environment["PATH"]
+    require_portable_footprint(
+        "tmux placeholder",
+        ["sleep", "2147483647"],
+        placeholder_environment,
+    )
+    meta: dict[str, object] = {
+        "id": task_id,
+        "name": spec.name,
+        "command": list(spec.command),
+        "cwd": spec.cwd,
+        "created": "2000-01-01T00:00:00.000000+00:00",
+        "log": log_path,
+        "on_exit": spec.on_exit,
+    }
+    require_portable_footprint(
+        "tmux task creation",
+        [*tmux_prefix, *initial_task_queue(session, spec.cwd, meta)],
+        client_environment,
+    )
+    require_portable_footprint(
+        "tmux supervisor launch",
+        [
+            *tmux_prefix,
+            *respawn_task_arguments(
+                pane,
+                spec.cwd,
+                python_binary,
+                script,
+                control_binary,
+                control_socket,
+                launcher,
+            ),
+        ],
+        client_environment,
+    )
+    return existing
 
 
 def ensure_server_available() -> None:
@@ -1864,29 +2665,132 @@ def kill_managed_session(session: str) -> None:
     raise CliLaneError(detail or f"could not remove tmux session: {session}")
 
 
-def run_task(
-    name: str, cwd_value: str, command: list[str], on_exit: str | None = None
-) -> Task:
+def initial_task_queue(session: str, cwd: str, meta: Mapping[str, object]) -> list[str]:
+    return [
+        "start-server",
+        ";",
+        "set-option",
+        "-g",
+        "history-limit",
+        "50000",
+        ";",
+        "set-option",
+        "-g",
+        "@agt_server",
+        SERVER_TAG,
+        ";",
+        "new-session",
+        "-d",
+        "-E",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "-s",
+        session,
+        "-c",
+        tmux_command_argument(cwd),
+        "sleep",
+        "2147483647",
+        ";",
+        "set-option",
+        "-w",
+        "-t",
+        session,
+        "remain-on-exit",
+        "on",
+        ";",
+        "set-option",
+        "-t",
+        session,
+        "@agt_meta",
+        encode_meta(dict(meta)),
+        ";",
+        "set-option",
+        "-t",
+        session,
+        "@agt_committed",
+        "0",
+        ";",
+        "set-option",
+        "-t",
+        session,
+        "@agt_process_started",
+        "",
+        ";",
+        "set-option",
+        "-t",
+        session,
+        "@agt_stop_requested",
+        "0",
+    ]
+
+
+def respawn_task_arguments(
+    pane: str,
+    cwd: str,
+    python_binary: str,
+    script: str,
+    control_binary: str,
+    control_socket: str,
+    launcher: str,
+) -> list[str]:
+    return [
+        "respawn-pane",
+        "-k",
+        "-c",
+        tmux_command_argument(cwd),
+        "-t",
+        pane,
+        "--",
+        python_binary,
+        script,
+        "__supervise",
+        control_binary,
+        control_socket,
+        launcher,
+    ]
+
+
+def run_task(spec: LaunchSpec) -> Task:
+    spec = complete_launch_spec(
+        name=spec.name,
+        cwd_value=spec.cwd,
+        command=spec.command,
+        wait=spec.wait,
+        timeout=spec.timeout,
+        on_exit=spec.on_exit,
+        environment=spec.environment,
+        profile=spec.profile,
+        provider=spec.provider,
+    )
+    preflight_launch(spec, inspect_tmux=False)
     with registry_lock():
-        ensure_server_available()
-        validate_name(name)
+        existing_environment = preflight_launch(spec)
         existing = list_tasks()
         backfill_records(existing)
-        if any(task.name == name for task in existing):
-            raise CliLaneError(f"task already exists: {name}")
-        cwd = Path(cwd_value).expanduser().resolve()
-        if not cwd.is_dir():
-            raise CliLaneError(f"not a directory: {cwd}")
+        if any(task.name == spec.name for task in existing):
+            raise CliLaneError(f"task already exists: {spec.name}")
+        cwd = Path(spec.cwd)
+        command = list(spec.command)
         task_id = str(uuid.uuid4())
         session = f"{SESSION_PREFIX}{task_id.replace('-', '')[:12]}"
-        log_dir = state_root() / "logs"
+        runtime_state_root = state_root()
+        log_dir = runtime_state_root / "logs"
         log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(log_dir, 0o700)
         log_path = log_dir / f"{task_id}.log"
+        environment = dict(spec.environment)
+        environment.update(
+            CLILANE_TMUX_SOCKET=SOCKET,
+            CLILANE_STATE_HOME=str(runtime_state_root),
+            CLILANE_TASK_NAME=spec.name,
+            CLILANE_TASK_ID=task_id,
+            CLILANE_LOG=str(log_path),
+        )
         created_stamp = datetime.now(timezone.utc).isoformat()
         write_record(
             task_id,
-            name,
+            spec.name,
             command,
             str(cwd),
             created_stamp,
@@ -1903,102 +2807,78 @@ def run_task(
             raise
         meta: dict[str, object] = {
             "id": task_id,
-            "name": name,
+            "name": spec.name,
             "command": command,
             "cwd": str(cwd),
             "created": created_stamp,
             "log": str(log_path),
-            "on_exit": on_exit,
+            "on_exit": spec.on_exit,
         }
         script = Path(__file__).resolve()
+        python_binary = str(Path(sys.executable).resolve())
+        control_binary = str(Path(tmux_binary()).resolve())
         committed = False
         pane = ""
         started: str | None = None
         try:
-            created = tmux(
+            created = tmux(initial_task_queue(session, str(cwd), meta))
+            pane = created.stdout.decode().strip()
+            control_socket = tmux(
+                ["display-message", "-p", "-t", session, "#{socket_path}"]
+            ).stdout.decode().strip()
+            if not Path(control_socket).is_absolute():
+                raise CliLaneError("could not resolve the managed tmux socket")
+            environment["CLILANE_TMUX_SOCKET"] = control_socket
+            placeholder_pane = pane
+            set_task_environment(session, environment, existing_environment)
+            replacement = tmux(
                 [
-                    "start-server",
-                    ";",
-                    "set-option",
-                    "-g",
-                    "history-limit",
-                    "50000",
-                    ";",
-                    "set-option",
-                    "-g",
-                    "@agt_server",
-                    SERVER_TAG,
-                    ";",
-                    "new-session",
+                    "new-window",
                     "-d",
                     "-P",
                     "-F",
                     "#{pane_id}",
-                    "-s",
-                    session,
+                    "-t",
+                    f"{session}:",
                     "-c",
-                    str(cwd),
+                    tmux_command_argument(str(cwd)),
                     "sleep",
                     "2147483647",
-                    ";",
-                    "set-option",
-                    "-w",
-                    "-t",
-                    session,
-                    "remain-on-exit",
-                    "on",
-                    ";",
-                    "set-option",
-                    "-t",
-                    session,
-                    "@agt_meta",
-                    encode_meta(meta),
-                    ";",
-                    "set-option",
-                    "-t",
-                    session,
-                    "@agt_committed",
-                    "0",
-                    ";",
-                    "set-option",
-                    "-t",
-                    session,
-                    "@agt_process_started",
-                    "",
-                    ";",
-                    "set-option",
-                    "-t",
-                    session,
-                    "@agt_stop_requested",
-                    "0",
                 ]
             )
-            pane = created.stdout.decode().strip()
+            pane = replacement.stdout.decode().strip()
+            tmux(["set-option", "-w", "-t", pane, "remain-on-exit", "on"])
+            tmux(["kill-window", "-t", placeholder_pane])
             tmux(
-                ["set-window-option", "-t", session, "automatic-rename", "off"],
+                ["set-window-option", "-t", pane, "automatic-rename", "off"],
                 check=False,
             )
-            tmux(["rename-window", "-t", session, name], check=False)
+            tmux(["rename-window", "-t", pane, spec.name], check=False)
             configure_task_status(session)
-            set_task_environment(session)
             sink = (
-                f"exec {shlex.quote(str(script))} __log "
+                f"exec {shlex.quote(python_binary)} {shlex.quote(str(script))} __log "
+                f"{shlex.quote(control_binary)} {shlex.quote(control_socket)} "
                 f"{shlex.quote(str(log_path))} {LOG_MAX_BYTES} {shlex.quote(session)}"
             )
             tmux(["pipe-pane", "-t", pane, sink])
+            launcher = encode_launcher(
+                command,
+                spec.on_exit,
+                spec.name,
+                task_id,
+                str(log_path),
+                sorted(environment),
+            )
             tmux(
-                [
-                    "respawn-pane",
-                    "-k",
-                    "-c",
-                    str(cwd),
-                    "-t",
+                respawn_task_arguments(
                     pane,
-                    "--",
+                    str(cwd),
+                    python_binary,
                     str(script),
-                    "__supervise",
-                    encode_launcher(command, on_exit, name, task_id, str(log_path)),
-                ]
+                    control_binary,
+                    control_socket,
+                    launcher,
+                )
             )
             deadline = time.monotonic() + 0.5
             started = None
@@ -2024,7 +2904,7 @@ def run_task(
             tmux(["set-option", "-t", session, "@agt_committed", "1"])
             write_record(
                 task_id,
-                name,
+                spec.name,
                 command,
                 str(cwd),
                 created_stamp,
@@ -2279,11 +3159,11 @@ def attach_task(task: Task) -> int:
         binary,
         [
             binary,
-            "-L",
-            SOCKET,
+            *tmux_socket_arguments(),
             "-f",
             "/dev/null",
             "attach-session",
+            "-E",
             "-t",
             task.session,
             ";",
@@ -2330,17 +3210,61 @@ def discover_hub_presets(
     return presets
 
 
+def expanded_hub_directory(value: object, name: str, environment: Mapping[str, str]) -> str:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise CliLaneError(f"hub preset dir must be a non-empty string: {name}")
+    if value == "~" or value.startswith("~/"):
+        home = environment.get("HOME")
+        if not home:
+            raise CliLaneError(f"hub preset dir needs HOME to expand '~': {name}")
+        value = home + value[1:]
+    expanded = Path(value)
+    if not expanded.is_absolute():
+        raise CliLaneError(f"hub preset dir must be absolute: {name}")
+    return str(expanded)
+
+
+def legacy_hub_directory(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise CliLaneError(f"hub preset dir must be a string: {name}")
+    expanded = Path(value).expanduser()
+    if not expanded.is_absolute():
+        raise CliLaneError(f"hub preset dir must be absolute: {name}")
+    return str(expanded)
+
+
+def resolved_hub_directory(value: object, name: str, environment: Mapping[str, str]) -> str:
+    expanded = expanded_hub_directory(value, name, environment)
+    resolved = Path(expanded).resolve()
+    if not resolved.is_dir():
+        raise CliLaneError(f"hub preset dir is not a directory: {name}: {resolved}")
+    return str(resolved)
+
+
+def selection_digest(value: object) -> str:
+    canonical = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def load_hub_presets(
     configured: str | None,
     *,
     allow_missing: bool | None = None,
     discovery_environment: dict[str, str] | None = None,
     discovery_directory: str | None = None,
+    launch_environment: Mapping[str, str] | None = None,
+    profiles_file: str | None = None,
 ) -> list[dict[str, object]]:
     path = hub_config_path(configured)
     missing_ok = not configured if allow_missing is None else allow_missing
     try:
-        raw = path.read_text(encoding="utf-8")
+        with path.open("rb") as handle:
+            raw = handle.read(CONFIG_MAX_BYTES + 1)
     except FileNotFoundError:
         if not missing_ok:
             raise CliLaneError(
@@ -2349,62 +3273,142 @@ def load_hub_presets(
         if discovery_environment is not None and discovery_directory is not None:
             return discover_hub_presets(discovery_environment, discovery_directory)
         return []
-    except UnicodeDecodeError as error:
-        raise CliLaneError(f"hub config is not UTF-8: {str(path)!r}") from error
     except OSError as error:
         raise CliLaneError(f"could not read hub config: {error}") from error
-    try:
-        decoded = json.loads(
-            raw,
-            parse_constant=reject_json_constant,
-            parse_float=finite_json_float,
-            parse_int=bounded_json_int,
-        )
-    except (json.JSONDecodeError, RecursionError, ValueError) as error:
-        raise CliLaneError(f"invalid hub config JSON: {str(path)!r}: {error}") from error
-    if (
-        not isinstance(decoded, dict)
-        or decoded.get("schema_version") != HUB_CONFIG_SCHEMA_VERSION
-    ):
-        raise CliLaneError(
-            f'hub config must be an object with "schema_version": '
-            f"{HUB_CONFIG_SCHEMA_VERSION}"
-        )
-    unexpected_root = set(decoded) - {"schema_version", "agents"}
-    if unexpected_root:
-        raise CliLaneError(f"unexpected hub config field: {sorted(unexpected_root)[0]!r}")
-    agents = decoded.get("agents")
+    if len(raw) > CONFIG_MAX_BYTES:
+        raise CliLaneError(f"hub config exceeds the 256 KiB limit: {str(path)!r}")
+    decoded = strict_json(raw, path, "hub config")
+    root = exact_fields(decoded, {"schema_version", "agents"}, "hub config")
+    schema_version = root["schema_version"]
+    if type(schema_version) is not int or schema_version not in HUB_CONFIG_SCHEMA_VERSIONS:
+        raise CliLaneError(f"unsupported hub config schema_version: {schema_version!r}")
+    agents = root["agents"]
     if not isinstance(agents, list) or len(agents) > HUB_MAX_PRESETS:
         raise CliLaneError(
             f"hub config needs an agents list with at most {HUB_MAX_PRESETS} entries"
         )
+    source_environment = os.environ if launch_environment is None else launch_environment
+    profile_path = (
+        Path(profiles_file)
+        if profiles_file is not None
+        else profiles_config_path(source_environment)
+    )
+    profiles: dict[str, Profile] | None = None
     presets: list[dict[str, object]] = []
     seen: set[str] = set()
     for entry in agents:
         if not isinstance(entry, dict):
             raise CliLaneError("each hub preset must be an object")
-        unexpected = set(entry) - {"name", "command", "dir"}
-        if unexpected:
-            raise CliLaneError(f"unexpected hub preset field: {sorted(unexpected)[0]!r}")
         name = fleet_name(entry.get("name"), "hub preset name")
         if name in seen:
             raise CliLaneError(f"duplicate hub preset: {name}")
         seen.add(name)
-        command = entry.get("command")
-        if (
-            not isinstance(command, list)
-            or not command
-            or not all(isinstance(part, str) and part for part in command)
-        ):
-            raise CliLaneError(f"hub preset command must be a list of strings: {name}")
-        directory = entry.get("dir", "~")
-        if not isinstance(directory, str) or not directory:
-            raise CliLaneError(f"hub preset dir must be a string: {name}")
-        expanded = Path(directory).expanduser()
-        if not expanded.is_absolute():
-            raise CliLaneError(f"hub preset dir must be absolute: {name}")
-        presets.append({"name": name, "command": command, "dir": str(expanded)})
+        if schema_version == 1:
+            unexpected = set(entry) - {"name", "command", "dir"}
+            if unexpected:
+                raise CliLaneError(
+                    f"unexpected hub preset field: {sorted(unexpected)[0]!r}"
+                )
+            if "command" not in entry:
+                raise CliLaneError(f"missing hub preset field: command ({name})")
+            command = validated_argv(entry["command"], f"hub preset command ({name})")
+            directory = legacy_hub_directory(entry.get("dir", "~"), name)
+            presets.append(
+                {
+                    "name": name,
+                    "command": list(command),
+                    "dir": directory,
+                }
+            )
+            continue
+
+        has_command = "command" in entry
+        has_profile = "profile" in entry
+        if has_command == has_profile:
+            raise CliLaneError(
+                f"hub v2 preset must contain exactly one of command or profile: {name}"
+            )
+        if has_command:
+            unexpected = set(entry) - {"name", "command", "dir"}
+            if unexpected:
+                raise CliLaneError(
+                    f"unexpected hub preset field: {sorted(unexpected)[0]!r}"
+                )
+            command = validated_argv(entry["command"], f"hub preset command ({name})")
+            directory = resolved_hub_directory(
+                entry.get("dir", "~"), name, source_environment
+            )
+            canonical = {
+                "preset": {
+                    "name": name,
+                    "command": list(command),
+                    "dir": directory,
+                }
+            }
+            presets.append(
+                {
+                    "name": name,
+                    "command": list(command),
+                    "dir": directory,
+                    "launch_mode": "raw",
+                    "hub_schema_version": 2,
+                    "selection_digest": selection_digest(canonical),
+                    "provider": None,
+                    "profile": None,
+                }
+            )
+            continue
+
+        profile_name = fleet_name(entry["profile"], f"hub preset profile ({name})")
+        if profiles is None:
+            profiles = load_profiles(profile_path)
+        profile = profiles.get(profile_name)
+        if profile is None:
+            raise CliLaneError(f"hub preset profile not found: {profile_name}")
+        profile_launch_environment(profile, source_environment)
+        if profile.cwd_mode == "explicit":
+            exact_fields(entry, {"name", "profile", "dir"}, f"hub preset {name!r}")
+            directory = resolved_hub_directory(entry["dir"], name, source_environment)
+        else:
+            exact_fields(entry, {"name", "profile"}, f"hub preset {name!r}")
+            if profile.cwd_path is None:
+                raise CliLaneError(f"profile {profile.name!r} has no fixed cwd path")
+            directory = resolved_hub_directory(
+                profile.cwd_path, name, source_environment
+            )
+        canonical = {
+            "preset": {
+                "name": name,
+                "profile": profile_name,
+                **({"dir": directory} if profile.cwd_mode == "explicit" else {}),
+            },
+            "profile": profile.canonical_value(),
+            "resolved_dir": directory,
+        }
+        presets.append(
+            {
+                "name": name,
+                "command": list(profile.command),
+                "dir": directory,
+                "launch_mode": "profile",
+                "hub_schema_version": 2,
+                "selection_digest": selection_digest(canonical),
+                "provider": profile.provider,
+                "profile": profile.name,
+                "profile_value": profile,
+            }
+        )
     return presets
+
+
+def tmux_control_paths() -> tuple[str, str]:
+    binary = str(Path(tmux_binary()).resolve())
+    socket_path = tmux(
+        ["display-message", "-p", "#{socket_path}"]
+    ).stdout.decode().strip()
+    if not Path(socket_path).is_absolute():
+        raise CliLaneError("could not resolve the managed tmux socket")
+    return binary, socket_path
 
 
 def hub_environment_prefix() -> str:
@@ -2418,12 +3422,25 @@ def hub_environment_prefix() -> str:
     return " ".join(f"{key}={shlex.quote(value)}" for key, value in pairs)
 
 
-def hub_open_command(context: str = "") -> str:
-    script = shlex.quote(str(Path(__file__).resolve()))
-    prefix = tmux_literal(
-        f"{hub_environment_prefix()} {script} __hub-open ",
-        1,
+def hub_helper_prefix(action: str) -> str:
+    python_binary = str(Path(sys.executable).resolve())
+    script = str(Path(__file__).resolve())
+    control_binary, control_socket = tmux_control_paths()
+    command = " ".join(
+        (
+            hub_environment_prefix(),
+            shlex.quote(python_binary),
+            shlex.quote(script),
+            action,
+            shlex.quote(control_binary),
+            shlex.quote(control_socket),
+        )
     )
+    return tmux_literal(command + " ", 1)
+
+
+def hub_open_command(context: str = "") -> str:
+    prefix = hub_helper_prefix("__hub-open")
     return (
         f"{prefix}'#{{client_name}}' '#{{session_name}}' '#{{client_pid}}' "
         f"{tmux_literal(shlex.quote(context), 1)}"
@@ -2431,11 +3448,7 @@ def hub_open_command(context: str = "") -> str:
 
 
 def hub_register_command(context: str) -> str:
-    script = shlex.quote(str(Path(__file__).resolve()))
-    prefix = tmux_literal(
-        f"{hub_environment_prefix()} {script} __hub-register ",
-        1,
-    )
+    prefix = hub_helper_prefix("__hub-register")
     return (
         f"{prefix}'#{{client_name}}' '#{{client_pid}}' "
         f"{tmux_literal(shlex.quote(context), 1)}"
@@ -2448,11 +3461,7 @@ def hub_detach_hook(context: str) -> str:
 
 
 def hub_forget_command(client: str, client_pid: str, context: str) -> str:
-    script = shlex.quote(str(Path(__file__).resolve()))
-    prefix = tmux_literal(
-        f"{hub_environment_prefix()} {script} __hub-forget ",
-        1,
-    )
+    prefix = hub_helper_prefix("__hub-forget")
     arguments = " ".join(
         tmux_literal(shlex.quote(value), 1)
         for value in (client, client_pid, context)
@@ -2532,11 +3541,14 @@ def hub_context_data(context: str) -> dict[str, object]:
     ):
         raise CliLaneError("corrupt session switcher context")
     config = decoded.get("config")
+    profiles = decoded.get("profiles")
     launch_cwd = decoded.get("launch_cwd")
     if (
         decoded.get("schema_version") != HUB_CONTEXT_SCHEMA_VERSION
         or not isinstance(config, str)
         or not Path(config).is_absolute()
+        or not isinstance(profiles, str)
+        or not Path(profiles).is_absolute()
         or (
             launch_cwd is not None
             and (
@@ -2552,11 +3564,13 @@ def hub_context_data(context: str) -> dict[str, object]:
 
 
 def create_hub_context(configured: str | None) -> str:
+    environment = portable_environment()
     payload: dict[str, object] = {
         "schema_version": HUB_CONTEXT_SCHEMA_VERSION,
-        "environment": portable_environment(),
+        "environment": environment,
         "environment_error": "",
         "config": str(hub_config_path(configured)),
+        "profiles": str(profiles_config_path(environment)),
         "config_required": bool(configured),
         "launch_cwd": str(Path.cwd().resolve()),
     }
@@ -2655,17 +3669,20 @@ def hub_open(
         register_hub_client(client, client_pid, supplied_context)
     context = hub_client_context(client, client_pid)
     data = hub_context_data(context)
+    environment = data["environment"]
     load_hub_presets(
-        str(data["config"]), allow_missing=not bool(data["config_required"])
+        str(data["config"]),
+        allow_missing=not bool(data["config_required"]),
+        launch_environment=environment if isinstance(environment, dict) else {},
+        profiles_file=str(data["profiles"]),
     )
     ensure_hub_session()
     for task in list_tasks():
         configure_task_status(task.session)
-    tmux(["switch-client", "-c", client, "-t", HUB_SESSION])
+    tmux(["switch-client", "-E", "-c", client, "-t", HUB_SESSION])
     tmux(["display-popup", "-c", client, "-C"], check=False)
-    script = shlex.quote(str(Path(__file__).resolve()))
     command = (
-        f"{hub_environment_prefix()} {script} __hub-ui "
+        f"{hub_helper_prefix('__hub-ui')}"
         f"{shlex.quote(client)} {shlex.quote(source)} {shlex.quote(context)}"
     )
     shown = tmux(
@@ -2809,10 +3826,16 @@ def hub_key(descriptor: int) -> tuple[str, str] | None:
 
 def hub_preset_kind(preset: dict[str, object]) -> str | None:
     name = str(preset["name"]).lower()
+    provider = str(preset.get("provider") or "").lower()
     command = list(preset["command"])
     executable = Path(str(command[0])).name.lower() if command else ""
     return next(
-        (kind for kind in HUB_PROMPT_AGENT_ORDER if kind in {name, executable}), None
+        (
+            kind
+            for kind in HUB_PROMPT_AGENT_ORDER
+            if kind in {name, provider, executable}
+        ),
+        None,
     )
 
 
@@ -2838,13 +3861,70 @@ def hub_task_name(preset: dict[str, object], tasks: Sequence[Task]) -> str:
     return next_hub_task_name(base[:64], tasks)
 
 
+def revalidate_hub_preset(
+    preset: dict[str, object],
+    config: str,
+    profiles_file: str,
+    environment: Mapping[str, str],
+) -> dict[str, object]:
+    if preset.get("hub_schema_version") != 2:
+        return preset
+    try:
+        reloaded = load_hub_presets(
+            config,
+            allow_missing=False,
+            launch_environment=environment,
+            profiles_file=profiles_file,
+        )
+    except CliLaneError as error:
+        raise CliLaneError(f"hub configuration changed; reopen menu: {error}") from error
+    selected = next(
+        (item for item in reloaded if item["name"] == preset["name"]), None
+    )
+    if selected is None:
+        raise CliLaneError("hub configuration changed; reopen menu: preset no longer exists")
+    if selected.get("selection_digest") != preset.get("selection_digest"):
+        raise CliLaneError("hub configuration changed; reopen menu")
+    return selected
+
+
 def launch_hub_preset(
     preset: dict[str, object], name: str, context: str, prompt: str = ""
 ) -> Task:
     if prompt:
         validate_message_text(prompt)
-    adopt_hub_environment(context)
-    task = run_task(name, str(preset["dir"]), list(preset["command"]))
+    data = hub_context_data(context)
+    environment = hub_launch_environment(context)
+    selected = revalidate_hub_preset(
+        preset,
+        str(data["config"]),
+        str(data["profiles"]),
+        environment,
+    )
+
+    if selected.get("launch_mode") == "profile":
+        profile = selected.get("profile_value")
+        if not isinstance(profile, Profile):
+            raise CliLaneError("corrupt resolved hub profile")
+        launch_environment = profile_launch_environment(profile, environment)
+        profile_name: str | None = profile.name
+        provider: str | None = profile.provider
+    else:
+        launch_environment = legacy_launch_environment(environment)
+        profile_name = None
+        provider = None
+    spec = complete_launch_spec(
+        name=name,
+        cwd_value=str(selected["dir"]),
+        command=list(selected["command"]),
+        wait=False,
+        timeout=None,
+        on_exit=None,
+        environment=launch_environment,
+        profile=profile_name,
+        provider=provider,
+    )
+    task = run_task(spec)
     if prompt:
         send_task(task.id, prompt, True)
     return task
@@ -2989,6 +4069,10 @@ def hub_ui(client: str, source: str, context: str) -> int:
             if isinstance(context_environment, dict)
             else None,
             discovery_directory=discovery_directory,
+            launch_environment=context_environment
+            if isinstance(context_environment, dict)
+            else {},
+            profiles_file=str(data["profiles"]),
         )
     )
     selected_key = source_task.id if source_task else (tasks[0].id if tasks else "")
@@ -3111,7 +4195,14 @@ def hub_ui(client: str, source: str, context: str) -> int:
             if not prompt:
                 if selected < len(tasks):
                     tmux(
-                        ["switch-client", "-c", client, "-t", tasks[selected].session]
+                        [
+                            "switch-client",
+                            "-E",
+                            "-c",
+                            client,
+                            "-t",
+                            tasks[selected].session,
+                        ]
                     )
                     return 0
                 notice = "Type a message to start a new session"
@@ -3138,7 +4229,7 @@ def hub_ui(client: str, source: str, context: str) -> int:
             except CliLaneError as error:
                 notice = str(error)
                 continue
-            tmux(["switch-client", "-c", client, "-t", task.session])
+            tmux(["switch-client", "-E", "-c", client, "-t", task.session])
             return 0
     finally:
         with suppress(termios.error):
@@ -3149,14 +4240,10 @@ def hub_ui(client: str, source: str, context: str) -> int:
 
 
 def portable_environment() -> dict[str, str]:
-    return {
-        key: value
-        for key, value in os.environ.items()
-        if key not in TRANSIENT_ENV and ENV_PATTERN.fullmatch(key) and "\x00" not in value
-    }
+    return legacy_launch_environment(os.environ)
 
 
-def adopt_hub_environment(context: str) -> None:
+def hub_launch_environment(context: str) -> dict[str, str]:
     decoded = hub_context_data(context)
     error = str(decoded["environment_error"])
     environment = decoded["environment"]
@@ -3164,17 +4251,9 @@ def adopt_hub_environment(context: str) -> None:
         raise CliLaneError(error or "the session launch environment is unavailable")
     if not isinstance(environment, dict):
         raise CliLaneError("corrupt session switcher context")
-    pinned = {
-        key: value
-        for key, value in os.environ.items()
-        if key in {"CLILANE_TMUX_SOCKET", "CLILANE_STATE_HOME", "TMUX_TMPDIR"}
-    }
-    adopted = {
+    return {
         key: value for key, value in environment.items() if isinstance(value, str)
     }
-    os.environ.clear()
-    os.environ.update(adopted)
-    os.environ.update(pinned)
 
 
 def ensure_hub_session() -> None:
@@ -3231,11 +4310,11 @@ def hub_command(configured: str | None) -> int:
         binary,
         [
             binary,
-            "-L",
-            SOCKET,
+            *tmux_socket_arguments(),
             "-f",
             "/dev/null",
             "attach-session",
+            "-E",
             "-t",
             HUB_SESSION,
             ";",
@@ -3758,36 +4837,21 @@ the switcher.""",
         "run",
         help="start a managed task",
         description="Start a task in the background and return immediately.",
-        usage="clilane run NAME [-C DIR] [--on-exit COMMAND] [--wait [--timeout SECONDS]] -- COMMAND [ARG ...]",
+        usage=(
+            "clilane run [OPTIONS] NAME [OPTIONS] -- COMMAND [ARG ...]\n"
+            "       clilane run [OPTIONS] NAME [OPTIONS] --profile PROFILE"
+        ),
     )
-    run.add_argument("name", help="unique task name")
+    run.add_argument("-C", "--cwd", metavar="DIR", help="task working directory")
+    run.add_argument("--profile", metavar="PROFILE", help="clean launch profile name")
+    run.add_argument("--wait", action="store_true", help="wait for the command to exit")
+    run.add_argument("--timeout", metavar="SECONDS", help="timeout used with --wait")
+    run.add_argument("--on-exit", metavar="COMMAND", help="shell command run after exit")
     run.add_argument(
-        "-C",
-        "--cwd",
-        metavar="DIR",
-        default=os.getcwd(),
-        help="task working directory (default: current directory)",
-    )
-    run.add_argument(
-        "--wait",
-        action="store_true",
-        help="block until the command exits and return its exit status",
-    )
-    run.add_argument(
-        "--on-exit",
-        metavar="COMMAND",
-        help="shell command to run after the task exits",
-    )
-    run.add_argument(
-        "--timeout",
-        type=float,
-        help="seconds to wait with --wait before returning 124",
-    )
-    run.add_argument(
-        "command",
-        metavar="COMMAND",
+        "run_arguments",
+        metavar="ARG",
         nargs=argparse.REMAINDER,
-        help="command and arguments, preceded by --",
+        help="task name and raw command preceded by --, or a profile launch",
     )
 
     listing = commands.add_parser(
@@ -3941,21 +5005,26 @@ the switcher.""",
     return root
 
 
+def parse_cli_arguments(parts: Sequence[str] | None = None) -> argparse.Namespace:
+    arguments = list(sys.argv[1:] if parts is None else parts)
+    if arguments and arguments[0] == "run":
+        run_parts = arguments[1:]
+        if run_parts in (["-h"], ["--help"]):
+            return parser().parse_args(arguments)
+        return argparse.Namespace(action="run", run_arguments=run_parts)
+    return parser().parse_args(arguments)
+
+
 def execute(arguments: argparse.Namespace) -> int:
     if arguments.action is None:
         return hub_command(None)
     if arguments.action == "run":
-        spec = run_spec(arguments.cwd, arguments.on_exit, arguments.command)
-        wait = arguments.wait or spec.wait
-        timeout = spec.timeout
-        if arguments.timeout is not None:
-            timeout = positive_timeout(str(arguments.timeout))
-        if timeout is not None and not wait:
-            raise CliLaneError("--timeout requires --wait")
-        task = run_task(arguments.name, spec.cwd, spec.command, spec.on_exit)
+        request = parse_run_request(arguments.run_arguments)
+        spec = resolve_run_request(request, os.environ, os.getcwd())
+        task = run_task(spec)
         print(f"created {task.name} {task.id[:8]}")
-        if wait:
-            return wait_task(task.id, timeout)
+        if spec.wait:
+            return wait_task(task.id, spec.timeout)
         return 0
     if arguments.action in {"list", "ls", "ps"}:
         print_tasks(list_tasks(), arguments.json)
@@ -4038,22 +5107,43 @@ def execute(arguments: argparse.Namespace) -> int:
 
 def main() -> int:
     try:
+        if len(sys.argv) == 5 and sys.argv[1] == "__supervise":
+            configure_tmux_control(sys.argv[2], sys.argv[3])
+            return supervise(sys.argv[4])
         if len(sys.argv) == 3 and sys.argv[1] == "__supervise":
             return supervise(sys.argv[2])
+        if len(sys.argv) == 7 and sys.argv[1] == "__hub-register":
+            configure_tmux_control(sys.argv[2], sys.argv[3])
+            return hub_register(sys.argv[4], sys.argv[5], sys.argv[6])
         if len(sys.argv) == 5 and sys.argv[1] == "__hub-register":
             return hub_register(sys.argv[2], sys.argv[3], sys.argv[4])
+        if len(sys.argv) == 8 and sys.argv[1] == "__hub-forget":
+            configure_tmux_control(sys.argv[2], sys.argv[3])
+            return hub_forget(sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7])
         if len(sys.argv) == 6 and sys.argv[1] == "__hub-forget":
             return hub_forget(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
+        if len(sys.argv) == 8 and sys.argv[1] == "__hub-open":
+            configure_tmux_control(sys.argv[2], sys.argv[3])
+            return hub_open(sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7])
         if len(sys.argv) == 6 and sys.argv[1] == "__hub-open":
             return hub_open(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
+        if len(sys.argv) == 7 and sys.argv[1] == "__hub-ui":
+            configure_tmux_control(sys.argv[2], sys.argv[3])
+            return hub_ui(sys.argv[4], sys.argv[5], sys.argv[6])
         if len(sys.argv) == 5 and sys.argv[1] == "__hub-ui":
             return hub_ui(sys.argv[2], sys.argv[3], sys.argv[4])
+        if len(sys.argv) == 7 and sys.argv[1] == "__log":
+            configure_tmux_control(sys.argv[2], sys.argv[3])
+            max_bytes = optional_int(sys.argv[5])
+            if max_bytes is None:
+                raise CliLaneError("invalid log size")
+            return sink_log(sys.argv[4], max_bytes, sys.argv[6])
         if len(sys.argv) == 5 and sys.argv[1] == "__log":
             max_bytes = optional_int(sys.argv[3])
             if max_bytes is None:
                 raise CliLaneError("invalid log size")
             return sink_log(sys.argv[2], max_bytes, sys.argv[4])
-        return execute(parser().parse_args())
+        return execute(parse_cli_arguments())
     except CliLaneError as error:
         print(f"{PROGRAM}: {error}", file=sys.stderr)
         return 1
