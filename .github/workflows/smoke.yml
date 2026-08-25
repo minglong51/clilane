@@ -86,7 +86,7 @@ jobs:
           for path in sys.argv[1:]:
               assert os.stat(path).st_mode & 0o777 == 0o700, path
           PY
-          test "$(./bin/clilane --version)" = "clilane 0.6.0"
+          test "$(./bin/clilane --version)" = "clilane 0.7.0"
           ./bin/clilane --help | grep -F "~/projects/sample-app" >/dev/null
           python3 -c 'import sys; assert sys.version_info >= (3, 10)'
           tmux -V
@@ -162,7 +162,7 @@ jobs:
           host = fleet["hosts"][0]
           assert host["name"] == "ci-local"
           assert host["status"] == "ok"
-          assert host["clilane_version"] == "0.6.0"
+          assert host["clilane_version"] == "0.7.0"
           assert host["error"] is None
           assert len(host["tasks"]) == 1
           assert host["tasks"][0] == status
