@@ -339,7 +339,9 @@ def main() -> int:
             discovery_terminal.expect("This clilane server", mark)
             discovery_terminal.expect("codex-launch-project", mark)
             discovery_terminal.expect("empty message: →/Enter view", mark)
-            time.sleep(0.25)
+            handshake_mark = discovery_terminal.mark()
+            discovery_terminal.send(b"\x15")
+            discovery_terminal.expect("> ▏", handshake_mark)
             discovery_terminal.send(b"\x1b[D")
             assert discovery_terminal.wait() == 0
             discovery_terminal.close()
@@ -389,7 +391,9 @@ def main() -> int:
             discovery_terminal.expect("This clilane server", mark)
             discovery_terminal.expect("kimi-source-project", mark)
             discovery_terminal.expect("empty message: →/Enter view", mark)
-            time.sleep(0.25)
+            handshake_mark = discovery_terminal.mark()
+            discovery_terminal.send(b"\x15")
+            discovery_terminal.expect("> ▏", handshake_mark)
             discovery_terminal.send(b"\x1b[D")
             assert discovery_terminal.wait() == 0
             discovery_terminal.close()
@@ -421,12 +425,8 @@ def main() -> int:
             discovery_terminal.send(b"suppressed discovery\r")
             discovery_terminal.expect("Config disables discovery", mark)
             assert len(_tasks(discovery_environment)) == before
-            mark = discovery_terminal.mark()
-            discovery_terminal.send(b"\x15")
-            discovery_terminal.expect("> ▏", mark)
-            time.sleep(0.25)
-            discovery_terminal.send(b"\x1b[D")
-            assert discovery_terminal.wait() == 0
+            discovery_terminal.close()
+            discovery_terminal = None
         finally:
             if discovery_terminal is not None:
                 discovery_terminal.close()
