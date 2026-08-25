@@ -45,10 +45,11 @@ Laptop / Termius / another node
 - `tail` for persistent log reading
 - OpenSSH and key-based host access for `clilane fleet`
 
-CLI Lane uses only the Python standard library. The lifecycle and fleet paths are
-verified on macOS and Ubuntu in CI. tmux 3.3 is required because older releases
-do not report the signal that ended a task, which would silently corrupt exit
-statuses; `run` refuses to start on an older tmux.
+CLI Lane uses only the Python standard library. The lifecycle, fleet, and
+interactive switcher paths are verified on macOS and Ubuntu in CI. tmux 3.3 is
+required because older releases do not report the signal that ended a task,
+which would silently corrupt exit statuses; `run` refuses to start on an older
+tmux.
 
 ## Install
 
@@ -90,8 +91,8 @@ clilane status demo
 clilane read demo
 ```
 
-Attach to its terminal when you need full interaction. Press `Ctrl-Q` to detach
-without stopping the command:
+Attach to its terminal when you need full interaction. Press `Ctrl-Q` to leave it
+running and return to the switcher; press `Ctrl-Q` again there to detach:
 
 ```bash
 clilane attach demo
@@ -226,58 +227,64 @@ network was discovered.
 
 ## One view for every agent
 
-`clilane hub` attaches to a persistent `hub` session on CLI Lane's dedicated tmux
-server: a shell for typing CLI Lane commands, plus prefix-less keys for reaching
-every running agent.
+Run `clilane` with no subcommand to open the native session switcher. `clilane hub`
+is an explicit alias for the same view.
 
 ```bash
-clilane hub
+clilane
 ```
 
 | Key | Behavior |
 | --- | --- |
-| `M-n` | Open the menu: start a preset agent, or jump to a running one. |
-| `M-h` | Return to the hub from whichever agent you are in. |
-| `Ctrl-Q` | Detach and leave every agent running. |
+| Type | Write the first message for a new session in the bottom composer. |
+| `Tab` / `Shift-Tab` | Choose Codex, Kimi, Claude, or another configured preset. |
+| `Up` / `Down` | Select a running or finished job. |
+| `Enter` | Start the chosen agent when the composer has text. |
+| `Right` / `Enter` | Open the selected job when the composer is empty. |
+| `Left` / `Right` | Move the composer cursor while typing. |
+| `Left` with an empty composer / `Ctrl-Q` | Detach and leave every job running. |
+| `Ctrl-Q` or `Ctrl-b w` in a job | Background that job and return to the switcher. |
 
-The menu lists presets first, then every running task by name and state. Starting
-one prompts for a task name; jumping switches straight to it.
+The dashboard identifies jobs started from a terminal as `LOCAL` and jobs started
+by OpenClaw or another automation lane as `BOT`. All of them are ordinary CLI Lane
+tasks on the current host and tmux socket. CLI Lane does not import unrelated
+processes or historical conversations from an agent's own session store.
 
-`M-n` acts only while the hub is in front, so an attached agent keeps receiving it
-as an ordinary key. `M-h` is deliberately global — a reliable way back matters more
-than the one key it takes, and CLI Lane already reserves `Ctrl-Q` the same way. It
-rebuilds the hub session if you have closed it, so it never becomes a dead key.
+Typing a message and pressing `Enter` starts the selected preset immediately, gives
+it an agent-and-project task name, and delivers the message through its terminal.
+The message is not stored in the command arguments or task metadata. It can still
+appear in the terminal log, just as if you had typed it directly into the agent.
 
-Presets come from an optional file. Without one the hub is still a working
-launcher: type `clilane run ...` in its shell, or press `M-n` to jump between
-whatever is already running.
+Agent choices come from an optional file at `~/.config/clilane/hub.json` (or under
+`$XDG_CONFIG_HOME`). Codex, Kimi, and Claude are shown first; other configured
+presets remain available. Without presets, the switcher still opens existing jobs
+but cannot start a new one from the composer.
 
 ```json
 {
   "schema_version": 1,
   "agents": [
-    { "name": "claude", "command": ["claude"], "dir": "~/projects/app" },
     { "name": "codex", "command": ["codex"], "dir": "~/projects/app" },
     { "name": "kimi", "command": ["kimi"], "dir": "~/projects/web" },
+    { "name": "claude", "command": ["claude"], "dir": "~/projects/app" },
     { "name": "hermes", "command": ["hermes"], "dir": "~" }
   ]
 }
 ```
 
 `dir` must be absolute after `~` expansion. A preset starts an ordinary task, so
-`list`, `log`, `stop`, and the fleet commands all see it, and the task's tmux
-window carries its name.
+`list`, `log`, `stop`, and the fleet commands all see it.
 
-An agent started from the menu inherits the environment of the shell you ran
-`clilane hub` in — the same environment `clilane run` would have given it. This
+An agent started from the composer inherits the environment of the shell you ran
+`clilane` in — the same environment `clilane run` would have given it. This
 matters more than it sounds: tools installed by a version manager, or on a PATH
 your shell builds interactively, are invisible to the tmux server that runs the
-menu, so without this a preset for such a tool would fail to launch at all. The
-environment is captured when you start the hub; start it again to refresh it.
+switcher, so without this a preset for such a tool would fail to launch at all.
+Opening or attaching through CLI Lane refreshes the captured environment.
 
-The hub runs on CLI Lane's own tmux server, so it nests safely inside your normal
-tmux: your prefix, configuration, and other panes are untouched, and both survive a
-dropped connection independently.
+The switcher runs on CLI Lane's own tmux server, so it nests safely inside your
+normal tmux: your prefix, configuration, and other panes are untouched, and both
+survive a dropped connection independently.
 
 ## SSH, Mosh, and tmux
 
@@ -314,8 +321,8 @@ named `agt` for compatibility with tasks created before the project was renamed.
 | `fleet status HOST:TASK` | Show one task on a fleet host as JSON. |
 | `fleet log HOST:TASK` | Read a fleet task's persistent log. `--lines` defaults to 200. |
 | `status TARGET` | Show one task by name or unique ID prefix. Supports `--json`. |
-| `attach TARGET` | Attach interactively. `Ctrl-Q` detaches. |
-| `hub` | Attach to the hub session: every agent in one view, with `M-n` for the start-or-jump menu, `M-h` to return, and `Ctrl-Q` to detach. `--config` overrides the presets file. |
+| `attach TARGET` | Attach interactively. `Ctrl-Q` returns to the switcher. |
+| `hub` | Open the same switcher as bare `clilane`. `--config` overrides the presets file. |
 | `read TARGET` | Print the last 200 terminal lines. `--all` prints retained scrollback. |
 | `log TARGET` | Read persistent output. `--lines` defaults to 200; `--follow` follows rotation. |
 | `send TARGET MESSAGE` | Paste text and press Enter. `--no-enter` only pastes. Control characters are rejected; use `key`. |
@@ -368,7 +375,7 @@ running.
 | Setting | Purpose |
 |---|---|
 | `~/.config/clilane/fleet.json` | Default versioned fleet inventory. |
-| `~/.config/clilane/hub.json` | Optional hub launcher presets, up to nine agents. |
+| `~/.config/clilane/hub.json` | Optional switcher presets, up to nine agents. |
 | `XDG_CONFIG_HOME` | Moves the default fleet and hub configs under `$XDG_CONFIG_HOME/clilane/`. |
 | `CLILANE_TMUX_SOCKET` | Overrides the dedicated local tmux socket. |
 | `CLILANE_STATE_HOME` | Overrides the local state root; it must be absolute. |

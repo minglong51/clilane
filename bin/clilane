@@ -17,8 +17,10 @@ import shutil
 import signal
 import subprocess
 import sys
+import termios
 import threading
 import time
+import tty
 import unicodedata
 import uuid
 from contextlib import contextmanager, suppress
@@ -29,7 +31,7 @@ from typing import BinaryIO, Iterator, Sequence
 
 
 PROGRAM = "clilane"
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 TASK_STATE_INITIALIZING = "initializing"
 TASK_STATE_RUNNING = "running"
 TASK_STATE_STOPPED = "stopped"
@@ -42,16 +44,20 @@ SESSION_PREFIX = "agt_"
 SERVER_TAG = "agt-v1"
 HUB_SESSION = "hub"
 HUB_MAX_PRESETS = 9
-HUB_MAX_JUMPS = 20
-HUB_NAME_OPTION = "@agt_hub_name"
-HUB_ENV_OPTION = "@agt_hub_env"
+HUB_CONTEXT_OPTION_PREFIX = "@agt_hub_context_"
+HUB_CLIENT_CONTEXT_OPTION_PREFIX = "@agt_hub_client_"
 HUB_ENV_MAX_BYTES = 256 * 1024
-HUB_SLOT_PATTERN = re.compile(r"@agt_hub_name_[0-9a-f]{8}")
 HUB_CONFIG_SCHEMA_VERSION = 1
+HUB_CONTEXT_SCHEMA_VERSION = 1
+HUB_REFRESH_SECONDS = 0.5
+HUB_PROMPT_MAX_CHARS = 8000
+HUB_PROMPT_AGENT_ORDER = ("codex", "kimi", "claude")
 FIELD_SEPARATOR = "|"
 ON_EXIT_TIMEOUT = 30.0
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 ENV_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+HUB_CONTEXT_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+HUB_CLIENT_CONTEXT_PATTERN = re.compile(r"^([1-9][0-9]{0,19}):([0-9a-f]{32})$")
 KEY_PATTERN = re.compile(r"^(?:C-|M-|C-M-|M-C-)?[\x21-\x3a\x3c-\x7e]$")
 NAMED_KEYS = frozenset(
     {
@@ -200,6 +206,7 @@ class Task:
     signal_name: str | None
     pid: int | None
     attached: bool
+    origin: str
 
     @property
     def state(self) -> str:
@@ -1165,6 +1172,7 @@ def list_tasks(timeout: float | None = None) -> list[Task]:
         "#{pane_dead_signal}",
         "#{pane_pid}",
         "#{session_attached}",
+        "#{?#{OPENCLAW_SESSION},bot,local}",
     ]
     completed = tmux(
         ["list-panes", "-a", "-F", FIELD_SEPARATOR.join(fields)],
@@ -1194,6 +1202,7 @@ def list_tasks(timeout: float | None = None) -> list[Task]:
             dead_signal,
             pid,
             attached,
+            origin,
         ) = values
         if not session.startswith(SESSION_PREFIX) or not encoded:
             continue
@@ -1228,6 +1237,7 @@ def list_tasks(timeout: float | None = None) -> list[Task]:
                 else normalized_signal(dead_signal),
                 pid=optional_int(pid),
                 attached=(optional_int(attached) or 0) > 0,
+                origin=origin if origin in {"bot", "local"} else "local",
             )
         )
     return sorted(tasks, key=lambda task: task.created)
@@ -1797,10 +1807,6 @@ def run_spec(
     return RunSpec(cwd, wait, timeout, on_exit, command_from_remainder(remaining))
 
 
-def bind_detach_key() -> None:
-    tmux(["bind-key", "-T", "root", "C-q", "detach-client"])
-
-
 def ensure_server_available() -> None:
     ensure_tmux_version()
     probe = tmux(["list-sessions"], check=False)
@@ -1822,6 +1828,30 @@ def tmux_session_absent(session: str) -> bool:
     if tmux_server_absent(probe) or "can't find session" in detail:
         return True
     raise CliLaneError(detail.strip() or f"could not inspect tmux session: {session}")
+
+
+def configure_task_status(session: str) -> None:
+    tmux(
+        [
+            "set-option",
+            "-t",
+            session,
+            "status-left",
+            " #{?#{OPENCLAW_SESSION},BOT,LOCAL} · #{window_name} ",
+        ],
+        check=False,
+    )
+    tmux(["set-option", "-t", session, "status-left-length", "50"], check=False)
+    tmux(
+        [
+            "set-option",
+            "-t",
+            session,
+            "status-right",
+            " C-q / C-b w switcher ",
+        ],
+        check=False,
+    )
 
 
 def kill_managed_session(session: str) -> None:
@@ -1949,13 +1979,13 @@ def run_task(
                 check=False,
             )
             tmux(["rename-window", "-t", session, name], check=False)
+            configure_task_status(session)
             set_task_environment(session)
             sink = (
                 f"exec {shlex.quote(str(script))} __log "
                 f"{shlex.quote(str(log_path))} {LOG_MAX_BYTES} {shlex.quote(session)}"
             )
             tmux(["pipe-pane", "-t", pane, sink])
-            bind_detach_key()
             tmux(
                 [
                     "respawn-pane",
@@ -2238,14 +2268,28 @@ def print_status(task: Task, as_json: bool) -> None:
 
 
 def attach_task(task: Task) -> int:
-    bind_detach_key()
+    configure_task_status(task.session)
+    context = create_hub_context(None)
+    bind_hub_keys()
     environment = os.environ.copy()
     environment.pop("TMUX", None)
     environment.pop("TMUX_PANE", None)
     binary = tmux_binary()
     os.execvpe(
         binary,
-        [binary, "-L", SOCKET, "-f", "/dev/null", "attach-session", "-t", task.session],
+        [
+            binary,
+            "-L",
+            SOCKET,
+            "-f",
+            "/dev/null",
+            "attach-session",
+            "-t",
+            task.session,
+            ";",
+            "run-shell",
+            hub_register_command(context),
+        ],
         environment,
     )
     return 1
@@ -2260,12 +2304,15 @@ def tmux_quoted(text: str) -> str:
     return f'"{escaped}"'
 
 
-def load_hub_presets(configured: str | None) -> list[dict[str, object]]:
+def load_hub_presets(
+    configured: str | None, *, allow_missing: bool | None = None
+) -> list[dict[str, object]]:
     path = hub_config_path(configured)
+    missing_ok = not configured if allow_missing is None else allow_missing
     try:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        if configured:
+        if not missing_ok:
             raise CliLaneError(
                 f"hub config not found: {str(path)!r}; create it or omit --config"
             ) from None
@@ -2339,93 +2386,683 @@ def hub_environment_prefix() -> str:
     return " ".join(f"{key}={shlex.quote(value)}" for key, value in pairs)
 
 
-def hub_menu_command(config: Path) -> str:
+def hub_open_command(context: str = "") -> str:
     script = shlex.quote(str(Path(__file__).resolve()))
-    body = (
-        f"{hub_environment_prefix()} {script} __hub-menu "
-        f"'#{{client_name}}' {shlex.quote(str(config))}"
+    prefix = tmux_literal(
+        f"{hub_environment_prefix()} {script} __hub-open ",
+        1,
     )
-    return tmux_literal_command(body, 1)
+    return (
+        f"{prefix}'#{{client_name}}' '#{{session_name}}' '#{{client_pid}}' "
+        f"{tmux_literal(shlex.quote(context), 1)}"
+    )
 
 
-def tmux_literal_command(body: str, expansions: int) -> str:
-    guard = "#{client_name}"
-    parts = body.split(guard)
-    return guard.join(tmux_literal(part, expansions) for part in parts)
-
-
-def hub_ensure_command() -> str:
+def hub_register_command(context: str) -> str:
     script = shlex.quote(str(Path(__file__).resolve()))
-    body = f"{hub_environment_prefix()} {script} __hub-ensure '#{{client_name}}'"
-    return tmux_literal_command(body, 1)
+    prefix = tmux_literal(
+        f"{hub_environment_prefix()} {script} __hub-register ",
+        1,
+    )
+    return (
+        f"{prefix}'#{{client_name}}' '#{{client_pid}}' "
+        f"{tmux_literal(shlex.quote(context), 1)}"
+    )
 
 
-def bind_hub_keys(config: Path) -> None:
-    guard = f"#{{==:#{{session_name}},{HUB_SESSION}}}"
+def hub_detach_hook(context: str) -> str:
+    hub_context_option(context)
+    return f"client-detached[{int(context[:7], 16) + 1000}]"
+
+
+def hub_forget_command(client: str, client_pid: str, context: str) -> str:
+    script = shlex.quote(str(Path(__file__).resolve()))
+    prefix = tmux_literal(
+        f"{hub_environment_prefix()} {script} __hub-forget ",
+        1,
+    )
+    arguments = " ".join(
+        tmux_literal(shlex.quote(value), 1)
+        for value in (client, client_pid, context)
+    )
+    return f"{prefix}'#{{hook_client}}' {arguments}"
+
+
+def bind_hub_keys() -> None:
+    open_command = hub_open_command()
     tmux(
         [
             "bind-key",
             "-T",
             "root",
-            "M-h",
-            "if-shell",
-            "-F",
-            guard,
-            "display-message 'already in the hub'",
-            f"run-shell -b {tmux_quoted(hub_ensure_command())}",
+            "C-q",
+            f"run-shell -b {tmux_quoted(open_command)}",
         ]
     )
     tmux(
         [
             "bind-key",
             "-T",
-            "root",
-            "M-n",
-            "if-shell",
-            "-F",
-            guard,
-            f"run-shell -b {tmux_quoted(hub_menu_command(config))}",
-            "send-keys M-n",
+            "prefix",
+            "w",
+            f"run-shell -b {tmux_quoted(open_command)}",
         ]
     )
+    tmux(["unbind-key", "-T", "root", "M-h"], check=False)
+    tmux(["unbind-key", "-T", "root", "M-n"], check=False)
+    tmux(["set-hook", "-gu", "client-detached[100]"], check=False)
+    tmux(["set-option", "-gu", "@agt_hub_env"], check=False)
+    tmux(["set-option", "-gu", "@agt_hub_config"], check=False)
 
 
-def hub_menu(client: str, configured: str) -> int:
-    presets = load_hub_presets(configured)
+def hub_client_exists(client: str, client_pid: str | None = None) -> bool:
+    format_string = "#{client_name}" if client_pid is None else "#{client_name}|#{client_pid}"
+    expected = client if client_pid is None else f"{client}|{client_pid}"
+    listed = tmux(["list-clients", "-F", format_string], check=False)
+    if listed.returncode != 0:
+        return False
+    return expected in listed.stdout.decode(errors="replace").splitlines()
+
+
+def hub_context_option(context: str) -> str:
+    if not HUB_CONTEXT_PATTERN.fullmatch(context):
+        raise CliLaneError("invalid hub context")
+    return f"{HUB_CONTEXT_OPTION_PREFIX}{context}"
+
+
+def hub_client_context_option(client: str) -> str:
+    digest = hashlib.sha256(client.encode()).hexdigest()[:32]
+    return f"{HUB_CLIENT_CONTEXT_OPTION_PREFIX}{digest}"
+
+
+def parse_hub_client_context(value: str) -> tuple[str, str] | None:
+    matched = HUB_CLIENT_CONTEXT_PATTERN.fullmatch(value)
+    return matched.groups() if matched else None
+
+
+def hub_context_data(context: str) -> dict[str, object]:
+    encoded = tmux(
+        ["show-options", "-gqv", hub_context_option(context)]
+    ).stdout.decode().strip()
+    if not encoded:
+        raise CliLaneError("the session switcher context has expired; reattach first")
+    try:
+        decoded = decode_meta(encoded)
+    except CliLaneError as error:
+        raise CliLaneError("corrupt session switcher context") from error
+    environment = decoded.get("environment")
+    if environment is not None and (
+        not isinstance(environment, dict)
+        or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in environment.items()
+        )
+    ):
+        raise CliLaneError("corrupt session switcher context")
+    config = decoded.get("config")
+    if (
+        decoded.get("schema_version") != HUB_CONTEXT_SCHEMA_VERSION
+        or not isinstance(config, str)
+        or not Path(config).is_absolute()
+        or not isinstance(decoded.get("config_required"), bool)
+        or not isinstance(decoded.get("environment_error"), str)
+    ):
+        raise CliLaneError("corrupt session switcher context")
+    return decoded
+
+
+def create_hub_context(configured: str | None) -> str:
+    payload: dict[str, object] = {
+        "schema_version": HUB_CONTEXT_SCHEMA_VERSION,
+        "environment": portable_environment(),
+        "environment_error": "",
+        "config": str(hub_config_path(configured)),
+        "config_required": bool(configured),
+    }
+    encoded = encode_meta(payload)
+    if len(encoded) > HUB_ENV_MAX_BYTES:
+        size_kib = (len(encoded) + 1023) // 1024
+        payload["environment"] = None
+        payload["environment_error"] = (
+            f"Session launches disabled: environment is too large "
+            f"({size_kib} KiB; limit 256 KiB)"
+        )
+        encoded = encode_meta(payload)
+    context = uuid.uuid4().hex
+    tmux(["set-option", "-g", hub_context_option(context), encoded])
+    return context
+
+
+def register_hub_client(client: str, client_pid: str, context: str) -> None:
+    if not HUB_CLIENT_CONTEXT_PATTERN.fullmatch(f"{client_pid}:{context}"):
+        raise CliLaneError("invalid hub client context")
+    if not hub_client_exists(client, client_pid):
+        raise CliLaneError("the clilane client is no longer attached")
+    hub_context_data(context)
+    option = hub_client_context_option(client)
+    previous = tmux(["show-options", "-gqv", option]).stdout.decode().strip()
+    previous_entry = parse_hub_client_context(previous)
+    if previous_entry is not None and previous_entry[1] != context:
+        tmux(["set-hook", "-gu", hub_detach_hook(previous_entry[1])], check=False)
+    tmux(["set-option", "-g", option, f"{client_pid}:{context}"])
+    tmux(
+        [
+            "set-hook",
+            "-g",
+            hub_detach_hook(context),
+            f"run-shell {tmux_quoted(hub_forget_command(client, client_pid, context))}",
+        ]
+    )
+    if previous_entry is not None and previous_entry[1] != context:
+        tmux(
+            ["set-option", "-gu", hub_context_option(previous_entry[1])],
+            check=False,
+        )
+
+
+def hub_client_context(client: str, client_pid: str) -> str:
+    value = tmux(
+        ["show-options", "-gqv", hub_client_context_option(client)]
+    ).stdout.decode().strip()
+    entry = parse_hub_client_context(value)
+    if entry is None or entry[0] != client_pid:
+        raise CliLaneError("this client has no switcher context; reattach with clilane")
+    context = entry[1]
+    hub_context_data(context)
+    return context
+
+
+def forget_hub_client(
+    client: str, context: str | None = None, client_pid: str | None = None
+) -> None:
+    option = hub_client_context_option(client)
+    current = tmux(["show-options", "-gqv", option]).stdout.decode().strip()
+    entry = parse_hub_client_context(current)
+    if entry is None:
+        return
+    mapped_pid, mapped_context = entry
+    if context is not None and mapped_context != context:
+        return
+    if client_pid is not None and mapped_pid != client_pid:
+        return
+    tmux(["set-option", "-gu", option], check=False)
+    tmux(["set-hook", "-gu", hub_detach_hook(mapped_context)], check=False)
+    tmux(["set-option", "-gu", hub_context_option(mapped_context)], check=False)
+
+
+def hub_register(client: str, client_pid: str, context: str) -> int:
+    register_hub_client(client, client_pid, context)
+    return 0
+
+
+def hub_forget(
+    detached_client: str, client: str, client_pid: str, context: str
+) -> int:
+    if detached_client != client:
+        return 0
+    forget_hub_client(client, context=context, client_pid=client_pid)
+    tmux(["set-hook", "-gu", hub_detach_hook(context)], check=False)
+    return 0
+
+
+def hub_open(
+    client: str, source: str, client_pid: str, supplied_context: str
+) -> int:
+    if not hub_client_exists(client, client_pid):
+        raise CliLaneError("the clilane client is no longer attached")
+    if supplied_context:
+        register_hub_client(client, client_pid, supplied_context)
+    context = hub_client_context(client, client_pid)
+    data = hub_context_data(context)
+    load_hub_presets(
+        str(data["config"]), allow_missing=not bool(data["config_required"])
+    )
+    ensure_hub_session()
+    for task in list_tasks():
+        configure_task_status(task.session)
+    tmux(["switch-client", "-c", client, "-t", HUB_SESSION])
+    tmux(["display-popup", "-c", client, "-C"], check=False)
     script = shlex.quote(str(Path(__file__).resolve()))
-    items: list[str] = []
-    for index, preset in enumerate(presets):
-        name = str(preset["name"])
-        slot = f"{HUB_NAME_OPTION}_{uuid.uuid4().hex[:8]}"
-        launch = tmux_literal(
-            f"{hub_environment_prefix()} {script} __hub-run "
-            f"{shlex.quote(configured)} {index} {shlex.quote(client)} {slot}",
-            2,
-        )
-        capture = f"set-option -g {slot} '%1'"
-        template = f"{capture} ; run-shell -b {tmux_quoted(launch)}"
-        action = (
-            f"command-prompt -p {tmux_quoted(f'{name} task name:')} "
-            f"-I {tmux_quoted(f'{name}-')} {tmux_quoted(template)}"
-        )
-        items.extend([f"start {name}", str(index + 1), action])
-    running = [task for task in list_tasks() if not task.dead][:HUB_MAX_JUMPS]
-    if items and running:
-        items.extend(["", "", ""])
-    for offset, task in enumerate(running):
-        key = chr(ord("a") + offset)
-        items.extend(
-            [f"{task.name}  ({task.state})", key, f"switch-client -t {task.session}"]
-        )
-    if items:
-        items.extend(["", "", ""])
-    items.extend(["browse sessions", "b", "choose-tree -s"])
-    items.extend(["detach", "d", "detach-client"])
-    shown = tmux(["display-menu", "-c", client, "-T", PROGRAM, *items], check=False)
+    command = (
+        f"{hub_environment_prefix()} {script} __hub-ui "
+        f"{shlex.quote(client)} {shlex.quote(source)} {shlex.quote(context)}"
+    )
+    shown = tmux(
+        [
+            "display-popup",
+            "-c",
+            client,
+            "-E",
+            "-B",
+            "-w",
+            "100%",
+            "-h",
+            "100%",
+            "-x",
+            "0",
+            "-y",
+            "0",
+            command,
+        ],
+        check=False,
+    )
     if shown.returncode != 0:
         detail = shown.stderr.decode(errors="replace").strip()
-        raise CliLaneError(detail or "could not display the hub menu")
+        raise CliLaneError(detail or "could not open the session switcher")
     return 0
+
+
+def next_hub_task_name(base: str, tasks: Sequence[Task]) -> str:
+    names = {task.name for task in tasks}
+    if base not in names:
+        return base
+    suffix = 2
+    while True:
+        ending = f"-{suffix}"
+        candidate = f"{base[: 64 - len(ending)]}{ending}"
+        if candidate not in names:
+            return candidate
+        suffix += 1
+
+
+def hub_task_order(tasks: Sequence[Task]) -> list[Task]:
+    newest_first = sorted(tasks, key=lambda task: task.created, reverse=True)
+    return sorted(newest_first, key=lambda task: task.dead)
+
+
+def hub_read_byte(descriptor: int, timeout: float) -> bytes | None:
+    readable, _, _ = select.select([descriptor], [], [], timeout)
+    if not readable:
+        return None
+    value = os.read(descriptor, 1)
+    return value or None
+
+
+def hub_read_bytes(descriptor: int, count: int, timeout: float) -> bytes | None:
+    value = bytearray()
+    while len(value) < count:
+        part = hub_read_byte(descriptor, timeout)
+        if part is None:
+            return None
+        value.extend(part)
+    return bytes(value)
+
+
+def hub_read_paste(descriptor: int) -> str:
+    terminator = b"\x1b[201~"
+    maximum = HUB_PROMPT_MAX_CHARS * 4
+    value = bytearray()
+    tail = bytearray()
+    while True:
+        part = hub_read_byte(descriptor, 5.0)
+        if part is None:
+            break
+        if len(value) < maximum:
+            value.extend(part)
+        tail.extend(part)
+        if len(tail) > len(terminator):
+            del tail[: len(tail) - len(terminator)]
+        if tail == terminator:
+            if value.endswith(terminator):
+                del value[-len(terminator) :]
+            break
+    return bytes(value).decode("utf-8", errors="replace")
+
+
+def hub_key(descriptor: int) -> tuple[str, str] | None:
+    first = hub_read_byte(descriptor, HUB_REFRESH_SECONDS)
+    if first is None:
+        return None
+    if first == b"\x1b":
+        introducer = hub_read_byte(descriptor, 0.03)
+        if introducer is None:
+            return "left", ""
+        if introducer not in {b"[", b"O"}:
+            return "ignore", ""
+        final = hub_read_byte(descriptor, 0.03)
+        if final is None:
+            return "left", ""
+        arrow = {
+            b"A": "up",
+            b"B": "down",
+            b"C": "right",
+            b"D": "left",
+        }.get(final)
+        if arrow:
+            return arrow, ""
+        if introducer == b"[" and final == b"Z":
+            return "backtab", ""
+        if introducer == b"[" and final == b"2":
+            ending = hub_read_bytes(descriptor, 3, 0.03)
+            if ending == b"00~":
+                return "text", hub_read_paste(descriptor)
+        return "ignore", ""
+    controls = {
+        b"\r": "enter",
+        b"\n": "enter",
+        b"\t": "tab",
+        b"\x08": "backspace",
+        b"\x7f": "backspace",
+        b"\x11": "quit",
+        b"\x15": "clear",
+    }
+    if first in controls:
+        return controls[first], ""
+    lead = first[0]
+    length = 1
+    if lead & 0b11110000 == 0b11110000:
+        length = 4
+    elif lead & 0b11100000 == 0b11100000:
+        length = 3
+    elif lead & 0b11000000 == 0b11000000:
+        length = 2
+    remaining = hub_read_bytes(descriptor, length - 1, 0.03) if length > 1 else b""
+    if remaining is None:
+        return "ignore", ""
+    try:
+        value = (first + remaining).decode("utf-8")
+    except UnicodeDecodeError:
+        return "ignore", ""
+    return ("text", value) if value.isprintable() or value in "\n\t" else ("ignore", "")
+
+
+def hub_preset_kind(preset: dict[str, object]) -> str | None:
+    name = str(preset["name"]).lower()
+    command = list(preset["command"])
+    executable = Path(str(command[0])).name.lower() if command else ""
+    return next(
+        (kind for kind in HUB_PROMPT_AGENT_ORDER if kind in {name, executable}), None
+    )
+
+
+def hub_composer_presets(
+    presets: Sequence[dict[str, object]],
+) -> list[dict[str, object]]:
+    recognized = [
+        preset
+        for kind in HUB_PROMPT_AGENT_ORDER
+        for preset in presets
+        if hub_preset_kind(preset) == kind
+    ]
+    generic = [preset for preset in presets if hub_preset_kind(preset) is None]
+    return recognized + generic
+
+
+def hub_task_name(preset: dict[str, object], tasks: Sequence[Task]) -> str:
+    agent = str(preset["name"])
+    project = Path(str(preset["dir"])).name
+    normalized = unicodedata.normalize("NFKD", project).encode("ascii", "ignore").decode()
+    project_slug = re.sub(r"[^A-Za-z0-9]+", "-", normalized).strip("-").lower()
+    base = f"{agent}-{project_slug}" if project_slug else agent
+    return next_hub_task_name(base[:64], tasks)
+
+
+def launch_hub_preset(
+    preset: dict[str, object], name: str, context: str, prompt: str = ""
+) -> Task:
+    if prompt:
+        validate_message_text(prompt)
+    adopt_hub_environment(context)
+    task = run_task(name, str(preset["dir"]), list(preset["command"]))
+    if prompt:
+        send_task(task.id, prompt, True)
+    return task
+
+
+def hub_task_line(task: Task) -> str:
+    markers = {
+        TASK_STATE_INITIALIZING: "○",
+        TASK_STATE_RUNNING: "●",
+        TASK_STATE_STOPPED: "■",
+        TASK_STATE_SUCCEEDED: "✓",
+        TASK_STATE_FAILED: "!",
+    }
+    marker = markers.get(task.state, "·")
+    agent = Path(task.command[0]).name if task.command else "-"
+    project = Path(task.cwd).name or task.cwd
+    source = "BOT" if task.origin == "bot" else "LOCAL"
+    attached = " open" if task.attached else ""
+    return (
+        f"{marker}  {task.name:<22.22} {agent:<12.12} "
+        f"{task.state:<12.12} {age(task.created):>4}  {source:<5} {project}{attached}"
+    )
+
+
+def hub_composer_line(
+    preset: dict[str, object] | None, prompt: str, cursor: int, width: int
+) -> str:
+    if preset:
+        project = Path(str(preset["dir"])).name or str(preset["dir"])
+        agent = fleet_display_cell(
+            f"{preset['name']} · {project}", max(1, width - 10)
+        )
+    else:
+        agent = "no-agent"
+    prefix = f"[{agent}] > "
+    room = max(1, width - len(prefix) - 2)
+    before = fleet_display_cell(prompt[:cursor])
+    after = fleet_display_cell(prompt[cursor:])
+    left_room = min(len(before), max(room // 2, room - len(after) - 1))
+    visible_before = before[-left_room:] if left_room else ""
+    if len(before) > len(visible_before) and room > 1:
+        visible_before = "…" + visible_before[1:]
+    after_room = max(0, room - len(visible_before) - 1)
+    visible_after = after[:after_room]
+    return f"\033[1m[{agent}]\033[0m > {visible_before}▏{visible_after}"
+
+
+def hub_draw(
+    tasks: Sequence[Task],
+    selected: int,
+    presets: Sequence[dict[str, object]],
+    agent_index: int,
+    prompt: str,
+    cursor: int,
+    notice: str,
+) -> None:
+    width, height = shutil.get_terminal_size((80, 24))
+    width = max(24, width)
+    height = max(12, height)
+    preset = presets[agent_index] if presets else None
+    agents = " / ".join(str(item["name"]) for item in presets) or "no presets"
+    rows = [hub_task_line(task) for task in tasks]
+    rows.append("+  New session")
+    selected = max(0, min(selected, len(rows) - 1))
+    body_height = max(1, height - 9)
+    start = max(0, min(selected - body_height // 2, len(rows) - body_height))
+    visible = rows[start : start + body_height]
+    lines = [
+        "\033[1mCLI LANE\033[0m",
+        fleet_display_cell(
+            "This clilane server · LOCAL terminal · BOT OpenClaw/automation", width
+        ),
+        fleet_display_cell(
+            f"   {'JOB':<22} {'AGENT':<12} {'STATE':<12} "
+            f"{'AGE':>4}  {'ORIGIN':<6} PROJECT",
+            width,
+        ),
+    ]
+    for offset, row in enumerate(visible, start=start):
+        cleaned = fleet_display_cell(row, max(1, width - 2))
+        padded = f" {cleaned:<{max(1, width - 2)}}"
+        if offset == selected:
+            lines.append(f"\033[7m{padded}\033[0m")
+        else:
+            lines.append(padded)
+    while len(lines) < height - 4:
+        lines.append("")
+    if notice:
+        lines.append(f"\033[1m{fleet_display_cell(notice, width)}\033[0m")
+    else:
+        lines.append("")
+    lines.extend(
+        [
+            hub_composer_line(preset, prompt, cursor, width),
+            fleet_display_cell(
+                f"type message · Tab agent ({agents}) · Enter start · ↑↓ jobs", width
+            ),
+            fleet_display_cell(
+                "empty message: →/Enter view · ←/Ctrl-Q detach", width
+            ),
+        ]
+    )
+    sys.stdout.write("\033[H\033[2J" + "\r\n".join(lines[:height]))
+    sys.stdout.flush()
+
+
+def hub_ui(client: str, source: str, context: str) -> int:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise CliLaneError("the session switcher needs an interactive terminal")
+    if not hub_client_exists(client):
+        raise CliLaneError("the clilane client is no longer attached")
+    data = hub_context_data(context)
+    config = str(data["config"])
+    presets = hub_composer_presets(
+        load_hub_presets(config, allow_missing=not bool(data["config_required"]))
+    )
+    tasks = hub_task_order(list_tasks())
+    source_task = next((task for task in tasks if task.session == source), None)
+    selected_key = source_task.id if source_task else (tasks[0].id if tasks else "")
+    agent_index = 0
+    if source_task:
+        exact_indices = [
+            index
+            for index, preset in enumerate(presets)
+            if list(preset["command"]) == source_task.command
+            and Path(str(preset["dir"])).resolve() == Path(source_task.cwd).resolve()
+        ]
+        named_indices = [
+            index
+            for index in exact_indices
+            if source_task.name == str(presets[index]["name"])
+            or source_task.name.startswith(f"{presets[index]['name']}-")
+        ]
+        named_index = max(
+            named_indices,
+            key=lambda index: len(str(presets[index]["name"])),
+            default=None,
+        )
+        source_kind = hub_preset_kind(
+            {"name": "", "command": source_task.command, "dir": source_task.cwd}
+        )
+        if named_index is not None:
+            agent_index = named_index
+        elif exact_indices:
+            agent_index = exact_indices[0]
+        elif source_kind is not None:
+            agent_index = next(
+                (
+                    index
+                    for index, preset in enumerate(presets)
+                    if hub_preset_kind(preset) == source_kind
+                ),
+                0,
+            )
+    prompt = ""
+    cursor = 0
+    notice = str(data["environment_error"])
+    descriptor = sys.stdin.fileno()
+    previous = termios.tcgetattr(descriptor)
+    try:
+        tty.setraw(descriptor)
+        sys.stdout.write("\033[?1049h\033[?25l\033[?2004h")
+        sys.stdout.flush()
+        while True:
+            tasks = hub_task_order(list_tasks())
+            item_keys = [task.id for task in tasks] + [""]
+            if selected_key not in item_keys:
+                selected_key = ""
+            selected = item_keys.index(selected_key)
+            item_count = len(item_keys)
+            preset = presets[agent_index] if presets else None
+            hub_draw(tasks, selected, presets, agent_index, prompt, cursor, notice)
+            event = hub_key(descriptor)
+            if event is None:
+                continue
+            notice = ""
+            key, text_value = event
+            if key == "up":
+                selected = (selected - 1) % max(1, item_count)
+                selected_key = item_keys[selected]
+                continue
+            if key == "down":
+                selected = (selected + 1) % max(1, item_count)
+                selected_key = item_keys[selected]
+                continue
+            if key == "quit":
+                forget_hub_client(client, context)
+                tmux(["detach-client", "-t", client], check=False)
+                return 0
+            if key == "left":
+                if prompt:
+                    cursor = max(0, cursor - 1)
+                    continue
+                forget_hub_client(client, context)
+                tmux(["detach-client", "-t", client], check=False)
+                return 0
+            if key == "right" and prompt:
+                cursor = min(len(prompt), cursor + 1)
+                continue
+            if key in {"tab", "backtab"}:
+                if presets:
+                    direction = -1 if key == "backtab" else 1
+                    agent_index = (agent_index + direction) % len(presets)
+                else:
+                    notice = f"Add agent presets to {config}"
+                continue
+            if key == "clear":
+                prompt = ""
+                cursor = 0
+                continue
+            if key == "backspace":
+                if cursor:
+                    prompt = prompt[: cursor - 1] + prompt[cursor:]
+                    cursor -= 1
+                continue
+            if key == "text":
+                available = HUB_PROMPT_MAX_CHARS - len(prompt)
+                inserted = text_value[:available]
+                prompt = prompt[:cursor] + inserted + prompt[cursor:]
+                cursor += len(inserted)
+                if len(text_value) > available:
+                    notice = f"Message limited to {HUB_PROMPT_MAX_CHARS} characters"
+                continue
+            if key not in {"enter", "right"}:
+                continue
+            if not prompt:
+                if selected < len(tasks):
+                    tmux(
+                        ["switch-client", "-c", client, "-t", tasks[selected].session]
+                    )
+                    return 0
+                notice = "Type a message to start a new session"
+                continue
+            if preset is None:
+                notice = f"Add agent presets to {config}"
+                continue
+            name = hub_task_name(preset, tasks)
+            hub_draw(
+                tasks,
+                selected,
+                presets,
+                agent_index,
+                prompt,
+                cursor,
+                f"Starting {name}…",
+            )
+            try:
+                task = launch_hub_preset(preset, name, context, prompt)
+            except CliLaneError as error:
+                notice = str(error)
+                continue
+            tmux(["switch-client", "-c", client, "-t", task.session])
+            return 0
+    finally:
+        with suppress(termios.error):
+            termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
+        with suppress(OSError):
+            sys.stdout.write("\033[?2004l\033[?25h\033[?1049l")
+            sys.stdout.flush()
 
 
 def portable_environment() -> dict[str, str]:
@@ -2436,59 +3073,25 @@ def portable_environment() -> dict[str, str]:
     }
 
 
-def capture_hub_environment() -> None:
-    encoded = encode_meta(dict(portable_environment()))
-    if len(encoded) > HUB_ENV_MAX_BYTES:
-        raise CliLaneError("the environment is too large to hand to the hub")
-    tmux(["set-option", "-g", HUB_ENV_OPTION, encoded])
-
-
-def adopt_hub_environment() -> None:
-    encoded = tmux(["show-options", "-gqv", HUB_ENV_OPTION]).stdout.decode().strip()
-    if not encoded:
-        raise CliLaneError(
-            f"the hub has no recorded environment; start it again with {PROGRAM} hub"
-        )
-    decoded = decode_meta(encoded)
+def adopt_hub_environment(context: str) -> None:
+    decoded = hub_context_data(context)
+    error = str(decoded["environment_error"])
+    environment = decoded["environment"]
+    if error or environment is None:
+        raise CliLaneError(error or "the session launch environment is unavailable")
+    if not isinstance(environment, dict):
+        raise CliLaneError("corrupt session switcher context")
     pinned = {
         key: value
         for key, value in os.environ.items()
         if key in {"CLILANE_TMUX_SOCKET", "CLILANE_STATE_HOME", "TMUX_TMPDIR"}
     }
     adopted = {
-        key: value for key, value in decoded.items() if isinstance(value, str)
+        key: value for key, value in environment.items() if isinstance(value, str)
     }
     os.environ.clear()
     os.environ.update(adopted)
     os.environ.update(pinned)
-
-
-def hub_ensure(client: str) -> int:
-    ensure_hub_session()
-    tmux(["switch-client", "-c", client, "-t", HUB_SESSION])
-    return 0
-
-
-def hub_run(configured: str, index_text: str, client: str, slot: str) -> int:
-    if not HUB_SLOT_PATTERN.fullmatch(slot):
-        raise CliLaneError("invalid hub name slot")
-    presets = load_hub_presets(configured)
-    index = optional_int(index_text)
-    if index is None or not 0 <= index < len(presets):
-        raise CliLaneError("unknown hub preset")
-    name = tmux(["show-options", "-gqv", slot]).stdout.decode(errors="replace").strip()
-    tmux(["set-option", "-gu", slot], check=False)
-    if not name:
-        raise CliLaneError("no task name was given")
-    preset = presets[index]
-    try:
-        adopt_hub_environment()
-        task = run_task(name, str(preset["dir"]), list(preset["command"]))
-    except CliLaneError as error:
-        tmux(["display-message", "-c", client, f"{PROGRAM}: {error}"], check=False)
-        raise
-    tmux(["display-message", "-c", client, f"created {task.name}"], check=False)
-    return 0
 
 
 def ensure_hub_session() -> None:
@@ -2524,26 +3127,39 @@ def ensure_hub_session() -> None:
             "-t",
             HUB_SESSION,
             "status-right",
-            " M-n menu  M-h hub  C-q detach ",
+            " C-q switcher ",
         ]
     )
+    tmux(["set-option", "-t", HUB_SESSION, "status-left", " CLI LANE "])
+    tmux(["set-option", "-t", HUB_SESSION, "status-left-length", "20"])
 
 
 def hub_command(configured: str | None) -> int:
-    config = hub_config_path(configured)
     load_hub_presets(configured)
     ensure_server_available()
     ensure_hub_session()
-    capture_hub_environment()
-    bind_detach_key()
-    bind_hub_keys(config)
+    context = create_hub_context(configured)
+    bind_hub_keys()
     environment = os.environ.copy()
     environment.pop("TMUX", None)
     environment.pop("TMUX_PANE", None)
     binary = tmux_binary()
     os.execvpe(
         binary,
-        [binary, "-L", SOCKET, "-f", "/dev/null", "attach-session", "-t", HUB_SESSION],
+        [
+            binary,
+            "-L",
+            SOCKET,
+            "-f",
+            "/dev/null",
+            "attach-session",
+            "-t",
+            HUB_SESSION,
+            ";",
+            "run-shell",
+            "-b",
+            hub_open_command(context),
+        ],
         environment,
     )
     return 1
@@ -2583,7 +3199,7 @@ def live_task(target: str) -> Task:
     return task
 
 
-def send_task(target: str, message: str, enter: bool) -> int:
+def validate_message_text(message: str) -> None:
     if not message:
         raise CliLaneError(
             f"message is empty; use '{PROGRAM} key TARGET Enter' to press a key"
@@ -2602,6 +3218,10 @@ def send_task(target: str, message: str, enter: bool) -> int:
             f"message contains control characters ({listed}); they would reach "
             f"the task as raw bytes, not keypresses; use '{PROGRAM} key' instead"
         )
+
+
+def send_task(target: str, message: str, enter: bool) -> int:
+    validate_message_text(message)
     with registry_lock():
         task = live_task(target)
         buffer_name = f"agt_{uuid.uuid4().hex}"
@@ -3036,6 +3656,7 @@ def parser() -> argparse.ArgumentParser:
             "configured fleet."
         ),
         epilog="""examples:
+  clilane
   clilane run codex-app -C ~/projects/sample-app -- codex
   clilane run kimi-research -C ~/projects/research -- kimi
   clilane list
@@ -3043,11 +3664,12 @@ def parser() -> argparse.ArgumentParser:
   clilane status codex-app
   clilane attach codex-app
 
-Only tasks started through clilane appear. Press Ctrl-Q to detach from a task.""",
+Only tasks started through clilane appear. Press Ctrl-Q in an agent to return to
+the switcher.""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     root.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
-    commands = root.add_subparsers(dest="action", required=True)
+    commands = root.add_subparsers(dest="action")
 
     run = commands.add_parser(
         "run",
@@ -3142,9 +3764,9 @@ Only tasks started through clilane appear. Press Ctrl-Q to detach from a task.""
     status.add_argument("--json", action="store_true", help="emit JSON")
 
     attach = commands.add_parser("attach", help="attach to a task interactively")
-    attach.add_argument("target", help="task name or ID prefix; Ctrl-Q detaches")
+    attach.add_argument("target", help="task name or ID prefix; Ctrl-Q opens switcher")
 
-    hub = commands.add_parser("hub", help="attach to the hub: all agents in one view")
+    hub = commands.add_parser("hub", help="open the native session switcher")
     hub.add_argument(
         "--config",
         help=(
@@ -3237,6 +3859,8 @@ Only tasks started through clilane appear. Press Ctrl-Q to detach from a task.""
 
 
 def execute(arguments: argparse.Namespace) -> int:
+    if arguments.action is None:
+        return hub_command(None)
     if arguments.action == "run":
         spec = run_spec(arguments.cwd, arguments.on_exit, arguments.command)
         wait = arguments.wait or spec.wait
@@ -3333,12 +3957,14 @@ def main() -> int:
     try:
         if len(sys.argv) == 3 and sys.argv[1] == "__supervise":
             return supervise(sys.argv[2])
-        if len(sys.argv) == 3 and sys.argv[1] == "__hub-ensure":
-            return hub_ensure(sys.argv[2])
-        if len(sys.argv) == 4 and sys.argv[1] == "__hub-menu":
-            return hub_menu(sys.argv[2], sys.argv[3])
-        if len(sys.argv) == 6 and sys.argv[1] == "__hub-run":
-            return hub_run(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
+        if len(sys.argv) == 5 and sys.argv[1] == "__hub-register":
+            return hub_register(sys.argv[2], sys.argv[3], sys.argv[4])
+        if len(sys.argv) == 6 and sys.argv[1] == "__hub-forget":
+            return hub_forget(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
+        if len(sys.argv) == 6 and sys.argv[1] == "__hub-open":
+            return hub_open(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
+        if len(sys.argv) == 5 and sys.argv[1] == "__hub-ui":
+            return hub_ui(sys.argv[2], sys.argv[3], sys.argv[4])
         if len(sys.argv) == 5 and sys.argv[1] == "__log":
             max_bytes = optional_int(sys.argv[3])
             if max_bytes is None:
