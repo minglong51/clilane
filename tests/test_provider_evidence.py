@@ -7,10 +7,13 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import Any
@@ -25,6 +28,21 @@ if SPEC is None or SPEC.loader is None:
 provider_evidence = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = provider_evidence
 SPEC.loader.exec_module(provider_evidence)
+
+CAPTURE_ENGINE_PATH = ROOT / "scripts/provider_capture.py"
+CAPTURE_SPEC = importlib.util.spec_from_file_location(
+    "provider_capture", CAPTURE_ENGINE_PATH
+)
+if CAPTURE_SPEC is None or CAPTURE_SPEC.loader is None:
+    raise RuntimeError(f"cannot load {CAPTURE_ENGINE_PATH}")
+provider_capture = importlib.util.module_from_spec(CAPTURE_SPEC)
+sys.modules[CAPTURE_SPEC.name] = provider_capture
+CAPTURE_SPEC.loader.exec_module(provider_capture)
+
+COLLECTOR_SCRIPTS = {
+    provider: ROOT / f"scripts/collect_{provider}_evidence.py"
+    for provider in ("claude", "codex", "kimi")
+}
 
 EXPECTED_PROVIDERS = ("claude", "codex", "kimi")
 EXPECTED_EVENT_KINDS = (
@@ -55,6 +73,84 @@ T7_ARTIFACTS = (
     ROOT / "tests/fixtures/provider-evidence/synthetic.jsonl",
     ROOT / "docs/designs/provider-capabilities.json",
 )
+
+
+def write_fake_provider(
+    directory: Path,
+    provider: str,
+    command_source: str = "",
+    *,
+    version_output: bytes | None = None,
+) -> Path:
+    spec = provider_capture.PROVIDER_SPECS[provider]
+    selected_version = spec.version_outputs[0] if version_output is None else version_output
+    executable = directory / f"fake-{provider}"
+    source = (
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "import signal\n"
+        "import subprocess\n"
+        "import sys\n"
+        "import time\n"
+        f"version_output = {selected_version!r}\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        "    if os.getcwd() != '/':\n"
+        "        raise SystemExit(93)\n"
+        "    os.write(1, version_output)\n"
+        "    raise SystemExit(0)\n"
+        f"if sys.argv[1:] != {list(spec.command)!r}:\n"
+        "    raise SystemExit(91)\n"
+        f"{command_source}"
+    )
+    executable.write_text(source, encoding="utf-8")
+    executable.chmod(0o755)
+    return executable
+
+
+def run_collector(
+    provider: str,
+    capture_root: Path,
+    capture_id: str,
+    executable: Path,
+    payload: bytes = b"",
+    *,
+    per_capture_bytes: int = 1 << 20,
+    aggregate_bytes: int = 1 << 21,
+    timeout_seconds: int = 3,
+) -> subprocess.CompletedProcess[bytes]:
+    environment = os.environ.copy()
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    return subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            str(COLLECTOR_SCRIPTS[provider]),
+            "--capture-root",
+            str(capture_root),
+            "--capture-id",
+            capture_id,
+            "--per-capture-bytes",
+            str(per_capture_bytes),
+            "--aggregate-bytes",
+            str(aggregate_bytes),
+            "--timeout-seconds",
+            str(timeout_seconds),
+            "--provider-executable",
+            str(executable),
+        ],
+        cwd=ROOT,
+        input=payload,
+        capture_output=True,
+        check=False,
+        env=environment,
+        timeout=15,
+    )
+
+
+def read_receipt(capture_root: Path, capture_id: str) -> dict[str, Any]:
+    return json.loads(
+        (capture_root / f"{capture_id}.receipt.json").read_text(encoding="utf-8")
+    )
 
 
 def make_row(
@@ -168,12 +264,18 @@ def validate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def tree_snapshot(root: Path) -> dict[str, tuple[int, int, str]]:
     result: dict[str, tuple[int, int, str]] = {}
-    for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_file()):
-        metadata = path.stat()
+    for path in sorted(root.rglob("*")):
+        metadata = path.lstat()
+        if stat.S_ISREG(metadata.st_mode):
+            payload = hashlib.sha256(path.read_bytes()).hexdigest()
+        elif stat.S_ISLNK(metadata.st_mode):
+            payload = f"symlink:{os.readlink(path)}"
+        else:
+            payload = f"type:{stat.S_IFMT(metadata.st_mode)}"
         result[str(path.relative_to(root))] = (
             stat.S_IMODE(metadata.st_mode),
             metadata.st_mtime_ns,
-            hashlib.sha256(path.read_bytes()).hexdigest(),
+            payload,
         )
     return result
 
@@ -771,6 +873,1293 @@ class CheckArtifactTests(unittest.TestCase):
 
     def test_provider_evidence_script_imports_only_standard_library_modules(self) -> None:
         tree = ast.parse(SCRIPT_PATH.read_text(encoding="utf-8"))
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name.split(".", 1)[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                imported.add(node.module.split(".", 1)[0])
+        allowed = set(sys.stdlib_module_names) | {"__future__"}
+        self.assertEqual(imported - allowed, set())
+
+
+class ProviderCollectorTests(unittest.TestCase):
+    def test_all_entrypoints_capture_fixed_binary_streams_without_repo_writes(
+        self,
+    ) -> None:
+        before = tree_snapshot(ROOT)
+        payload = b"input-\x00-\xff"
+        command_source = (
+            "if os.getcwd() != '/':\n"
+            "    raise SystemExit(92)\n"
+            "payload = sys.stdin.buffer.read()\n"
+            "os.write(2, b'error-\\x00-\\xff')\n"
+            "os.write(1, b'output-\\x00-')\n"
+            "os.write(1, payload)\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            for provider in EXPECTED_PROVIDERS:
+                with self.subTest(provider=provider):
+                    capture_root = base / f"capture-{provider}"
+                    capture_root.mkdir(mode=0o700)
+                    executable = write_fake_provider(
+                        base,
+                        provider,
+                        "" if provider == "claude" else command_source,
+                    )
+                    capture_id = f"capture-{provider}-roundtrip"
+                    completed = run_collector(
+                        provider,
+                        capture_root,
+                        capture_id,
+                        executable,
+                        payload,
+                    )
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    expected_stdout = (
+                        b"" if provider == "claude" else b"output-\x00-" + payload
+                    )
+                    self.assertEqual(completed.stdout, expected_stdout)
+                    self.assertEqual(completed.stderr, b"")
+                    capture_path = capture_root / f"{capture_id}.capture"
+                    receipt_path = capture_root / f"{capture_id}.receipt.json"
+                    raw = capture_path.read_bytes()
+                    receipt = read_receipt(capture_root, capture_id)
+                    frames = list(
+                        provider_capture.iter_capture_frames(io.BytesIO(raw))
+                    )
+                    streams = {
+                        stream: b"".join(
+                            frame_payload
+                            for frame_stream, _observed_ns, frame_payload in frames
+                            if frame_stream == stream
+                        )
+                        for stream in ("I", "O", "E")
+                    }
+                    self.assertEqual(streams["I"], payload)
+                    self.assertEqual(
+                        streams["O"], b"" if provider == "claude" else expected_stdout
+                    )
+                    self.assertEqual(
+                        streams["E"],
+                        b"" if provider == "claude" else b"error-\x00-\xff",
+                    )
+                    self.assertEqual(receipt["provider"], provider)
+                    self.assertEqual(
+                        receipt["source_interface"],
+                        provider_capture.PROVIDER_SPECS[provider].source_interface,
+                    )
+                    self.assertEqual(receipt["capture_status"], "complete")
+                    self.assertEqual(receipt["provider_outcome"], "unknown")
+                    self.assertEqual(receipt["incomplete_reasons"], [])
+                    self.assertIs(receipt["capture_present"], True)
+                    self.assertEqual(
+                        receipt["source_capture_sha256"], hashlib.sha256(raw).hexdigest()
+                    )
+                    self.assertEqual(receipt["frame_count"], len(frames))
+                    self.assertEqual(stat.S_IMODE(capture_path.stat().st_mode), 0o600)
+                    self.assertEqual(stat.S_IMODE(receipt_path.stat().st_mode), 0o600)
+                    self.assertFalse((capture_root / f"{capture_id}.receipt.tmp").exists())
+                    receipt_bytes = receipt_path.read_bytes()
+                    self.assertNotIn(str(capture_root).encode(), receipt_bytes)
+                    self.assertNotIn(str(executable).encode(), receipt_bytes)
+                    self.assertNotIn(payload, receipt_bytes)
+        self.assertEqual(tree_snapshot(ROOT), before)
+        self.assertFalse((ROOT / "scripts/__pycache__").exists())
+
+    def test_root_rejection_precedes_executable_resolution_and_is_inode_based(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            repository = base / "repository"
+            git_dir = base / "git-dir"
+            repository.mkdir()
+            git_dir.mkdir()
+            paths = provider_capture.RepositoryPaths(repository, git_dir)
+            nested = repository / "private-capture"
+            nested.mkdir(mode=0o700)
+            ancestor = base / "ancestor"
+            ancestor.mkdir(mode=0o700)
+            nested_repository = ancestor / "nested-repository"
+            nested_repository.mkdir()
+            wrong_mode = base / "wrong-mode"
+            wrong_mode.mkdir(mode=0o755)
+            safe = base / "safe"
+            safe.mkdir(mode=0o700)
+            symlink = base / "safe-link"
+            symlink.symlink_to(safe, target_is_directory=True)
+
+            with self.assertRaises(provider_capture.CaptureError):
+                provider_capture.validate_capture_root(nested, paths)
+            with self.assertRaises(provider_capture.CaptureError):
+                provider_capture.validate_capture_root(
+                    ancestor,
+                    provider_capture.RepositoryPaths(nested_repository, git_dir),
+                )
+            with self.assertRaises(provider_capture.CaptureError):
+                provider_capture.validate_capture_root(wrong_mode, paths)
+            with self.assertRaises(provider_capture.CaptureError):
+                provider_capture.validate_capture_root(symlink, paths)
+
+            with mock.patch.object(provider_capture, "resolve_executable") as resolver:
+                with self.assertRaises(provider_capture.CaptureError):
+                    provider_capture.collect(
+                        provider_capture.PROVIDER_SPECS["claude"],
+                        wrong_mode,
+                        "capture-preflight",
+                        4096,
+                        8192,
+                        1,
+                        None,
+                        io.BytesIO(b"private"),
+                        io.BytesIO(),
+                        paths,
+                    )
+            resolver.assert_not_called()
+            self.assertEqual(tuple(wrong_mode.iterdir()), ())
+
+            root = provider_capture.validate_capture_root(safe, paths)
+            root.close()
+
+            race = base / "race"
+            race.mkdir(mode=0o700)
+
+            def mutate_root(
+                _spec: Any,
+                _override: Any,
+                _cwd: Any,
+                _root: Any,
+                _required_capture_bytes: Any,
+            ) -> Any:
+                race.chmod(0o755)
+                return mock.sentinel.identity
+
+            try:
+                with mock.patch.object(
+                    provider_capture,
+                    "resolve_executable",
+                    side_effect=mutate_root,
+                ):
+                    with self.assertRaises(provider_capture.CaptureError):
+                        provider_capture.collect(
+                            provider_capture.PROVIDER_SPECS["claude"],
+                            race,
+                            "capture-root-race",
+                            4096,
+                            8192,
+                            1,
+                            None,
+                            io.BytesIO(b"private"),
+                            io.BytesIO(),
+                            paths,
+                        )
+            finally:
+                race.chmod(0o700)
+            self.assertFalse((race / "capture-root-race.capture").exists())
+            self.assertFalse((race / "capture-root-race.receipt.json").exists())
+
+    def test_root_moved_into_repository_rolls_back_private_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            repository = base / "repository"
+            git_dir = base / "git-dir"
+            capture_root = base / "capture"
+            repository.mkdir()
+            git_dir.mkdir()
+            capture_root.mkdir(mode=0o700)
+            moved_root = repository / "moved-capture"
+            executable = write_fake_provider(base, "claude")
+            original_capture_stdin = provider_capture.capture_stdin
+
+            def move_then_capture(*args: Any, **kwargs: Any) -> Any:
+                capture_root.rename(moved_root)
+                return original_capture_stdin(*args, **kwargs)
+
+            with mock.patch.object(
+                provider_capture,
+                "capture_stdin",
+                side_effect=move_then_capture,
+            ):
+                with self.assertRaisesRegex(
+                    provider_capture.CaptureError,
+                    "capture-root-changed",
+                ):
+                    provider_capture.collect(
+                        provider_capture.PROVIDER_SPECS["claude"],
+                        capture_root,
+                        "capture-root-move",
+                        4096,
+                        8192,
+                        1,
+                        str(executable),
+                        io.BytesIO(b"private-root-race"),
+                        io.BytesIO(),
+                        provider_capture.RepositoryPaths(repository, git_dir),
+                    )
+            self.assertFalse((moved_root / "capture-root-move.capture").exists())
+            self.assertFalse(
+                (moved_root / "capture-root-move.receipt.json").exists()
+            )
+            for path in moved_root.iterdir():
+                if path.is_file():
+                    self.assertNotIn(b"private-root-race", path.read_bytes())
+
+    def test_budget_validation_and_fd_bound_free_space_boundaries(self) -> None:
+        invalid = (
+            (True, 2, 1),
+            (0, 1, 1),
+            (2, 1, 1),
+            (1, 1, 0),
+            (1, 1, provider_capture.MAX_TIMEOUT_SECONDS + 1),
+            (provider_capture.MAX_BUDGET_BYTES + 1, provider_capture.MAX_BUDGET_BYTES + 1, 1),
+        )
+        for per_capture, aggregate, timeout in invalid:
+            with self.subTest(
+                per_capture=per_capture, aggregate=aggregate, timeout=timeout
+            ):
+                with self.assertRaises(provider_capture.CaptureError):
+                    provider_capture.validate_request(
+                        "capture-budget", per_capture, aggregate, timeout
+                    )
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            capture_root = base / "capture"
+            repository = base / "repository"
+            git_dir = base / "git"
+            capture_root.mkdir(mode=0o700)
+            repository.mkdir()
+            git_dir.mkdir()
+            root = provider_capture.validate_capture_root(
+                capture_root,
+                provider_capture.RepositoryPaths(repository, git_dir),
+            )
+            provider_capture._lock_root(root)
+            limit = 4096
+            one_short = mock.Mock(
+                f_frsize=1,
+                f_bsize=1,
+                f_bavail=limit + provider_capture.MAX_RECEIPT_BYTES - 1,
+            )
+            with mock.patch.object(provider_capture.os, "fstatvfs", return_value=one_short):
+                with self.assertRaises(provider_capture.CaptureError):
+                    provider_capture.reserve_capture(
+                        root, "capture-space-short", limit, limit * 2
+                    )
+            self.assertEqual(
+                {path.name for path in capture_root.iterdir()},
+                {".clilane-provider-capture.lock"},
+            )
+            exact = mock.Mock(
+                f_frsize=1,
+                f_bsize=1,
+                f_bavail=limit + provider_capture.MAX_RECEIPT_BYTES,
+            )
+            with mock.patch.object(provider_capture.os, "fstatvfs", return_value=exact):
+                descriptor, selected_limit, reasons = provider_capture.reserve_capture(
+                    root, "capture-space-exact", limit, limit * 2
+                )
+            os.close(descriptor)
+            self.assertEqual(selected_limit, limit)
+            self.assertEqual(reasons, ("per_capture_budget",))
+            root.close()
+
+    def test_exact_and_overflow_caps_are_parseable_incomplete_unknown(self) -> None:
+        payload = b"exact-cap-payload"
+        limit = (
+            len(provider_capture.CAPTURE_MAGIC)
+            + provider_capture.FRAME_HEADER.size
+            + len(payload)
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            executable = write_fake_provider(base, "claude")
+            for suffix, selected_payload in (("exact", payload), ("over", payload + b"x")):
+                with self.subTest(suffix=suffix):
+                    capture_root = base / suffix
+                    capture_root.mkdir(mode=0o700)
+                    capture_id = f"capture-cap-{suffix}"
+                    completed = run_collector(
+                        "claude",
+                        capture_root,
+                        capture_id,
+                        executable,
+                        selected_payload,
+                        per_capture_bytes=limit,
+                        aggregate_bytes=limit + 1024,
+                    )
+                    self.assertEqual(completed.returncode, 3, completed.stderr)
+                    raw = (capture_root / f"{capture_id}.capture").read_bytes()
+                    receipt = read_receipt(capture_root, capture_id)
+                    frames = list(
+                        provider_capture.iter_capture_frames(io.BytesIO(raw))
+                    )
+                    self.assertEqual(len(raw), limit)
+                    self.assertEqual(frames[0][2], payload)
+                    self.assertEqual(receipt["capture_status"], "incomplete")
+                    self.assertEqual(receipt["provider_outcome"], "unknown")
+                    self.assertEqual(
+                        receipt["incomplete_reasons"], ["per_capture_budget"]
+                    )
+                    self.assertEqual(
+                        receipt["source_capture_sha256"], hashlib.sha256(raw).hexdigest()
+                    )
+
+    def test_subframe_and_exact_magic_budgets_have_explicit_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            executable = write_fake_provider(base, "claude")
+            for limit in (1, len(provider_capture.CAPTURE_MAGIC) - 1):
+                with self.subTest(limit=limit):
+                    capture_root = base / f"capture-{limit}"
+                    capture_root.mkdir(mode=0o700)
+                    capture_id = f"capture-budget-{limit}"
+                    completed = run_collector(
+                        "claude",
+                        capture_root,
+                        capture_id,
+                        executable,
+                        b"private",
+                        per_capture_bytes=limit,
+                        aggregate_bytes=limit,
+                    )
+                    self.assertEqual(completed.returncode, 3, completed.stderr)
+                    receipt = read_receipt(capture_root, capture_id)
+                    self.assertIs(receipt["capture_present"], False)
+                    self.assertIsNone(receipt["source_capture_sha256"])
+                    self.assertEqual(
+                        receipt["incomplete_reasons"],
+                        ["per_capture_budget", "aggregate_budget"],
+                    )
+                    self.assertFalse(
+                        (capture_root / f"{capture_id}.capture").exists()
+                    )
+
+            limit = len(provider_capture.CAPTURE_MAGIC)
+            capture_root = base / "capture-magic"
+            capture_root.mkdir(mode=0o700)
+            capture_id = "capture-budget-magic"
+            completed = run_collector(
+                "claude",
+                capture_root,
+                capture_id,
+                executable,
+                b"private",
+                per_capture_bytes=limit,
+                aggregate_bytes=limit,
+            )
+            self.assertEqual(completed.returncode, 3, completed.stderr)
+            raw = (capture_root / f"{capture_id}.capture").read_bytes()
+            receipt = read_receipt(capture_root, capture_id)
+            self.assertEqual(raw, provider_capture.CAPTURE_MAGIC)
+            self.assertEqual(
+                list(provider_capture.iter_capture_frames(io.BytesIO(raw))),
+                [],
+            )
+            self.assertIs(receipt["capture_present"], True)
+            self.assertEqual(
+                receipt["source_capture_sha256"], hashlib.sha256(raw).hexdigest()
+            )
+            self.assertEqual(
+                receipt["incomplete_reasons"],
+                ["per_capture_budget", "aggregate_budget"],
+            )
+
+    def test_existing_capture_bytes_enforce_the_aggregate_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            capture_root = base / "capture"
+            capture_root.mkdir(mode=0o700)
+            existing = capture_root / "existing.capture"
+            existing.write_bytes(b"x" * 80)
+            existing.chmod(0o600)
+            executable = write_fake_provider(base, "claude")
+            completed = run_collector(
+                "claude",
+                capture_root,
+                "capture-aggregate",
+                executable,
+                b"y" * 1024,
+                per_capture_bytes=256,
+                aggregate_bytes=296,
+            )
+            self.assertEqual(completed.returncode, 3, completed.stderr)
+            receipt = read_receipt(capture_root, "capture-aggregate")
+            self.assertEqual(receipt["budgets"]["capture_limit_bytes"], 216)
+            self.assertEqual(receipt["incomplete_reasons"], ["aggregate_budget"])
+            total = sum(path.stat().st_size for path in capture_root.glob("*.capture"))
+            self.assertLessEqual(total, 296)
+
+            exhausted = run_collector(
+                "claude",
+                capture_root,
+                "capture-aggregate-exhausted",
+                executable,
+                b"private-payload",
+                per_capture_bytes=256,
+                aggregate_bytes=296,
+            )
+            self.assertEqual(exhausted.returncode, 3, exhausted.stderr)
+            exhausted_receipt = read_receipt(
+                capture_root, "capture-aggregate-exhausted"
+            )
+            self.assertIs(exhausted_receipt["capture_present"], False)
+            self.assertIsNone(exhausted_receipt["source_capture_sha256"])
+            self.assertEqual(exhausted_receipt["capture_bytes"], 0)
+            self.assertEqual(
+                exhausted_receipt["incomplete_reasons"], ["aggregate_budget"]
+            )
+            self.assertFalse(
+                (capture_root / "capture-aggregate-exhausted.capture").exists()
+            )
+
+            external = base / "external-capture"
+            external.write_bytes(b"external")
+            external.chmod(0o600)
+            os.link(external, capture_root / "linked.capture")
+            rejected = run_collector(
+                "claude",
+                capture_root,
+                "capture-linked-inventory",
+                executable,
+                b"private",
+                per_capture_bytes=256,
+                aggregate_bytes=1024,
+            )
+            self.assertEqual(rejected.returncode, 1)
+            self.assertEqual(
+                rejected.stderr,
+                b"collect_claude_evidence: capture-inventory-unsafe\n",
+            )
+            self.assertEqual(external.read_bytes(), b"external")
+            self.assertFalse(
+                (capture_root / "capture-linked-inventory.capture").exists()
+            )
+
+    def test_provider_failure_remains_complete_evidence_with_unknown_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            capture_root = base / "capture"
+            capture_root.mkdir(mode=0o700)
+            executable = write_fake_provider(base, "kimi", "raise SystemExit(7)\n")
+            completed = run_collector(
+                "kimi", capture_root, "capture-provider-failure", executable
+            )
+            self.assertEqual(completed.returncode, 4, completed.stderr)
+            receipt = read_receipt(capture_root, "capture-provider-failure")
+            self.assertEqual(receipt["capture_status"], "complete")
+            self.assertEqual(receipt["provider_outcome"], "unknown")
+            self.assertEqual(receipt["termination"]["reason"], "provider_exit")
+            self.assertEqual(receipt["termination"]["exit_code"], 7)
+
+    def test_timeout_kills_descendant_after_leader_exit_and_commits_receipt(self) -> None:
+        command_source = (
+            "child = os.fork()\n"
+            "if child == 0:\n"
+            "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "    time.sleep(30)\n"
+            "    os._exit(0)\n"
+            "os.write(1, str(child).encode('ascii') + b'\\n')\n"
+            "os._exit(0)\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            capture_root = base / "capture"
+            capture_root.mkdir(mode=0o700)
+            executable = write_fake_provider(base, "codex", command_source)
+            started = time.monotonic()
+            completed = run_collector(
+                "codex",
+                capture_root,
+                "capture-descendant-timeout",
+                executable,
+                timeout_seconds=1,
+            )
+            elapsed = time.monotonic() - started
+            self.assertEqual(completed.returncode, 3, completed.stderr)
+            self.assertLess(elapsed, 6)
+            descendant = int(completed.stdout.strip())
+            try:
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(descendant, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.02)
+                else:
+                    self.fail("provider descendant survived bounded cleanup")
+            finally:
+                try:
+                    os.kill(descendant, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            receipt = read_receipt(capture_root, "capture-descendant-timeout")
+            self.assertEqual(receipt["capture_status"], "incomplete")
+            self.assertEqual(receipt["incomplete_reasons"], ["timeout"])
+            self.assertEqual(receipt["termination"]["reason"], "timeout")
+
+    def test_nonreading_provider_cannot_block_stdin_past_timeout(self) -> None:
+        command_source = (
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "os.write(1, str(os.getpid()).encode('ascii') + b'\\n')\n"
+            "time.sleep(30)\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            capture_root = base / "capture"
+            capture_root.mkdir(mode=0o700)
+            executable = write_fake_provider(base, "kimi", command_source)
+            started = time.monotonic()
+            completed = run_collector(
+                "kimi",
+                capture_root,
+                "capture-nonreading-stdin",
+                executable,
+                b"x" * (1 << 20),
+                per_capture_bytes=2 << 20,
+                aggregate_bytes=3 << 20,
+                timeout_seconds=1,
+            )
+            elapsed = time.monotonic() - started
+            self.assertEqual(completed.returncode, 3, completed.stderr)
+            self.assertLess(elapsed, 6)
+            provider_pid = int(completed.stdout.strip())
+            try:
+                os.kill(provider_pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                try:
+                    os.kill(provider_pid, signal.SIGKILL)
+                finally:
+                    self.fail("non-reading provider survived bounded cleanup")
+            receipt = read_receipt(capture_root, "capture-nonreading-stdin")
+            self.assertEqual(receipt["capture_status"], "incomplete")
+            self.assertEqual(receipt["termination"]["reason"], "timeout")
+
+    def test_clean_stdio_does_not_hide_a_live_provider_descendant(self) -> None:
+        command_source = (
+            "child = os.fork()\n"
+            "if child == 0:\n"
+            "    os.close(0)\n"
+            "    os.close(1)\n"
+            "    os.close(2)\n"
+            "    time.sleep(30)\n"
+            "    os._exit(0)\n"
+            "os.write(1, str(child).encode('ascii') + b'\\n')\n"
+            "os._exit(0)\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            capture_root = base / "capture"
+            capture_root.mkdir(mode=0o700)
+            executable = write_fake_provider(base, "kimi", command_source)
+            completed = run_collector(
+                "kimi", capture_root, "capture-hidden-descendant", executable
+            )
+            self.assertEqual(completed.returncode, 3, completed.stderr)
+            descendant = int(completed.stdout.strip())
+            try:
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(descendant, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.02)
+                else:
+                    self.fail("provider descendant survived clean-stdio cleanup")
+            finally:
+                try:
+                    os.kill(descendant, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            receipt = read_receipt(capture_root, "capture-hidden-descendant")
+            self.assertEqual(receipt["capture_status"], "incomplete")
+            self.assertEqual(
+                receipt["incomplete_reasons"], ["descendant_process"]
+            )
+            self.assertEqual(
+                receipt["termination"]["reason"], "descendant_process"
+            )
+
+    def test_version_descendant_is_killed_before_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            capture_root = base / "capture"
+            capture_root.mkdir(mode=0o700)
+            marker = base / "version-child-pid"
+            executable = base / "fake-kimi-version-child"
+            executable.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "import sys\n"
+                "import time\n"
+                "if sys.argv[1:] == ['--version']:\n"
+                "    child = os.fork()\n"
+                "    if child == 0:\n"
+                "        os.close(0)\n"
+                "        os.close(1)\n"
+                "        os.close(2)\n"
+                "        time.sleep(30)\n"
+                "        os._exit(0)\n"
+                f"    with open({str(marker)!r}, 'w', encoding='ascii') as output:\n"
+                "        output.write(str(child))\n"
+                "    os.write(1, b'0.38.0\\n')\n"
+                "    os._exit(0)\n"
+                "raise SystemExit(91)\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            completed = run_collector(
+                "kimi", capture_root, "capture-version-descendant", executable
+            )
+            self.assertEqual(completed.returncode, 1)
+            descendant = int(marker.read_text(encoding="ascii"))
+            try:
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(descendant, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.02)
+                else:
+                    self.fail("version descendant survived cleanup")
+            finally:
+                try:
+                    os.kill(descendant, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            self.assertFalse((capture_root / "capture-version-descendant.capture").exists())
+            self.assertFalse(
+                (capture_root / "capture-version-descendant.receipt.json").exists()
+            )
+
+    def test_external_signal_commits_incomplete_receipt_and_releases_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            capture_root = base / "capture"
+            capture_root.mkdir(mode=0o700)
+            ready = base / "provider-ready"
+            executable = write_fake_provider(
+                base,
+                "kimi",
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                f"with open({str(ready)!r}, 'w', encoding='ascii') as output:\n"
+                "    output.write(str(os.getpid()))\n"
+                "time.sleep(30)\n",
+            )
+            command = [
+                sys.executable,
+                "-B",
+                str(COLLECTOR_SCRIPTS["kimi"]),
+                "--capture-root",
+                str(capture_root),
+                "--capture-id",
+                "capture-signal",
+                "--per-capture-bytes",
+                str(1 << 20),
+                "--aggregate-bytes",
+                str(1 << 21),
+                "--timeout-seconds",
+                "20",
+                "--provider-executable",
+                str(executable),
+            ]
+            environment = os.environ.copy()
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            process = subprocess.Popen(
+                command,
+                cwd=ROOT,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+            )
+            if process.stdin is None:
+                self.fail("collector stdin was not created")
+            process.stdin.close()
+            process.stdin = None
+            try:
+                deadline = time.monotonic() + 5
+                while not ready.exists():
+                    if time.monotonic() >= deadline:
+                        self.fail("provider did not reach its ready handshake")
+                    time.sleep(0.01)
+                provider_pid = int(ready.read_text(encoding="ascii"))
+                started = time.monotonic()
+                process.send_signal(signal.SIGTERM)
+                time.sleep(0.05)
+                process.send_signal(signal.SIGTERM)
+                stdout, stderr = process.communicate(timeout=8)
+                elapsed = time.monotonic() - started
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+            self.assertEqual(process.returncode, 128 + signal.SIGTERM, stderr)
+            self.assertEqual(stdout, b"")
+            self.assertLess(elapsed, 4)
+            receipt = read_receipt(capture_root, "capture-signal")
+            self.assertEqual(receipt["capture_status"], "incomplete")
+            self.assertEqual(receipt["incomplete_reasons"], ["collector_signal"])
+            self.assertEqual(
+                receipt["termination"]["collector_signal"], signal.SIGTERM
+            )
+            try:
+                os.kill(provider_pid, 0)
+            except ProcessLookupError:
+                pass
+            else:
+                try:
+                    os.kill(provider_pid, signal.SIGKILL)
+                finally:
+                    self.fail("provider survived double-signal cleanup")
+            self.assertFalse(
+                (capture_root / "capture-signal.receipt.tmp").exists()
+            )
+
+            replacement = write_fake_provider(
+                base, "kimi", "sys.stdin.buffer.read()\n"
+            )
+            resumed = run_collector(
+                "kimi", capture_root, "capture-after-signal", replacement
+            )
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+
+    def test_signals_at_capture_start_and_finalize_still_commit_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            repository = base / "repository"
+            git_dir = base / "git-dir"
+            repository.mkdir()
+            git_dir.mkdir()
+            paths = provider_capture.RepositoryPaths(repository, git_dir)
+            executable = write_fake_provider(base, "claude")
+            original_start = provider_capture.CaptureWriter.start
+            original_finish = provider_capture.CaptureWriter.finish
+
+            def signal_after_start(writer: Any) -> Any:
+                original_start(writer)
+                raise provider_capture.CollectorSignal(signal.SIGTERM)
+
+            def signal_after_finish(writer: Any) -> Any:
+                result = original_finish(writer)
+                raise provider_capture.CollectorSignal(signal.SIGTERM)
+
+            for suffix, target, replacement in (
+                ("start", "start", signal_after_start),
+                ("finish", "finish", signal_after_finish),
+            ):
+                with self.subTest(suffix=suffix):
+                    capture_root = base / suffix
+                    capture_root.mkdir(mode=0o700)
+                    capture_id = f"capture-signal-{suffix}-window"
+                    with mock.patch.object(
+                        provider_capture.CaptureWriter,
+                        target,
+                        replacement,
+                    ):
+                        result = provider_capture.collect(
+                            provider_capture.PROVIDER_SPECS["claude"],
+                            capture_root,
+                            capture_id,
+                            4096,
+                            8192,
+                            1,
+                            str(executable),
+                            io.BytesIO(b"private"),
+                            io.BytesIO(),
+                            paths,
+                        )
+                    self.assertEqual(result.exit_status, 128 + signal.SIGTERM)
+                    receipt = read_receipt(capture_root, capture_id)
+                    self.assertEqual(receipt["capture_status"], "incomplete")
+                    self.assertEqual(
+                        receipt["incomplete_reasons"], ["collector_signal"]
+                    )
+                    self.assertEqual(
+                        receipt["termination"]["collector_signal"], signal.SIGTERM
+                    )
+                    raw = (capture_root / f"{capture_id}.capture").read_bytes()
+                    list(provider_capture.iter_capture_frames(io.BytesIO(raw)))
+
+    def test_executable_change_is_fail_closed_but_receipted(self) -> None:
+        command_source = (
+            "os.chmod(os.path.dirname(sys.argv[0]), 0o700)\n"
+            "os.chmod(sys.argv[0], 0o700)\n"
+            "with open(sys.argv[0], 'ab') as executable:\n"
+            "    executable.write(b'\\n')\n"
+            "os.write(1, b'changed')\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            capture_root = base / "capture"
+            capture_root.mkdir(mode=0o700)
+            executable = write_fake_provider(base, "kimi", command_source)
+            completed = run_collector(
+                "kimi", capture_root, "capture-executable-change", executable
+            )
+            self.assertEqual(completed.returncode, 1, completed.stderr)
+            self.assertEqual(completed.stdout, b"changed")
+            receipt = read_receipt(capture_root, "capture-executable-change")
+            self.assertEqual(receipt["capture_status"], "incomplete")
+            self.assertEqual(receipt["incomplete_reasons"], ["executable_changed"])
+            self.assertEqual(receipt["provider_outcome"], "unknown")
+
+    def test_command_executes_the_verified_private_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            repository = base / "repository"
+            git_dir = base / "git-dir"
+            capture_root = base / "capture"
+            repository.mkdir()
+            git_dir.mkdir()
+            capture_root.mkdir(mode=0o700)
+            executable = write_fake_provider(
+                base,
+                "kimi",
+                "os.write(1, b'SNAPSHOT_GOOD')\n",
+            )
+            original_popen = provider_capture.subprocess.Popen
+            staged_paths: list[Path] = []
+
+            def replace_original_at_launch(
+                command: Any,
+                *args: Any,
+                **kwargs: Any,
+            ) -> Any:
+                selected = list(command)
+                if selected[1:] == ["acp"]:
+                    staged_path = Path(selected[0])
+                    staged_paths.append(staged_path)
+                    self.assertNotEqual(staged_path, executable)
+                    self.assertEqual(staged_path.parents[1], capture_root)
+                    with self.assertRaises(PermissionError):
+                        staged_path.unlink()
+                    metadata = executable.stat()
+                    raw = executable.read_bytes()
+                    replacement = raw.replace(b"SNAPSHOT_GOOD", b"SNAPSHOT_EVIL")
+                    self.assertEqual(len(replacement), len(raw))
+                    executable.write_bytes(replacement)
+                    executable.chmod(0o755)
+                    os.utime(
+                        executable,
+                        ns=(metadata.st_atime_ns, metadata.st_mtime_ns),
+                    )
+                return original_popen(command, *args, **kwargs)
+
+            with mock.patch.object(
+                provider_capture.subprocess,
+                "Popen",
+                replace_original_at_launch,
+            ):
+                with tempfile.TemporaryFile() as source:
+                    result = provider_capture.collect(
+                        provider_capture.PROVIDER_SPECS["kimi"],
+                        capture_root,
+                        "capture-staged-executable",
+                        4096,
+                        8192,
+                        2,
+                        str(executable),
+                        source,
+                        io.BytesIO(),
+                        provider_capture.RepositoryPaths(repository, git_dir),
+                    )
+            self.assertEqual(result.exit_status, 0)
+            self.assertEqual(len(staged_paths), 1)
+            raw_capture = (
+                capture_root / "capture-staged-executable.capture"
+            ).read_bytes()
+            frames = list(
+                provider_capture.iter_capture_frames(io.BytesIO(raw_capture))
+            )
+            stdout = b"".join(
+                payload for stream, _observed_ns, payload in frames if stream == "O"
+            )
+            self.assertEqual(stdout, b"SNAPSHOT_GOOD")
+            self.assertFalse(staged_paths[0].exists())
+            self.assertFalse(
+                any(
+                    path.name.startswith(".clilane-provider-stage-")
+                    for path in capture_root.iterdir()
+                )
+            )
+
+    def test_version_same_size_rewrite_with_restored_mtime_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            capture_root = base / "capture"
+            capture_root.mkdir(mode=0o700)
+            executable = base / "fake-kimi-version-rewrite"
+            executable.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "import sys\n"
+                "if sys.argv[1:] == ['--version']:\n"
+                "    directory = os.path.dirname(sys.argv[0])\n"
+                "    os.chmod(directory, 0o700)\n"
+                "    os.chmod(sys.argv[0], 0o700)\n"
+                "    metadata = os.stat(sys.argv[0])\n"
+                "    with open(sys.argv[0], 'r+b') as target:\n"
+                "        raw = target.read()\n"
+                "        target.seek(0)\n"
+                "        target.write(raw.replace(b'ORIGINAL_A', b'MUTATED__A'))\n"
+                "        target.truncate()\n"
+                "    os.utime(\n"
+                "        sys.argv[0],\n"
+                "        ns=(metadata.st_atime_ns, metadata.st_mtime_ns),\n"
+                "    )\n"
+                "    os.chmod(sys.argv[0], 0o500)\n"
+                "    os.chmod(directory, 0o500)\n"
+                "    os.write(1, b'0.38.0\\n')\n"
+                "    raise SystemExit(0)\n"
+                "marker = b'ORIGINAL_A'\n"
+                "raise SystemExit(91)\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            completed = run_collector(
+                "kimi",
+                capture_root,
+                "capture-version-rewrite",
+                executable,
+            )
+            self.assertEqual(completed.returncode, 1, completed.stderr)
+            self.assertEqual(
+                completed.stderr,
+                b"collect_kimi_evidence: provider-executable-changed\n",
+            )
+            self.assertFalse(
+                (capture_root / "capture-version-rewrite.capture").exists()
+            )
+            self.assertFalse(
+                (capture_root / "capture-version-rewrite.receipt.json").exists()
+            )
+
+    def test_signal_at_stage_ownership_transfer_cleans_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            capture_root = base / "capture"
+            repository = base / "repository"
+            git_dir = base / "git-dir"
+            capture_root.mkdir(mode=0o700)
+            repository.mkdir()
+            git_dir.mkdir()
+            executable = write_fake_provider(base, "kimi")
+            root = provider_capture.validate_capture_root(
+                capture_root,
+                provider_capture.RepositoryPaths(repository, git_dir),
+            )
+            provider_capture._lock_root(root)
+            original_stage = provider_capture._stage_executable
+            original_cleanup = provider_capture._cleanup_executable
+            previous_signal_state = provider_capture.ACTIVE_SIGNAL_STATE
+            previous_signal_handler = signal.getsignal(signal.SIGTERM)
+            cleanup_calls = 0
+
+            def interrupt(number: int, _frame: Any) -> None:
+                state = provider_capture.ACTIVE_SIGNAL_STATE
+                if state is not None and state.depth > 0:
+                    if state.pending is None:
+                        state.pending = number
+                    return
+                raise provider_capture.CollectorSignal(number)
+
+            def stage_then_signal(*args: Any, **kwargs: Any) -> Any:
+                identity = original_stage(*args, **kwargs)
+                signal.raise_signal(signal.SIGTERM)
+                return identity
+
+            def cleanup_during_second_signal(*args: Any, **kwargs: Any) -> Any:
+                nonlocal cleanup_calls
+                cleanup_calls += 1
+                signal.raise_signal(signal.SIGTERM)
+                return original_cleanup(*args, **kwargs)
+
+            provider_capture.ACTIVE_SIGNAL_STATE = provider_capture.SignalState()
+            signal.signal(signal.SIGTERM, interrupt)
+            try:
+                with mock.patch.object(
+                    provider_capture,
+                    "_stage_executable",
+                    side_effect=stage_then_signal,
+                ), mock.patch.object(
+                    provider_capture,
+                    "_cleanup_executable",
+                    side_effect=cleanup_during_second_signal,
+                ):
+                    with self.assertRaises(provider_capture.CollectorSignal):
+                        provider_capture.resolve_executable(
+                            provider_capture.PROVIDER_SPECS["kimi"],
+                            str(executable),
+                            provider_capture.PROVIDER_COMMAND_CWD,
+                            root,
+                            4096,
+                        )
+            finally:
+                signal.signal(signal.SIGTERM, previous_signal_handler)
+                provider_capture.ACTIVE_SIGNAL_STATE = previous_signal_state
+                root.close()
+            self.assertEqual(cleanup_calls, 1)
+            self.assertFalse(
+                any(
+                    path.name.startswith(".clilane-provider-stage-")
+                    for path in capture_root.iterdir()
+                )
+            )
+
+    def test_receipt_publication_is_atomic_and_no_clobber(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            capture_root = base / "capture"
+            repository = base / "repository"
+            git_dir = base / "git"
+            capture_root.mkdir(mode=0o700)
+            repository.mkdir()
+            git_dir.mkdir()
+            root = provider_capture.validate_capture_root(
+                capture_root,
+                provider_capture.RepositoryPaths(repository, git_dir),
+            )
+            with mock.patch.object(provider_capture.os, "link", side_effect=OSError):
+                with self.assertRaises(provider_capture.CaptureError):
+                    provider_capture._write_receipt(
+                        root, "capture-atomic", {"schema_version": 1}
+                    )
+            self.assertFalse((capture_root / "capture-atomic.receipt.json").exists())
+            self.assertFalse((capture_root / "capture-atomic.receipt.tmp").exists())
+
+            original_fsync = os.fsync
+            fsync_calls = 0
+
+            def fail_directory_fsync(descriptor: int) -> None:
+                nonlocal fsync_calls
+                fsync_calls += 1
+                if fsync_calls == 2:
+                    raise OSError
+                original_fsync(descriptor)
+
+            with mock.patch.object(provider_capture.os, "fsync", fail_directory_fsync):
+                with self.assertRaises(provider_capture.CaptureError):
+                    provider_capture._write_receipt(
+                        root, "capture-fsync-failure", {"schema_version": 1}
+                    )
+            self.assertFalse(
+                (capture_root / "capture-fsync-failure.receipt.json").exists()
+            )
+            self.assertFalse(
+                (capture_root / "capture-fsync-failure.receipt.tmp").exists()
+            )
+
+            original_link = os.link
+
+            def replace_temporary_before_link(
+                source: str,
+                destination: str,
+                **kwargs: Any,
+            ) -> None:
+                source_dir_fd = kwargs["src_dir_fd"]
+                os.unlink(source, dir_fd=source_dir_fd)
+                replacement = os.open(
+                    source,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=source_dir_fd,
+                )
+                try:
+                    os.write(replacement, b'{"forged":true}\n')
+                    os.fsync(replacement)
+                finally:
+                    os.close(replacement)
+                original_link(source, destination, **kwargs)
+
+            with mock.patch.object(
+                provider_capture.os,
+                "link",
+                replace_temporary_before_link,
+            ):
+                with self.assertRaises(provider_capture.CaptureError):
+                    provider_capture._write_receipt(
+                        root,
+                        "capture-replaced-temp",
+                        {"schema_version": 1},
+                    )
+            self.assertFalse(
+                (capture_root / "capture-replaced-temp.receipt.json").exists()
+            )
+            self.assertFalse(
+                (capture_root / "capture-replaced-temp.receipt.tmp").exists()
+            )
+
+            link_calls = 0
+
+            def signal_once(*args: Any, **kwargs: Any) -> None:
+                nonlocal link_calls
+                link_calls += 1
+                if link_calls == 1:
+                    raise provider_capture.CollectorSignal(signal.SIGTERM)
+                original_link(*args, **kwargs)
+
+            with mock.patch.object(provider_capture.os, "link", signal_once):
+                with self.assertRaises(provider_capture.CollectorSignal):
+                    provider_capture._write_receipt(
+                        root, "capture-signal-commit", {"schema_version": 1}
+                    )
+            self.assertTrue(
+                (capture_root / "capture-signal-commit.receipt.json").exists()
+            )
+            self.assertFalse(
+                (capture_root / "capture-signal-commit.receipt.tmp").exists()
+            )
+
+            provider_capture._write_receipt(
+                root, "capture-atomic", {"schema_version": 1}
+            )
+            with self.assertRaises(provider_capture.CaptureError):
+                provider_capture._write_receipt(
+                    root, "capture-atomic", {"schema_version": 2}
+                )
+            self.assertEqual(
+                json.loads(
+                    (capture_root / "capture-atomic.receipt.json").read_text(
+                        encoding="utf-8"
+                    )
+                ),
+                {"schema_version": 1},
+            )
+            root.close()
+
+    def test_root_lock_rejects_a_concurrent_collector(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            capture_root = base / "capture"
+            capture_root.mkdir(mode=0o700)
+            executable = write_fake_provider(
+                base,
+                "kimi",
+                "sys.stdin.buffer.read()\ntime.sleep(1.5)\nos.write(1, b'done')\n",
+            )
+            common = [
+                sys.executable,
+                "-B",
+                str(COLLECTOR_SCRIPTS["kimi"]),
+                "--capture-root",
+                str(capture_root),
+                "--per-capture-bytes",
+                str(1 << 20),
+                "--aggregate-bytes",
+                str(1 << 21),
+                "--timeout-seconds",
+                "5",
+                "--provider-executable",
+                str(executable),
+            ]
+            environment = os.environ.copy()
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            first = subprocess.Popen(
+                [*common, "--capture-id", "capture-lock-first"],
+                cwd=ROOT,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+            )
+            if first.stdin is None:
+                self.fail("first collector stdin was not created")
+            first.stdin.close()
+            first.stdin = None
+            try:
+                deadline = time.monotonic() + 5
+                while not (capture_root / "capture-lock-first.capture").exists():
+                    if time.monotonic() >= deadline:
+                        self.fail("first collector did not reserve its capture")
+                    time.sleep(0.01)
+                second = subprocess.run(
+                    [*common, "--capture-id", "capture-lock-second"],
+                    cwd=ROOT,
+                    input=b"",
+                    capture_output=True,
+                    check=False,
+                    env=environment,
+                    timeout=5,
+                )
+                first_stdout, first_stderr = first.communicate(timeout=10)
+            finally:
+                if first.poll() is None:
+                    first.terminate()
+                    first.wait(timeout=5)
+            self.assertEqual(second.returncode, 1)
+            self.assertEqual(
+                second.stderr, b"collect_kimi_evidence: capture-root-busy\n"
+            )
+            self.assertFalse((capture_root / "capture-lock-second.capture").exists())
+            self.assertEqual(first.returncode, 0, first_stderr)
+            self.assertEqual(first_stdout, b"done")
+
+    def test_version_privacy_and_cli_surface_fail_closed(self) -> None:
+        canary = b"private-version-canary"
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            capture_root = base / "capture"
+            capture_root.mkdir(mode=0o700)
+            executable = write_fake_provider(
+                base,
+                "kimi",
+                version_output=b"0.38.0\n" + canary + b"\n",
+            )
+            completed = run_collector(
+                "kimi", capture_root, "capture-private-version", executable
+            )
+            self.assertEqual(completed.returncode, 1)
+            self.assertNotIn(canary, completed.stderr)
+            self.assertNotIn(str(executable).encode(), completed.stderr)
+            self.assertEqual(
+                {path.name for path in capture_root.iterdir()},
+                {".clilane-provider-capture.lock"},
+            )
+
+            invalid = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(COLLECTOR_SCRIPTS["kimi"]),
+                    "--source-interface",
+                    "private-canary",
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(invalid.returncode, 2)
+            self.assertNotIn(b"private-canary", invalid.stderr)
+
+    def test_codex_launcher_resolution_pins_the_packaged_native_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            launcher = base / "package/bin/codex.js"
+            launcher.parent.mkdir(parents=True)
+            launcher.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+            native = (
+                base
+                / "package/node_modules/@openai/codex-darwin-arm64"
+                / "vendor/aarch64-apple-darwin/bin/codex"
+            )
+            native.parent.mkdir(parents=True)
+            native.write_bytes(b"native")
+            with mock.patch.object(provider_capture.platform, "system", return_value="Darwin"):
+                with mock.patch.object(
+                    provider_capture.platform, "machine", return_value="arm64"
+                ):
+                    self.assertEqual(provider_capture._codex_native_path(launcher), native)
+
+    def test_collector_engine_uses_only_standard_library_modules(self) -> None:
+        tree = ast.parse(CAPTURE_ENGINE_PATH.read_text(encoding="utf-8"))
         imported: set[str] = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):

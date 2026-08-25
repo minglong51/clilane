@@ -103,6 +103,9 @@ jobs:
       - name: Exercise release workflow contract
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v tests.test_release
 
+      - name: Exercise provider evidence contracts
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v tests.test_provider_evidence
+
       - name: Exercise lifecycle and local fleet
         shell: bash
         run: |
