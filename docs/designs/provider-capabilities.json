@@ -1,0 +1,620 @@
+{
+  "complete": true,
+  "evidence_mode": "synthetic",
+  "human_summary": "### Provider capability evidence\n\nEvidence mode: `synthetic`. Required cells: 24/24. v0.6 gate: `experimental_preview`.\n\n| Provider | Version | Source | Support | Freshness | Pass | Fail | Unknown |\n|---|---|---|---|---|---:|---:|---:|\n| claude | synthetic | unknown:none | attach_only_unknown | unknown | 0 | 0 | 8 |\n| codex | synthetic | unknown:none | attach_only_unknown | unknown | 0 | 0 | 8 |\n| kimi | synthetic | unknown:none | attach_only_unknown | unknown | 0 | 0 | 8 |\n\n| Provider | Capability | Status | Binding (task/session/request) | Open/close | Duplicate | Stale session | Reconnect/recovery | Latency ms | Capture | Evidence |\n|---|---|---|---|---|---|---|---|---|---|---|\n| claude | approval_request | unknown | unknown/unknown/unknown | unknown/unknown | not_applicable | not_applicable | not_applicable/not_applicable |  | complete | evidence-claude-approval-request |\n| claude | duplicate | unknown | unknown/unknown/unknown | not_applicable/not_applicable | unknown | not_applicable | not_applicable/not_applicable |  | complete | evidence-claude-duplicate |\n| claude | heartbeat | unknown | unknown/unknown/not_applicable | not_applicable/not_applicable | not_applicable | not_applicable | not_applicable/not_applicable |  | complete | evidence-claude-heartbeat |\n| claude | input_request | unknown | unknown/unknown/unknown | unknown/unknown | not_applicable | not_applicable | not_applicable/not_applicable |  | complete | evidence-claude-input-request |\n| claude | reconnect | unknown | unknown/unknown/not_applicable | not_applicable/not_applicable | not_applicable | not_applicable | unknown/not_applicable |  | complete | evidence-claude-reconnect |\n| claude | request_recovery | unknown | unknown/unknown/unknown | not_applicable/not_applicable | not_applicable | not_applicable | not_applicable/unknown |  | complete | evidence-claude-request-recovery |\n| claude | stale_session | unknown | unknown/unknown/not_applicable | not_applicable/not_applicable | not_applicable | unknown | not_applicable/not_applicable |  | complete | evidence-claude-stale-session |\n| claude | turn_state | unknown | unknown/unknown/not_applicable | unknown/unknown | not_applicable | not_applicable | not_applicable/not_applicable |  | complete | evidence-claude-turn-state |\n| codex | approval_request | unknown | unknown/unknown/unknown | unknown/unknown | not_applicable | not_applicable | not_applicable/not_applicable |  | complete | evidence-codex-approval-request |\n| codex | duplicate | unknown | unknown/unknown/unknown | not_applicable/not_applicable | unknown | not_applicable | not_applicable/not_applicable |  | complete | evidence-codex-duplicate |\n| codex | heartbeat | unknown | unknown/unknown/not_applicable | not_applicable/not_applicable | not_applicable | not_applicable | not_applicable/not_applicable |  | complete | evidence-codex-heartbeat |\n| codex | input_request | unknown | unknown/unknown/unknown | unknown/unknown | not_applicable | not_applicable | not_applicable/not_applicable |  | complete | evidence-codex-input-request |\n| codex | reconnect | unknown | unknown/unknown/not_applicable | not_applicable/not_applicable | not_applicable | not_applicable | unknown/not_applicable |  | complete | evidence-codex-reconnect |\n| codex | request_recovery | unknown | unknown/unknown/unknown | not_applicable/not_applicable | not_applicable | not_applicable | not_applicable/unknown |  | complete | evidence-codex-request-recovery |\n| codex | stale_session | unknown | unknown/unknown/not_applicable | not_applicable/not_applicable | not_applicable | unknown | not_applicable/not_applicable |  | complete | evidence-codex-stale-session |\n| codex | turn_state | unknown | unknown/unknown/not_applicable | unknown/unknown | not_applicable | not_applicable | not_applicable/not_applicable |  | complete | evidence-codex-turn-state |\n| kimi | approval_request | unknown | unknown/unknown/unknown | unknown/unknown | not_applicable | not_applicable | not_applicable/not_applicable |  | complete | evidence-kimi-approval-request |\n| kimi | duplicate | unknown | unknown/unknown/unknown | not_applicable/not_applicable | unknown | not_applicable | not_applicable/not_applicable |  | complete | evidence-kimi-duplicate |\n| kimi | heartbeat | unknown | unknown/unknown/not_applicable | not_applicable/not_applicable | not_applicable | not_applicable | not_applicable/not_applicable |  | complete | evidence-kimi-heartbeat |\n| kimi | input_request | unknown | unknown/unknown/unknown | unknown/unknown | not_applicable | not_applicable | not_applicable/not_applicable |  | complete | evidence-kimi-input-request |\n| kimi | reconnect | unknown | unknown/unknown/not_applicable | not_applicable/not_applicable | not_applicable | not_applicable | unknown/not_applicable |  | complete | evidence-kimi-reconnect |\n| kimi | request_recovery | unknown | unknown/unknown/unknown | not_applicable/not_applicable | not_applicable | not_applicable | not_applicable/unknown |  | complete | evidence-kimi-request-recovery |\n| kimi | stale_session | unknown | unknown/unknown/not_applicable | not_applicable/not_applicable | not_applicable | unknown | not_applicable/not_applicable |  | complete | evidence-kimi-stale-session |\n| kimi | turn_state | unknown | unknown/unknown/not_applicable | unknown/unknown | not_applicable | not_applicable | not_applicable/not_applicable |  | complete | evidence-kimi-turn-state |\n",
+  "present_cells": 24,
+  "providers": [
+    {
+      "authoritative": false,
+      "cells": [
+        {
+          "binding": {
+            "request": "unknown",
+            "session": "unknown",
+            "task": "unknown"
+          },
+          "capture_status": "complete",
+          "close_behavior": "unknown",
+          "duplicate_handling": "not_applicable",
+          "event_kind": "approval_request",
+          "evidence_id": "evidence-claude-approval-request",
+          "failure_behavior": "unknown",
+          "freshness": null,
+          "latency_ms": [],
+          "open_behavior": "unknown",
+          "reconnect_result": "not_applicable",
+          "recovery_result": "not_applicable",
+          "source_capture_sha256": "1bda83f7f0ffc4c975dfa00aec0dac9127c356c3ec01fa43046ca2f0468c5dda",
+          "source_interface": "none",
+          "source_kind": "unknown",
+          "stale_session_handling": "not_applicable",
+          "status": "unknown"
+        },
+        {
+          "binding": {
+            "request": "unknown",
+            "session": "unknown",
+            "task": "unknown"
+          },
+          "capture_status": "complete",
+          "close_behavior": "not_applicable",
+          "duplicate_handling": "unknown",
+          "event_kind": "duplicate",
+          "evidence_id": "evidence-claude-duplicate",
+          "failure_behavior": "unknown",
+          "freshness": null,
+          "latency_ms": [],
+          "open_behavior": "not_applicable",
+          "reconnect_result": "not_applicable",
+          "recovery_result": "not_applicable",
+          "source_capture_sha256": "858ffe20095aa7310c17f14d401bc62648a89ad44210158663952e0d22ef2cd2",
+          "source_interface": "none",
+          "source_kind": "unknown",
+          "stale_session_handling": "not_applicable",
+          "status": "unknown"
+        },
+        {
+          "binding": {
+            "request": "not_applicable",
+            "session": "unknown",
+            "task": "unknown"
+          },
+          "capture_status": "complete",
+          "close_behavior": "not_applicable",
+          "duplicate_handling": "not_applicable",
+          "event_kind": "heartbeat",
+          "evidence_id": "evidence-claude-heartbeat",
+          "failure_behavior": "unknown",
+          "freshness": null,
+          "latency_ms": [],
+          "open_behavior": "not_applicable",
+          "reconnect_result": "not_applicable",
+          "recovery_result": "not_applicable",
+          "source_capture_sha256": "5bb88f1bd151c047e4aa03a3bb5882038297e0d31cca8f18e21e81529daa3321",
+          "source_interface": "none",
+          "source_kind": "unknown",
+          "stale_session_handling": "not_applicable",
+          "status": "unknown"
+        },
+        {
+          "binding": {
+            "request": "unknown",
+            "session": "unknown",
+            "task": "unknown"
+          },
+          "capture_status": "complete",
+          "close_behavior": "unknown",
+          "duplicate_handling": "not_applicable",
+          "event_kind": "input_request",
+          "evidence_id": "evidence-claude-input-request",
+          "failure_behavior": "unknown",
+          "freshness": null,
+          "latency_ms": [],
+          "open_behavior": "unknown",
+          "reconnect_result": "not_applicable",
+          "recovery_result": "not_applicable",
+          "source_capture_sha256": "b498bf54a9e6dd708dde218e2aa72ace250719a96bbd8ae13eafc8294bdcd64d",
+          "source_interface": "none",
+          "source_kind": "unknown",
+          "stale_session_handling": "not_applicable",
+          "status": "unknown"
+        },
+        {
+          "binding": {
+            "request": "not_applicable",
+            "session": "unknown",
+            "task": "unknown"
+          },
+          "capture_status": "complete",
+          "close_behavior": "not_applicable",
+          "duplicate_handling": "not_applicable",
+          "event_kind": "reconnect",
+          "evidence_id": "evidence-claude-reconnect",
+          "failure_behavior": "unknown",
+          "freshness": null,
+          "latency_ms": [],
+          "open_behavior": "not_applicable",
+          "reconnect_result": "unknown",
+          "recovery_result": "not_applicable",
+          "source_capture_sha256": "4ff133033da7dcf805921805600bbf29cfb9fc125e37c97bf93509c175578598",
+          "source_interface": "none",
+          "source_kind": "unknown",
+          "stale_session_handling": "not_applicable",
+          "status": "unknown"
+        },
+        {
+          "binding": {
+            "request": "unknown",
+            "session": "unknown",
+            "task": "unknown"
+          },
+          "capture_status": "complete",
+          "close_behavior": "not_applicable",
+          "duplicate_handling": "not_applicable",
+          "event_kind": "request_recovery",
+          "evidence_id": "evidence-claude-request-recovery",
+          "failure_behavior": "unknown",
+          "freshness": null,
+          "latency_ms": [],
+          "open_behavior": "not_applicable",
+          "reconnect_result": "not_applicable",
+          "recovery_result": "unknown",
+          "source_capture_sha256": "0322047a8304fce769912c844e5132e4d083f5d2b5a59181f9e6ca0f1d6d1157",
+          "source_interface": "none",
+          "source_kind": "unknown",
+          "stale_session_handling": "not_applicable",
+          "status": "unknown"
+        },
+        {
+          "binding": {
+            "request": "not_applicable",
+            "session": "unknown",
+            "task": "unknown"
+          },
+          "capture_status": "complete",
+          "close_behavior": "not_applicable",
+          "duplicate_handling": "not_applicable",
+          "event_kind": "stale_session",
+          "evidence_id": "evidence-claude-stale-session",
+          "failure_behavior": "unknown",
+          "freshness": null,
+          "latency_ms": [],
+          "open_behavior": "not_applicable",
+          "reconnect_result": "not_applicable",
+          "recovery_result": "not_applicable",
+          "source_capture_sha256": "d28e9a8e623e930edf6e523e105b90ef221af782b07cf341c0cdeb2bacaef856",
+          "source_interface": "none",
+          "source_kind": "unknown",
+          "stale_session_handling": "unknown",
+          "status": "unknown"
+        },
+        {
+          "binding": {
+            "request": "not_applicable",
+            "session": "unknown",
+            "task": "unknown"
+          },
+          "capture_status": "complete",
+          "close_behavior": "unknown",
+          "duplicate_handling": "not_applicable",
+          "event_kind": "turn_state",
+          "evidence_id": "evidence-claude-turn-state",
+          "failure_behavior": "unknown",
+          "freshness": null,
+          "latency_ms": [],
+          "open_behavior": "unknown",
+          "reconnect_result": "not_applicable",
+          "recovery_result": "not_applicable",
+          "source_capture_sha256": "e27fb03f700ba6bfc3e15bd5f3c25aa45b1b63dbff83c78fcdbf470e8277c9fd",
+          "source_interface": "none",
+          "source_kind": "unknown",
+          "stale_session_handling": "not_applicable",
+          "status": "unknown"
+        }
+      ],
+      "freshness": null,
+      "provider": "claude",
+      "provider_version": "synthetic",
+      "sources": [
+        {
+          "interface": "none",
+          "kind": "unknown"
+        }
+      ],
+      "support": "attach_only_unknown"
+    },
+    {
+      "authoritative": false,
+      "cells": [
+        {
+          "binding": {
+            "request": "unknown",
+            "session": "unknown",
+            "task": "unknown"
+          },
+          "capture_status": "complete",
+          "close_behavior": "unknown",
+          "duplicate_handling": "not_applicable",
+          "event_kind": "approval_request",
+          "evidence_id": "evidence-codex-approval-request",
+          "failure_behavior": "unknown",
+          "freshness": null,
+          "latency_ms": [],
+          "open_behavior": "unknown",
+          "reconnect_result": "not_applicable",
+          "recovery_result": "not_applicable",
+          "source_capture_sha256": "014169f79c6fcb9d13fef9efe78867efea402ce9c46e940d4c3c08769da39a93",
+          "source_interface": "none",
+          "source_kind": "unknown",
+          "stale_session_handling": "not_applicable",
+          "status": "unknown"
+        },
+        {
+          "binding": {
+            "request": "unknown",
+            "session": "unknown",
+            "task": "unknown"
+          },
+          "capture_status": "complete",
+          "close_behavior": "not_applicable",
+          "duplicate_handling": "unknown",
+          "event_kind": "duplicate",
+          "evidence_id": "evidence-codex-duplicate",
+          "failure_behavior": "unknown",
+          "freshness": null,
+          "latency_ms": [],
+          "open_behavior": "not_applicable",
+          "reconnect_result": "not_applicable",
+          "recovery_result": "not_applicable",
+          "source_capture_sha256": "d865318d4a7d96aa28a6a43a1ddb1dcea49ab05e86246f9965d1f02704c5b4a5",
+          "source_interface": "none",
+          "source_kind": "unknown",
+          "stale_session_handling": "not_applicable",
+          "status": "unknown"
+        },
+        {
+          "binding": {
+            "request": "not_applicable",
+            "session": "unknown",
+            "task": "unknown"
+          },
+          "capture_status": "complete",
+          "close_behavior": "not_applicable",
+          "duplicate_handling": "not_applicable",
+          "event_kind": "heartbeat",
+          "evidence_id": "evidence-codex-heartbeat",
+          "failure_behavior": "unknown",
+          "freshness": null,
+          "latency_ms": [],
+          "open_behavior": "not_applicable",
+          "reconnect_result": "not_applicable",
+          "recovery_result": "not_applicable",
+          "source_capture_sha256": "7236275890ae5bab7e8ea2cc7fbccc3eec3f9eb7507c7319dace68c7e9ecaee4",
+          "source_interface": "none",
+          "source_kind": "unknown",
+          "stale_session_handling": "not_applicable",
+          "status": "unknown"
+        },
+        {
+          "binding": {
+            "request": "unknown",
+            "session": "unknown",
+            "task": "unknown"
+          },
+          "capture_status": "complete",
+          "close_behavior": "unknown",
+          "duplicate_handling": "not_applicable",
+          "event_kind": "input_request",
+          "evidence_id": "evidence-codex-input-request",
+          "failure_behavior": "unknown",
+          "freshness": null,
+          "latency_ms": [],
+          "open_behavior": "unknown",
+          "reconnect_result": "not_applicable",
+          "recovery_result": "not_applicable",
+          "source_capture_sha256": "e25a60d6762029a2325d9c0987bf8805afe3e9e5c08be30a9a16e777b58159f1",
+          "source_interface": "none",
+          "source_kind": "unknown",
+          "stale_session_handling": "not_applicable",
+          "status": "unknown"
+        },
+        {
+          "binding": {
+            "request": "not_applicable",
+            "session": "unknown",
+            "task": "unknown"
+          },
+          "capture_status": "complete",
+          "close_behavior": "not_applicable",
+          "duplicate_handling": "not_applicable",
+          "event_kind": "reconnect",
+          "evidence_id": "evidence-codex-reconnect",
+          "failure_behavior": "unknown",
+          "freshness": null,
+          "latency_ms": [],
+          "open_behavior": "not_applicable",
+          "reconnect_result": "unknown",
+          "recovery_result": "not_applicable",
+          "source_capture_sha256": "2e8081a13e3d7511c1209cff91b3e491f7d22e83ce0c93310f26fc07556e45af",
+          "source_interface": "none",
+          "source_kind": "unknown",
+          "stale_session_handling": "not_applicable",
+          "status": "unknown"
+        },
+        {
+          "binding": {
+            "request": "unknown",
+            "session": "unknown",
+            "task": "unknown"
+          },
+          "capture_status": "complete",
+          "close_behavior": "not_applicable",
+          "duplicate_handling": "not_applicable",
+          "event_kind": "request_recovery",
+          "evidence_id": "evidence-codex-request-recovery",
+          "failure_behavior": "unknown",
+          "freshness": null,
+          "latency_ms": [],
+          "open_behavior": "not_applicable",
+          "reconnect_result": "not_applicable",
+          "recovery_result": "unknown",
+          "source_capture_sha256": "7c20bcd226a966794ba0b3d83c1b9a57ddb76b8185c9fe829937bf5524193534",
+          "source_interface": "none",
+          "source_kind": "unknown",
+          "stale_session_handling": "not_applicable",
+          "status": "unknown"
+        },
+        {
+          "binding": {
+            "request": "not_applicable",
+            "session": "unknown",
+            "task": "unknown"
+          },
+          "capture_status": "complete",
+          "close_behavior": "not_applicable",
+          "duplicate_handling": "not_applicable",
+          "event_kind": "stale_session",
+          "evidence_id": "evidence-codex-stale-session",
+          "failure_behavior": "unknown",
+          "freshness": null,
+          "latency_ms": [],
+          "open_behavior": "not_applicable",
+          "reconnect_result": "not_applicable",
+          "recovery_result": "not_applicable",
+          "source_capture_sha256": "0b84cb15ab8ae83d404a47b02a8c6f94a99ad62036f7868bcb2ce0b56e42b1f4",
+          "source_interface": "none",
+          "source_kind": "unknown",
+          "stale_session_handling": "unknown",
+          "status": "unknown"
+        },
+        {
+          "binding": {
+            "request": "not_applicable",
+            "session": "unknown",
+            "task": "unknown"
+          },
+          "capture_status": "complete",
+          "close_behavior": "unknown",
+          "duplicate_handling": "not_applicable",
+          "event_kind": "turn_state",
+          "evidence_id": "evidence-codex-turn-state",
+          "failure_behavior": "unknown",
+          "freshness": null,
+          "latency_ms": [],
+          "open_behavior": "unknown",
+          "reconnect_result": "not_applicable",
+          "recovery_result": "not_applicable",
+          "source_capture_sha256": "64ede918833308a6398a15e3a95c005fb1450d8f8f2ba836c5a556a3be841d23",
+          "source_interface": "none",
+          "source_kind": "unknown",
+          "stale_session_handling": "not_applicable",
+          "status": "unknown"
+        }
+      ],
+      "freshness": null,
+      "provider": "codex",
+      "provider_version": "synthetic",
+      "sources": [
+        {
+          "interface": "none",
+          "kind": "unknown"
+        }
+      ],
+      "support": "attach_only_unknown"
+    },
+    {
+      "authoritative": false,
+      "cells": [
+        {
+          "binding": {
+            "request": "unknown",
+            "session": "unknown",
+            "task": "unknown"
+          },
+          "capture_status": "complete",
+          "close_behavior": "unknown",
+          "duplicate_handling": "not_applicable",
+          "event_kind": "approval_request",
+          "evidence_id": "evidence-kimi-approval-request",
+          "failure_behavior": "unknown",
+          "freshness": null,
+          "latency_ms": [],
+          "open_behavior": "unknown",
+          "reconnect_result": "not_applicable",
+          "recovery_result": "not_applicable",
+          "source_capture_sha256": "26de49e69d53d4eec27a86ff3a97f7e1d458d5cc3f1fdc64f802d16c8ba93434",
+          "source_interface": "none",
+          "source_kind": "unknown",
+          "stale_session_handling": "not_applicable",
+          "status": "unknown"
+        },
+        {
+          "binding": {
+            "request": "unknown",
+            "session": "unknown",
+            "task": "unknown"
+          },
+          "capture_status": "complete",
+          "close_behavior": "not_applicable",
+          "duplicate_handling": "unknown",
+          "event_kind": "duplicate",
+          "evidence_id": "evidence-kimi-duplicate",
+          "failure_behavior": "unknown",
+          "freshness": null,
+          "latency_ms": [],
+          "open_behavior": "not_applicable",
+          "reconnect_result": "not_applicable",
+          "recovery_result": "not_applicable",
+          "source_capture_sha256": "6b2a80028a818e532bfca89d0567fe13d2c4886e74b50a05583d6c171a8cca76",
+          "source_interface": "none",
+          "source_kind": "unknown",
+          "stale_session_handling": "not_applicable",
+          "status": "unknown"
+        },
+        {
+          "binding": {
+            "request": "not_applicable",
+            "session": "unknown",
+            "task": "unknown"
+          },
+          "capture_status": "complete",
+          "close_behavior": "not_applicable",
+          "duplicate_handling": "not_applicable",
+          "event_kind": "heartbeat",
+          "evidence_id": "evidence-kimi-heartbeat",
+          "failure_behavior": "unknown",
+          "freshness": null,
+          "latency_ms": [],
+          "open_behavior": "not_applicable",
+          "reconnect_result": "not_applicable",
+          "recovery_result": "not_applicable",
+          "source_capture_sha256": "24a4e3a97dcba1e424cd890da576620abb466d687bab66dcc2ec141cb778ed3a",
+          "source_interface": "none",
+          "source_kind": "unknown",
+          "stale_session_handling": "not_applicable",
+          "status": "unknown"
+        },
+        {
+          "binding": {
+            "request": "unknown",
+            "session": "unknown",
+            "task": "unknown"
+          },
+          "capture_status": "complete",
+          "close_behavior": "unknown",
+          "duplicate_handling": "not_applicable",
+          "event_kind": "input_request",
+          "evidence_id": "evidence-kimi-input-request",
+          "failure_behavior": "unknown",
+          "freshness": null,
+          "latency_ms": [],
+          "open_behavior": "unknown",
+          "reconnect_result": "not_applicable",
+          "recovery_result": "not_applicable",
+          "source_capture_sha256": "ff065f9e0d5c3544e99862aafe8235e1453594087d59039f14fc8008bc646299",
+          "source_interface": "none",
+          "source_kind": "unknown",
+          "stale_session_handling": "not_applicable",
+          "status": "unknown"
+        },
+        {
+          "binding": {
+            "request": "not_applicable",
+            "session": "unknown",
+            "task": "unknown"
+          },
+          "capture_status": "complete",
+          "close_behavior": "not_applicable",
+          "duplicate_handling": "not_applicable",
+          "event_kind": "reconnect",
+          "evidence_id": "evidence-kimi-reconnect",
+          "failure_behavior": "unknown",
+          "freshness": null,
+          "latency_ms": [],
+          "open_behavior": "not_applicable",
+          "reconnect_result": "unknown",
+          "recovery_result": "not_applicable",
+          "source_capture_sha256": "67216b7fb07997841f427952592be6c616a5dc9054fcd7bc8d084b7380a5f8a6",
+          "source_interface": "none",
+          "source_kind": "unknown",
+          "stale_session_handling": "not_applicable",
+          "status": "unknown"
+        },
+        {
+          "binding": {
+            "request": "unknown",
+            "session": "unknown",
+            "task": "unknown"
+          },
+          "capture_status": "complete",
+          "close_behavior": "not_applicable",
+          "duplicate_handling": "not_applicable",
+          "event_kind": "request_recovery",
+          "evidence_id": "evidence-kimi-request-recovery",
+          "failure_behavior": "unknown",
+          "freshness": null,
+          "latency_ms": [],
+          "open_behavior": "not_applicable",
+          "reconnect_result": "not_applicable",
+          "recovery_result": "unknown",
+          "source_capture_sha256": "7c9dba876a2fc5c9c20c21f887395e2ece40c98fe06d4f4f1ae7a53d32d09c01",
+          "source_interface": "none",
+          "source_kind": "unknown",
+          "stale_session_handling": "not_applicable",
+          "status": "unknown"
+        },
+        {
+          "binding": {
+            "request": "not_applicable",
+            "session": "unknown",
+            "task": "unknown"
+          },
+          "capture_status": "complete",
+          "close_behavior": "not_applicable",
+          "duplicate_handling": "not_applicable",
+          "event_kind": "stale_session",
+          "evidence_id": "evidence-kimi-stale-session",
+          "failure_behavior": "unknown",
+          "freshness": null,
+          "latency_ms": [],
+          "open_behavior": "not_applicable",
+          "reconnect_result": "not_applicable",
+          "recovery_result": "not_applicable",
+          "source_capture_sha256": "9fd6aa69b46f24088d5f7f7ef2b59048a386c0162ecbe099343298d5bbf4ae1e",
+          "source_interface": "none",
+          "source_kind": "unknown",
+          "stale_session_handling": "unknown",
+          "status": "unknown"
+        },
+        {
+          "binding": {
+            "request": "not_applicable",
+            "session": "unknown",
+            "task": "unknown"
+          },
+          "capture_status": "complete",
+          "close_behavior": "unknown",
+          "duplicate_handling": "not_applicable",
+          "event_kind": "turn_state",
+          "evidence_id": "evidence-kimi-turn-state",
+          "failure_behavior": "unknown",
+          "freshness": null,
+          "latency_ms": [],
+          "open_behavior": "unknown",
+          "reconnect_result": "not_applicable",
+          "recovery_result": "not_applicable",
+          "source_capture_sha256": "79fcbd385529145cde5941bd4f9ecd5994d3105f8e8dbe327a46cf76d6573b63",
+          "source_interface": "none",
+          "source_kind": "unknown",
+          "stale_session_handling": "not_applicable",
+          "status": "unknown"
+        }
+      ],
+      "freshness": null,
+      "provider": "kimi",
+      "provider_version": "synthetic",
+      "sources": [
+        {
+          "interface": "none",
+          "kind": "unknown"
+        }
+      ],
+      "support": "attach_only_unknown"
+    }
+  ],
+  "required_cells": 24,
+  "required_event_kinds": [
+    "approval_request",
+    "duplicate",
+    "heartbeat",
+    "input_request",
+    "reconnect",
+    "request_recovery",
+    "stale_session",
+    "turn_state"
+  ],
+  "schema_version": 1,
+  "source_fixture": "tests/fixtures/provider-evidence/synthetic.jsonl",
+  "source_fixture_sha256": "a284338599778a325f5337165933f3d6f59dce639c904da31eb932af49229888",
+  "v0_6_gate": "experimental_preview"
+}
