@@ -7,7 +7,9 @@ import fcntl
 import json
 import os
 import pty
+import runpy
 import select
+import shutil
 import signal
 import struct
 import subprocess
@@ -24,10 +26,17 @@ CLILANE = ROOT / "bin" / "clilane"
 
 
 class _Terminal:
-    def __init__(self, arguments: Sequence[str], environment: dict[str, str]) -> None:
+    def __init__(
+        self,
+        arguments: Sequence[str],
+        environment: dict[str, str],
+        cwd: str | None = None,
+    ) -> None:
         pid, descriptor = pty.fork()
         if pid == 0:
             try:
+                if cwd is not None:
+                    os.chdir(cwd)
                 fcntl.ioctl(
                     sys.stdout.fileno(),
                     termios.TIOCSWINSZ,
@@ -201,6 +210,56 @@ def _cleanup(environment: dict[str, str]) -> None:
     _tmux(environment, ["kill-session", "-t", "hub"])
 
 
+def _exercise_discovery_helpers(root: Path) -> None:
+    namespace = runpy.run_path(str(CLILANE), run_name="clilane_test")
+    discover = namespace["discover_hub_presets"]
+    load = namespace["load_hub_presets"]
+    notice = namespace["hub_no_presets_notice"]
+    error_type = namespace["CliLaneError"]
+
+    assert discover({}, str(root.resolve())) == []
+    assert discover({"PATH": ""}, str(root.resolve())) == []
+
+    helper_bin = root / "helper-agents"
+    helper_bin.mkdir(mode=0o700)
+    (helper_bin / "kimi").symlink_to("/bin/cat")
+    assert discover(
+        {"PATH": str(helper_bin.resolve())}, str(root.resolve())
+    ) == [
+        {
+            "name": "kimi",
+            "command": [str(root.resolve() / "helper-agents" / "kimi")],
+            "dir": str(root.resolve()),
+        }
+    ]
+
+    try:
+        discover({"PATH": str(helper_bin)}, "relative")
+    except Exception as error:
+        assert type(error) is error_type
+    else:
+        raise AssertionError("relative discovery directory was accepted")
+
+    try:
+        load(str(root / "missing.json"), allow_missing=False)
+    except Exception as error:
+        assert type(error) is error_type
+    else:
+        raise AssertionError("missing explicit hub config was accepted")
+
+    config = str(root / "config" / "clilane" / "hub.json")
+    assert "Install Codex, Kimi, or Claude" in notice(
+        config, config_present=False, config_required=False
+    )
+    default_notice = notice(config, config_present=True, config_required=False)
+    assert "Config disables discovery" in default_notice
+    assert "Remove it" in default_notice
+    assert "Install Codex, Kimi, or Claude" not in default_notice
+    explicit_notice = notice(config, config_present=True, config_required=True)
+    assert "Add agent presets" in explicit_notice
+    assert "Remove it" not in explicit_notice
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="clp-", dir="/tmp") as temporary:
         root = Path(temporary)
@@ -234,6 +293,135 @@ def main() -> int:
                 "XDG_CONFIG_HOME": str(root / "config"),
             }
         )
+        _exercise_discovery_helpers(root)
+
+        tool_bin = root / "tools"
+        tool_bin.mkdir(mode=0o700)
+        tmux_executable = shutil.which("tmux")
+        sleep_executable = shutil.which("sleep")
+        assert tmux_executable is not None
+        assert sleep_executable is not None
+        (tool_bin / "tmux").symlink_to(tmux_executable)
+        (tool_bin / "sleep").symlink_to(sleep_executable)
+        (tool_bin / "python3").symlink_to(sys.executable)
+
+        launch_project = root / "launch-project"
+        source_project = root / "source-project"
+        for project, agents in (
+            (launch_project, ("codex", "kimi", "claude")),
+            (source_project, ("kimi",)),
+        ):
+            agent_bin = project / "agent-bin"
+            agent_bin.mkdir(parents=True, mode=0o700)
+            for agent in agents:
+                (agent_bin / agent).symlink_to("/bin/cat")
+
+        discovery_environment = dict(environment)
+        discovery_environment["PATH"] = os.pathsep.join(
+            ["agent-bin", str(tool_bin.resolve())]
+        )
+        discovery_environment["SHELL"] = "/bin/sh"
+        discovery_terminal: _Terminal | None = None
+        try:
+            discovery_terminal = _Terminal(
+                [], discovery_environment, cwd=str(launch_project)
+            )
+            discovery_terminal.expect("codex / kimi / claude")
+            discovery_terminal.expect("[codex · launch-project]")
+            launch_prompt = f"zero config {os.getpid()}"
+            mark = discovery_terminal.mark()
+            discovery_terminal.send(launch_prompt.encode() + b"\r")
+            discovery_terminal.expect("Starting codex-launch-project", mark)
+            discovery_terminal.expect(launch_prompt, mark)
+            discovery_terminal.settle()
+            mark = discovery_terminal.mark()
+            discovery_terminal.send(b"\x11")
+            discovery_terminal.expect("This clilane server", mark)
+            discovery_terminal.send(b"\x11")
+            assert discovery_terminal.wait() == 0
+            discovery_terminal.close()
+            discovery_terminal = None
+
+            tasks = _tasks(discovery_environment)
+            launched = [
+                task
+                for task in tasks
+                if task["name"] == "codex-launch-project"
+            ]
+            assert len(launched) == 1, tasks
+            assert launched[0]["command"] == [
+                str(launch_project.resolve() / "agent-bin" / "codex")
+            ]
+            assert launched[0]["cwd"] == str(launch_project.resolve())
+
+            _run(
+                discovery_environment,
+                [
+                    "run",
+                    "source-ui",
+                    "-C",
+                    str(source_project),
+                    "--",
+                    "/bin/cat",
+                ],
+            )
+            discovery_terminal = _Terminal(
+                ["attach", "source-ui"],
+                discovery_environment,
+                cwd=str(launch_project),
+            )
+            discovery_terminal.expect("LOCAL · source-ui")
+            mark = discovery_terminal.mark()
+            discovery_terminal.send(b"\x11")
+            discovery_terminal.expect("This clilane server", mark)
+            discovery_terminal.expect("[kimi · source-project]", mark)
+            source_prompt = f"source project {os.getpid()}"
+            mark = discovery_terminal.mark()
+            discovery_terminal.send(source_prompt.encode() + b"\r")
+            discovery_terminal.expect("Starting kimi-source-project", mark)
+            discovery_terminal.expect(source_prompt, mark)
+            discovery_terminal.settle()
+            mark = discovery_terminal.mark()
+            discovery_terminal.send(b"\x11")
+            discovery_terminal.expect("This clilane server", mark)
+            discovery_terminal.send(b"\x11")
+            assert discovery_terminal.wait() == 0
+            discovery_terminal.close()
+            discovery_terminal = None
+
+            tasks = _tasks(discovery_environment)
+            launched = [
+                task
+                for task in tasks
+                if task["name"] == "kimi-source-project"
+            ]
+            assert len(launched) == 1, tasks
+            assert launched[0]["command"] == [
+                str(source_project.resolve() / "agent-bin" / "kimi")
+            ]
+            assert launched[0]["cwd"] == str(source_project.resolve())
+
+            (config_dir / "hub.json").write_text(
+                json.dumps({"schema_version": 1, "agents": []}),
+                encoding="utf-8",
+            )
+            before = len(tasks)
+            discovery_terminal = _Terminal(
+                [], discovery_environment, cwd=str(launch_project)
+            )
+            discovery_terminal.expect("no presets")
+            discovery_terminal.expect("Config disables discovery")
+            mark = discovery_terminal.mark()
+            discovery_terminal.send(b"suppressed discovery\r")
+            discovery_terminal.expect("Config disables discovery", mark)
+            assert len(_tasks(discovery_environment)) == before
+            discovery_terminal.send(b"\x11")
+            assert discovery_terminal.wait() == 0
+        finally:
+            if discovery_terminal is not None:
+                discovery_terminal.close()
+            _cleanup(discovery_environment)
+
         command = [
             "/bin/sh",
             "-c",

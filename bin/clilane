@@ -31,7 +31,7 @@ from typing import BinaryIO, Iterator, Sequence
 
 
 PROGRAM = "clilane"
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 TASK_STATE_INITIALIZING = "initializing"
 TASK_STATE_RUNNING = "running"
 TASK_STATE_STOPPED = "stopped"
@@ -2304,8 +2304,38 @@ def tmux_quoted(text: str) -> str:
     return f'"{escaped}"'
 
 
+def discover_hub_presets(
+    environment: dict[str, str], directory: str
+) -> list[dict[str, object]]:
+    path_value = environment.get("PATH")
+    if not path_value:
+        return []
+    launch_directory = Path(directory).expanduser()
+    if not launch_directory.is_absolute():
+        raise CliLaneError("hub discovery directory must be absolute")
+    search_roots: list[str] = []
+    for value in path_value.split(os.pathsep):
+        candidate = Path(value or ".")
+        if not candidate.is_absolute():
+            candidate = launch_directory / candidate
+        search_roots.append(str(candidate))
+    search_path = os.pathsep.join(search_roots)
+    presets: list[dict[str, object]] = []
+    for name in HUB_PROMPT_AGENT_ORDER:
+        executable = shutil.which(name, path=search_path)
+        if executable:
+            presets.append(
+                {"name": name, "command": [executable], "dir": str(launch_directory)}
+            )
+    return presets
+
+
 def load_hub_presets(
-    configured: str | None, *, allow_missing: bool | None = None
+    configured: str | None,
+    *,
+    allow_missing: bool | None = None,
+    discovery_environment: dict[str, str] | None = None,
+    discovery_directory: str | None = None,
 ) -> list[dict[str, object]]:
     path = hub_config_path(configured)
     missing_ok = not configured if allow_missing is None else allow_missing
@@ -2316,6 +2346,8 @@ def load_hub_presets(
             raise CliLaneError(
                 f"hub config not found: {str(path)!r}; create it or omit --config"
             ) from None
+        if discovery_environment is not None and discovery_directory is not None:
+            return discover_hub_presets(discovery_environment, discovery_directory)
         return []
     except UnicodeDecodeError as error:
         raise CliLaneError(f"hub config is not UTF-8: {str(path)!r}") from error
@@ -2500,10 +2532,18 @@ def hub_context_data(context: str) -> dict[str, object]:
     ):
         raise CliLaneError("corrupt session switcher context")
     config = decoded.get("config")
+    launch_cwd = decoded.get("launch_cwd")
     if (
         decoded.get("schema_version") != HUB_CONTEXT_SCHEMA_VERSION
         or not isinstance(config, str)
         or not Path(config).is_absolute()
+        or (
+            launch_cwd is not None
+            and (
+                not isinstance(launch_cwd, str)
+                or not Path(launch_cwd).is_absolute()
+            )
+        )
         or not isinstance(decoded.get("config_required"), bool)
         or not isinstance(decoded.get("environment_error"), str)
     ):
@@ -2518,6 +2558,7 @@ def create_hub_context(configured: str | None) -> str:
         "environment_error": "",
         "config": str(hub_config_path(configured)),
         "config_required": bool(configured),
+        "launch_cwd": str(Path.cwd().resolve()),
     }
     encoded = encode_meta(payload)
     if len(encoded) > HUB_ENV_MAX_BYTES:
@@ -2851,6 +2892,16 @@ def hub_composer_line(
     return f"\033[1m[{agent}]\033[0m > {visible_before}▏{visible_after}"
 
 
+def hub_no_presets_notice(
+    config: str, *, config_present: bool, config_required: bool
+) -> str:
+    if config_required:
+        return f"Add agent presets to {config}"
+    if config_present:
+        return f"Config disables discovery · Remove it or add agent presets to {config}"
+    return f"Install Codex, Kimi, or Claude · Add agent presets to {config}"
+
+
 def hub_draw(
     tasks: Sequence[Task],
     selected: int,
@@ -2917,11 +2968,29 @@ def hub_ui(client: str, source: str, context: str) -> int:
         raise CliLaneError("the clilane client is no longer attached")
     data = hub_context_data(context)
     config = str(data["config"])
-    presets = hub_composer_presets(
-        load_hub_presets(config, allow_missing=not bool(data["config_required"]))
-    )
+    config_present = Path(config).exists()
+    config_required = bool(data["config_required"])
     tasks = hub_task_order(list_tasks())
     source_task = next((task for task in tasks if task.session == source), None)
+    configured_directory = data.get("launch_cwd")
+    discovery_directory = (
+        source_task.cwd
+        if source_task is not None
+        else configured_directory
+        if isinstance(configured_directory, str)
+        else str(Path.home())
+    )
+    context_environment = data["environment"]
+    presets = hub_composer_presets(
+        load_hub_presets(
+            config,
+            allow_missing=not config_required,
+            discovery_environment=context_environment
+            if isinstance(context_environment, dict)
+            else None,
+            discovery_directory=discovery_directory,
+        )
+    )
     selected_key = source_task.id if source_task else (tasks[0].id if tasks else "")
     agent_index = 0
     if source_task:
@@ -2961,6 +3030,12 @@ def hub_ui(client: str, source: str, context: str) -> int:
     prompt = ""
     cursor = 0
     notice = str(data["environment_error"])
+    if not notice and not presets:
+        notice = hub_no_presets_notice(
+            config,
+            config_present=config_present,
+            config_required=config_required,
+        )
     descriptor = sys.stdin.fileno()
     previous = termios.tcgetattr(descriptor)
     try:
@@ -3008,7 +3083,11 @@ def hub_ui(client: str, source: str, context: str) -> int:
                     direction = -1 if key == "backtab" else 1
                     agent_index = (agent_index + direction) % len(presets)
                 else:
-                    notice = f"Add agent presets to {config}"
+                    notice = hub_no_presets_notice(
+                        config,
+                        config_present=config_present,
+                        config_required=config_required,
+                    )
                 continue
             if key == "clear":
                 prompt = ""
@@ -3038,7 +3117,11 @@ def hub_ui(client: str, source: str, context: str) -> int:
                 notice = "Type a message to start a new session"
                 continue
             if preset is None:
-                notice = f"Add agent presets to {config}"
+                notice = hub_no_presets_notice(
+                    config,
+                    config_present=config_present,
+                    config_required=config_required,
+                )
                 continue
             name = hub_task_name(preset, tasks)
             hub_draw(

@@ -255,10 +255,16 @@ it an agent-and-project task name, and delivers the message through its terminal
 The message is not stored in the command arguments or task metadata. It can still
 appear in the terminal log, just as if you had typed it directly into the agent.
 
-Agent choices come from an optional file at `~/.config/clilane/hub.json` (or under
-`$XDG_CONFIG_HOME`). Codex, Kimi, and Claude are shown first; other configured
-presets remain available. Without presets, the switcher still opens existing jobs
-but cannot start a new one from the composer.
+When the optional `~/.config/clilane/hub.json` file is absent (or absent under
+`$XDG_CONFIG_HOME`), CLI Lane discovers executable `codex`, `kimi`, and `claude`
+commands from the shell PATH captured when the switcher opens. New sessions start
+in the directory where you ran `clilane`; returning from a managed job uses that
+job's directory instead. Installed agents are shown in Codex, Kimi, Claude order.
+
+A present config file is authoritative, including an intentionally empty agents
+list. Use it to override commands, directories, ordering among same-kind presets,
+or add other agents. Codex, Kimi, and Claude presets are shown first; other
+configured presets remain available.
 
 ```json
 {
@@ -375,7 +381,7 @@ running.
 | Setting | Purpose |
 |---|---|
 | `~/.config/clilane/fleet.json` | Default versioned fleet inventory. |
-| `~/.config/clilane/hub.json` | Optional switcher presets, up to nine agents. |
+| `~/.config/clilane/hub.json` | Optional switcher overrides, up to nine agents; absent files enable agent discovery. |
 | `XDG_CONFIG_HOME` | Moves the default fleet and hub configs under `$XDG_CONFIG_HOME/clilane/`. |
 | `CLILANE_TMUX_SOCKET` | Overrides the dedicated local tmux socket. |
 | `CLILANE_STATE_HOME` | Overrides the local state root; it must be absolute. |
