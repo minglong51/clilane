@@ -115,6 +115,49 @@ clilane run claude-api -C ~/projects/api -- claude
 
 The named command must already be installed on that host.
 
+### Clean launch profiles
+
+Profiles make an agent's launch environment explicit. Create
+`$XDG_CONFIG_HOME/clilane/profiles.json`, or
+`~/.config/clilane/profiles.json` when `XDG_CONFIG_HOME` is unset:
+
+```json
+{
+  "schema_version": 1,
+  "profiles": {
+    "claude-clean": {
+      "provider": "claude",
+      "command": ["claude"],
+      "cwd": { "mode": "explicit" },
+      "env": {
+        "inherit": ["ANTHROPIC_API_KEY"],
+        "set": { "PATH": "/opt/homebrew/bin:/usr/bin:/bin" }
+      }
+    }
+  }
+}
+```
+
+Launch it with `clilane run NAME --profile PROFILE [-C DIR]`. The profile owns
+the complete argument vector and cannot be combined with raw `-- COMMAND`.
+`cwd.mode: explicit` requires `-C`; `cwd.mode: fixed` requires an absolute
+`path` and forbids `-C`. Profile and provider names are case-sensitive and use
+the same 1–64-character safe-name grammar as task names.
+
+The child environment starts with the present values of `HOME`, `PATH`, `USER`,
+`LOGNAME`, `SHELL`, `TMPDIR`, `LANG`, `LC_ALL`, and `LC_CTYPE`. CLI Lane then
+copies the keys named by `env.inherit` and applies `env.set`, which takes
+precedence. A missing inherited key fails the launch. `TERM`, `TMUX`,
+`TMUX_PANE`, `CLILANE_*`, and `AGT_*` are reserved. Keys ending in `_TOKEN`,
+`_KEY`, `_SECRET`, or `_PASSWORD`, case-insensitively, cannot appear in
+`env.set`; inherit those values instead.
+
+The strict schema-v1 file is limited to 256 KiB. It must be a regular,
+non-symlink file owned by the current user and not writable by group or others.
+The fully materialized launch must also fit CLI Lane's portable 64 KiB launch
+budget. Profiles provide environment isolation, not a security sandbox. The
+command still runs with your Unix user's permissions.
+
 ## View tasks across hosts
 
 `clilane fleet` reads a fixed set of hosts concurrently; `--watch` keeps the
@@ -268,25 +311,26 @@ configured presets remain available.
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "agents": [
     { "name": "codex", "command": ["codex"], "dir": "~/projects/app" },
-    { "name": "kimi", "command": ["kimi"], "dir": "~/projects/web" },
-    { "name": "claude", "command": ["claude"], "dir": "~/projects/app" },
-    { "name": "hermes", "command": ["hermes"], "dir": "~" }
+    { "name": "claude", "profile": "claude-clean", "dir": "~/projects/app" },
+    { "name": "kimi", "profile": "kimi-fixed" }
   ]
 }
 ```
 
-`dir` must be absolute after `~` expansion. A preset starts an ordinary task, so
-`list`, `log`, `stop`, and the fleet commands all see it.
+Each schema-v2 preset contains exactly one of `command` or `profile`. A command
+preset is a raw launch using the filtered environment captured when the switcher
+opens. An explicit-cwd profile requires `dir`; a fixed-cwd profile forbids it.
+`dir` must be absolute after `~` expansion. Only profile-backed v2 presets use a
+clean environment. Discovered presets and schema-v1 configs remain accepted with
+their legacy raw environment behavior.
 
-An agent started from the composer inherits the environment of the shell you ran
-`clilane` in — the same environment `clilane run` would have given it. This
-matters more than it sounds: tools installed by a version manager, or on a PATH
-your shell builds interactively, are invisible to the tmux server that runs the
-switcher, so without this a preset for such a tool would fail to launch at all.
-Opening or attaching through CLI Lane refreshes the captured environment.
+CLI Lane rereads schema-v2 presets and profiles immediately before launch. If the
+selected preset, profile, or resolved directory changed while the menu was open,
+reopen the switcher. Every preset still starts an ordinary task, so `list`, `log`,
+`stop`, and the fleet commands all see it.
 
 The switcher runs on CLI Lane's own tmux server, so it nests safely inside your
 normal tmux: your prefix, configuration, and other panes are untouched, and both
@@ -321,7 +365,8 @@ named `agt` for compatibility with tasks created before the project was renamed.
 
 | Command | Behavior |
 |---|---|
-| `run NAME [-C DIR] [--on-exit COMMAND] [--wait] -- COMMAND [ARG ...]` | Start a background task. `DIR` defaults to the current directory. `--wait` blocks and returns the command's exit status; `--timeout` returns 124. `--on-exit` runs a shell command after the task exits. |
+| `run NAME [-C DIR] [--on-exit COMMAND] [--wait] -- COMMAND [ARG ...]` | Start a raw background task. `DIR` defaults to the current directory. `--wait` blocks and returns the command's exit status; `--timeout` returns 124. |
+| `run NAME --profile PROFILE [-C DIR] [--on-exit COMMAND] [--wait]` | Start a task from a clean launch profile. The profile's cwd rule determines whether `-C` is required or forbidden. |
 | `list`, `ls`, `ps` | List tasks on the current host. `--json` emits an array. |
 | `fleet` | Read the configured local and SSH hosts. Supports `--config`, `--timeout`, `--json`, and `--watch` (`--interval` defaults to 2 seconds). |
 | `fleet status HOST:TASK` | Show one task on a fleet host as JSON. |
@@ -347,7 +392,9 @@ empty) in its environment. Hook output is captured in the task log. The hook
 gets 30 seconds, then it is killed; its exit status never changes the task's.
 With `--wait`, the wait returns after the hook finishes. Stopping or removing
 the task while the hook runs delivers TERM to the hook first and kills it after
-the grace period; the task's recorded exit status is unaffected either way.
+the grace period; the task's recorded exit status is unaffected either way. A
+profile launch gives the hook the same selected environment plus the exit-result
+keys.
 
 Task names are unique per host. They are 1–64 characters, begin with an ASCII
 letter or number, and otherwise contain ASCII letters, numbers, dots, dashes, or
@@ -382,7 +429,8 @@ running.
 |---|---|
 | `~/.config/clilane/fleet.json` | Default versioned fleet inventory. |
 | `~/.config/clilane/hub.json` | Optional switcher overrides, up to nine agents; absent files enable agent discovery. |
-| `XDG_CONFIG_HOME` | Moves the default fleet and hub configs under `$XDG_CONFIG_HOME/clilane/`. |
+| `~/.config/clilane/profiles.json` | Strict clean-launch profile definitions. |
+| `XDG_CONFIG_HOME` | Moves the default fleet, hub, and profile configs under `$XDG_CONFIG_HOME/clilane/`. |
 | `CLILANE_TMUX_SOCKET` | Overrides the dedicated local tmux socket. |
 | `CLILANE_STATE_HOME` | Overrides the local state root; it must be absolute. |
 | `XDG_STATE_HOME` | Uses `$XDG_STATE_HOME/clilane` for state. |
@@ -397,9 +445,13 @@ logs under `~/.local/state/agt` remain readable for compatibility.
 
 - Commands run as exact argument vectors through `execvpe`; CLI Lane does not
   insert a shell. Run `sh -lc` explicitly when you want pipelines or redirection.
-- Tasks run with your user permissions. CLI Lane is not a sandbox.
-- Each task receives a snapshot of its launching environment except transient
-  tmux and terminal variables. Environment secrets remain available to the task.
+- Profiles provide environment isolation, not a security sandbox. Every task
+  still runs with your Unix user's permissions.
+- Raw, discovered, and hub-v1 launches receive a filtered snapshot of the
+  launching environment. Profile launches receive only the baseline keys,
+  explicitly inherited keys, literal assignments, and CLI Lane/tmux runtime
+  keys. Inherited values are not written to task records or the hub selection
+  digest, but the child can expose them through terminal output and logs.
 - Logs contain raw terminal bytes, ANSI controls, and potentially sensitive
   program output.
 - Local and fleet JSON include full command arguments, working directories, and
