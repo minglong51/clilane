@@ -337,6 +337,7 @@ def main() -> int:
             mark = discovery_terminal.mark()
             discovery_terminal.send(b"\x11")
             discovery_terminal.expect("This clilane server", mark)
+            time.sleep(0.25)
             discovery_terminal.send(b"\x11")
             assert discovery_terminal.wait() == 0
             discovery_terminal.close()
@@ -384,6 +385,7 @@ def main() -> int:
             mark = discovery_terminal.mark()
             discovery_terminal.send(b"\x11")
             discovery_terminal.expect("This clilane server", mark)
+            time.sleep(0.25)
             discovery_terminal.send(b"\x11")
             assert discovery_terminal.wait() == 0
             discovery_terminal.close()
@@ -415,6 +417,7 @@ def main() -> int:
             discovery_terminal.send(b"suppressed discovery\r")
             discovery_terminal.expect("Config disables discovery", mark)
             assert len(_tasks(discovery_environment)) == before
+            time.sleep(0.25)
             discovery_terminal.send(b"\x11")
             assert discovery_terminal.wait() == 0
         finally:
