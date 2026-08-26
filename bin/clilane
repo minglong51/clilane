@@ -33,7 +33,7 @@ from typing import BinaryIO, Iterator, Mapping, Sequence
 
 
 PROGRAM = "clilane"
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 TASK_STATE_INITIALIZING = "initializing"
 TASK_STATE_RUNNING = "running"
 TASK_STATE_STOPPED = "stopped"
@@ -50,6 +50,7 @@ HUB_SESSION = "hub"
 HUB_MAX_PRESETS = 9
 HUB_CONTEXT_OPTION_PREFIX = "@agt_hub_context_"
 HUB_CLIENT_CONTEXT_OPTION_PREFIX = "@agt_hub_client_"
+HUB_CLIENT_POPUP_OPTION_PREFIX = "@agt_hub_popup_"
 HUB_ENV_MAX_BYTES = 256 * 1024
 HUB_CONFIG_SCHEMA_VERSIONS = frozenset({1, 2})
 HUB_CONTEXT_SCHEMA_VERSION = 2
@@ -434,6 +435,38 @@ def tmux_server_absent(completed: subprocess.CompletedProcess[bytes]) -> bool:
     return "no server running" in detail or (
         "error connecting to " in detail and "no such file or directory" in detail
     )
+
+
+def current_tmux_socket_path() -> str | None:
+    value = os.environ.get("TMUX")
+    if not value:
+        return None
+    fields = value.rsplit(",", 2)
+    if len(fields) != 3 or not fields[0] or not Path(fields[0]).is_absolute():
+        return None
+    return fields[0]
+
+
+def hub_command_is_recursive() -> bool:
+    current = current_tmux_socket_path()
+    if current is None:
+        return False
+    displayed = tmux(["display-message", "-p", "#{socket_path}"], check=False)
+    if displayed.returncode != 0:
+        return False
+    target = displayed.stdout.decode(errors="replace").strip()
+    if not target:
+        return False
+    try:
+        same_socket = os.path.samefile(current, target)
+    except OSError:
+        same_socket = Path(current).resolve() == Path(target).resolve()
+    if not same_socket:
+        return False
+    tag = tmux(
+        ["show-options", "-gqv", "@agt_server"], check=False
+    ).stdout.decode(errors="replace").strip()
+    return tag == SERVER_TAG
 
 
 def state_root_path() -> Path:
@@ -3516,6 +3549,11 @@ def hub_client_context_option(client: str) -> str:
     return f"{HUB_CLIENT_CONTEXT_OPTION_PREFIX}{digest}"
 
 
+def hub_client_popup_option(client: str) -> str:
+    digest = hashlib.sha256(client.encode()).hexdigest()[:32]
+    return f"{HUB_CLIENT_POPUP_OPTION_PREFIX}{digest}"
+
+
 def parse_hub_client_context(value: str) -> tuple[str, str] | None:
     matched = HUB_CLIENT_CONTEXT_PATTERN.fullmatch(value)
     return matched.groups() if matched else None
@@ -3627,22 +3665,139 @@ def hub_client_context(client: str, client_pid: str) -> str:
     return context
 
 
-def forget_hub_client(
-    client: str, context: str | None = None, client_pid: str | None = None
-) -> None:
+def forget_hub_client(client: str, client_pid: str, context: str) -> None:
+    if not HUB_CLIENT_CONTEXT_PATTERN.fullmatch(f"{client_pid}:{context}"):
+        raise CliLaneError("invalid hub client context")
     option = hub_client_context_option(client)
+    value = f"{client_pid}:{context}"
+    run_tmux_commands_if(
+        tmux_option_equals(option, value),
+        [
+            ["set-option", "-gu", option],
+            ["set-hook", "-gu", hub_detach_hook(context)],
+            ["set-option", "-gu", hub_context_option(context)],
+        ],
+    )
+
+
+def tmux_option_equals(option: str, value: str) -> str:
+    return f"#{{==:#{{{option}}},{value}}}"
+
+
+def tmux_all(conditions: Sequence[str]) -> str:
+    if not conditions:
+        raise CliLaneError("tmux condition list cannot be empty")
+    combined = conditions[0]
+    for condition in conditions[1:]:
+        combined = f"#{{&&:{combined},{condition}}}"
+    return combined
+
+
+def tmux_client_equals(client: str, client_pid: str, session: str) -> str:
+    condition = tmux_all(
+        [
+            f"#{{==:#{{client_name}},{client}}}",
+            f"#{{==:#{{client_pid}},{client_pid}}}",
+            f"#{{==:#{{client_session}},{session}}}",
+        ]
+    )
+    return f"#{{L:#{{?{condition},1,}}}}"
+
+
+def hub_popup_owner_condition(
+    client: str,
+    client_pid: str,
+    context: str,
+    popup_value: str,
+) -> str:
+    return tmux_all(
+        [
+            tmux_option_equals(hub_client_popup_option(client), popup_value),
+            tmux_option_equals(
+                hub_client_context_option(client), f"{client_pid}:{context}"
+            ),
+            tmux_client_equals(client, client_pid, HUB_SESSION),
+        ]
+    )
+
+
+def run_tmux_commands_if(condition: str, commands: Sequence[Sequence[str]]) -> None:
+    tmux(
+        [
+            "if-shell",
+            "-F",
+            condition,
+            " ; ".join(shlex.join(command) for command in commands),
+            "",
+        ],
+        check=False,
+    )
+
+
+def clear_hub_popup(client: str, value: str) -> None:
+    option = hub_client_popup_option(client)
+    run_tmux_commands_if(
+        tmux_option_equals(option, value), [["set-option", "-gu", option]]
+    )
+
+
+def replace_hub_popup(
+    client: str,
+    client_pid: str,
+    context: str,
+    current_value: str,
+    replacement_value: str,
+) -> bool:
+    option = hub_client_popup_option(client)
+    run_tmux_commands_if(
+        hub_popup_owner_condition(client, client_pid, context, current_value),
+        [["set-option", "-g", option, replacement_value]],
+    )
     current = tmux(["show-options", "-gqv", option]).stdout.decode().strip()
-    entry = parse_hub_client_context(current)
-    if entry is None:
-        return
-    mapped_pid, mapped_context = entry
-    if context is not None and mapped_context != context:
-        return
-    if client_pid is not None and mapped_pid != client_pid:
-        return
-    tmux(["set-option", "-gu", option], check=False)
-    tmux(["set-hook", "-gu", hub_detach_hook(mapped_context)], check=False)
-    tmux(["set-option", "-gu", hub_context_option(mapped_context)], check=False)
+    return current == replacement_value
+
+
+def switch_hub_popup(
+    client: str,
+    client_pid: str,
+    context: str,
+    popup_value: str,
+    target: str,
+) -> None:
+    option = hub_client_popup_option(client)
+    run_tmux_commands_if(
+        hub_popup_owner_condition(client, client_pid, context, popup_value),
+        [
+            ["set-option", "-gu", option],
+            ["switch-client", "-E", "-c", client, "-t", target],
+        ],
+    )
+
+
+def detach_hub_popup(
+    client: str, client_pid: str, context: str, popup_value: str
+) -> None:
+    popup_option = hub_client_popup_option(client)
+    client_option = hub_client_context_option(client)
+    run_tmux_commands_if(
+        hub_popup_owner_condition(client, client_pid, context, popup_value),
+        [
+            ["set-option", "-gu", popup_option],
+            ["set-option", "-gu", client_option],
+            ["set-hook", "-gu", hub_detach_hook(context)],
+            ["set-option", "-gu", hub_context_option(context)],
+            ["detach-client", "-t", client],
+        ],
+    )
+
+
+def finish_hub_popup(
+    client: str, client_pid: str, context: str, generation: str
+) -> None:
+    popup_value = f"{client_pid}:{context}:{generation}"
+    for owned_value in (popup_value, f"{popup_value}:launch"):
+        detach_hub_popup(client, client_pid, context, owned_value)
+        clear_hub_popup(client, owned_value)
 
 
 def hub_register(client: str, client_pid: str, context: str) -> int:
@@ -3655,8 +3810,7 @@ def hub_forget(
 ) -> int:
     if detached_client != client:
         return 0
-    forget_hub_client(client, context=context, client_pid=client_pid)
-    tmux(["set-hook", "-gu", hub_detach_hook(context)], check=False)
+    forget_hub_client(client, client_pid, context)
     return 0
 
 
@@ -3680,10 +3834,14 @@ def hub_open(
     for task in list_tasks():
         configure_task_status(task.session)
     tmux(["switch-client", "-E", "-c", client, "-t", HUB_SESSION])
+    generation = uuid.uuid4().hex
+    popup_value = f"{client_pid}:{context}:{generation}"
+    tmux(["set-option", "-g", hub_client_popup_option(client), popup_value])
     tmux(["display-popup", "-c", client, "-C"], check=False)
     command = (
         f"{hub_helper_prefix('__hub-ui')}"
-        f"{shlex.quote(client)} {shlex.quote(source)} {shlex.quote(context)}"
+        f"{shlex.quote(client)} {shlex.quote(client_pid)} "
+        f"{shlex.quote(source)} {shlex.quote(context)} {shlex.quote(generation)}"
     )
     shown = tmux(
         [
@@ -3704,6 +3862,7 @@ def hub_open(
         ],
         check=False,
     )
+    finish_hub_popup(client, client_pid, context, generation)
     if shown.returncode != 0:
         detail = shown.stderr.decode(errors="replace").strip()
         raise CliLaneError(detail or "could not open the session switcher")
@@ -4041,11 +4200,21 @@ def hub_draw(
     sys.stdout.flush()
 
 
-def hub_ui(client: str, source: str, context: str) -> int:
+def hub_ui(
+    client: str, client_pid: str, source: str, context: str, generation: str
+) -> int:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise CliLaneError("the session switcher needs an interactive terminal")
-    if not hub_client_exists(client):
+    if not HUB_CONTEXT_PATTERN.fullmatch(generation):
+        raise CliLaneError("invalid hub popup generation")
+    if not hub_client_exists(client, client_pid):
         raise CliLaneError("the clilane client is no longer attached")
+    popup_value = f"{client_pid}:{context}:{generation}"
+    current_popup = tmux(
+        ["show-options", "-gqv", hub_client_popup_option(client)]
+    ).stdout.decode().strip()
+    if current_popup != popup_value:
+        return 0
     data = hub_context_data(context)
     config = str(data["config"])
     config_present = Path(config).exists()
@@ -4149,15 +4318,13 @@ def hub_ui(client: str, source: str, context: str) -> int:
                 selected_key = item_keys[selected]
                 continue
             if key == "quit":
-                forget_hub_client(client, context)
-                tmux(["detach-client", "-t", client], check=False)
+                detach_hub_popup(client, client_pid, context, popup_value)
                 return 0
             if key == "left":
                 if prompt:
                     cursor = max(0, cursor - 1)
                     continue
-                forget_hub_client(client, context)
-                tmux(["detach-client", "-t", client], check=False)
+                detach_hub_popup(client, client_pid, context, popup_value)
                 return 0
             if key == "right" and prompt:
                 cursor = min(len(prompt), cursor + 1)
@@ -4194,15 +4361,12 @@ def hub_ui(client: str, source: str, context: str) -> int:
                 continue
             if not prompt:
                 if selected < len(tasks):
-                    tmux(
-                        [
-                            "switch-client",
-                            "-E",
-                            "-c",
-                            client,
-                            "-t",
-                            tasks[selected].session,
-                        ]
+                    switch_hub_popup(
+                        client,
+                        client_pid,
+                        context,
+                        popup_value,
+                        tasks[selected].session,
                     )
                     return 0
                 notice = "Type a message to start a new session"
@@ -4224,12 +4388,27 @@ def hub_ui(client: str, source: str, context: str) -> int:
                 cursor,
                 f"Starting {name}…",
             )
+            claim_value = f"{popup_value}:launch"
+            if not replace_hub_popup(
+                client, client_pid, context, popup_value, claim_value
+            ):
+                return 0
             try:
                 task = launch_hub_preset(preset, name, context, prompt)
             except CliLaneError as error:
+                if not replace_hub_popup(
+                    client, client_pid, context, claim_value, popup_value
+                ):
+                    return 0
                 notice = str(error)
                 continue
-            tmux(["switch-client", "-E", "-c", client, "-t", task.session])
+            switch_hub_popup(
+                client,
+                client_pid,
+                context,
+                claim_value,
+                task.session,
+            )
             return 0
     finally:
         with suppress(termios.error):
@@ -4256,9 +4435,38 @@ def hub_launch_environment(context: str) -> dict[str, str]:
     }
 
 
+def hub_standby() -> int:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise CliLaneError("the hub standby screen needs an interactive terminal")
+    descriptor = sys.stdin.fileno()
+    previous = termios.tcgetattr(descriptor)
+    previous_size: os.terminal_size | None = None
+    try:
+        tty.setraw(descriptor)
+        while True:
+            size = shutil.get_terminal_size((80, 24))
+            if size != previous_size:
+                message = (
+                    "CLI LANE · Switcher inactive · "
+                    "Ctrl-b w to reopen · Ctrl-b d to detach"
+                )
+                sys.stdout.write("\033[H\033[2J" + message)
+                sys.stdout.flush()
+                previous_size = size
+            readable, _, _ = select.select(
+                [descriptor], [], [], HUB_REFRESH_SECONDS
+            )
+            if readable and not os.read(descriptor, 4096):
+                return 0
+    finally:
+        with suppress(termios.error):
+            termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
+
+
 def ensure_hub_session() -> None:
     if tmux_session_absent(HUB_SESSION):
-        shell = os.environ.get("SHELL") or "/bin/sh"
+        python_binary = str(Path(sys.executable).resolve())
+        script = str(Path(__file__).resolve())
         tmux(
             [
                 "start-server",
@@ -4279,8 +4487,10 @@ def ensure_hub_session() -> None:
                 HUB_SESSION,
                 "-c",
                 str(Path.home()),
-                shell,
-                "-l",
+                "--",
+                python_binary,
+                script,
+                "__hub-standby",
             ]
         )
     tmux(
@@ -4297,6 +4507,10 @@ def ensure_hub_session() -> None:
 
 
 def hub_command(configured: str | None) -> int:
+    if hub_command_is_recursive():
+        raise CliLaneError(
+            "already inside CLI Lane; press Ctrl-b w or Ctrl-Q to open the switcher"
+        )
     load_hub_presets(configured)
     ensure_server_available()
     ensure_hub_session()
@@ -5112,6 +5326,8 @@ def main() -> int:
             return supervise(sys.argv[4])
         if len(sys.argv) == 3 and sys.argv[1] == "__supervise":
             return supervise(sys.argv[2])
+        if len(sys.argv) == 2 and sys.argv[1] == "__hub-standby":
+            return hub_standby()
         if len(sys.argv) == 7 and sys.argv[1] == "__hub-register":
             configure_tmux_control(sys.argv[2], sys.argv[3])
             return hub_register(sys.argv[4], sys.argv[5], sys.argv[6])
@@ -5127,11 +5343,15 @@ def main() -> int:
             return hub_open(sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7])
         if len(sys.argv) == 6 and sys.argv[1] == "__hub-open":
             return hub_open(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
-        if len(sys.argv) == 7 and sys.argv[1] == "__hub-ui":
+        if len(sys.argv) == 9 and sys.argv[1] == "__hub-ui":
             configure_tmux_control(sys.argv[2], sys.argv[3])
-            return hub_ui(sys.argv[4], sys.argv[5], sys.argv[6])
-        if len(sys.argv) == 5 and sys.argv[1] == "__hub-ui":
-            return hub_ui(sys.argv[2], sys.argv[3], sys.argv[4])
+            return hub_ui(
+                sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8]
+            )
+        if len(sys.argv) == 7 and sys.argv[1] == "__hub-ui":
+            return hub_ui(
+                sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
+            )
         if len(sys.argv) == 7 and sys.argv[1] == "__log":
             configure_tmux_control(sys.argv[2], sys.argv[3])
             max_bytes = optional_int(sys.argv[5])

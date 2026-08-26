@@ -9,6 +9,7 @@ import os
 import pty
 import runpy
 import select
+import shlex
 import shutil
 import signal
 import struct
@@ -31,6 +32,7 @@ class _Terminal:
         arguments: Sequence[str],
         environment: dict[str, str],
         cwd: str | None = None,
+        executable: Path = CLILANE,
     ) -> None:
         pid, descriptor = pty.fork()
         if pid == 0:
@@ -43,8 +45,8 @@ class _Terminal:
                     struct.pack("HHHH", 24, 100, 0, 0),
                 )
                 os.execve(
-                    str(CLILANE),
-                    [str(CLILANE), *arguments],
+                    str(executable),
+                    [str(executable), *arguments],
                     environment,
                 )
             except BaseException as error:
@@ -79,6 +81,8 @@ class _Terminal:
                 raise AssertionError(f"terminal did not show {value!r}:\n{transcript}")
 
     def wait(self, timeout: float = 10.0) -> int:
+        if self.exit_code is not None:
+            return self.exit_code
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             pid, status = os.waitpid(self.pid, os.WNOHANG)
@@ -87,6 +91,15 @@ class _Terminal:
                 return self.exit_code
             self._read(0.1)
         raise AssertionError("terminal client did not exit")
+
+    def running(self) -> bool:
+        if self.exit_code is not None:
+            return False
+        pid, status = os.waitpid(self.pid, os.WNOHANG)
+        if not pid:
+            return True
+        self.exit_code = os.waitstatus_to_exitcode(status)
+        return False
 
     def settle(self, quiet: float = 0.2, timeout: float = 2.0) -> None:
         deadline = time.monotonic() + timeout
@@ -168,11 +181,19 @@ def _tasks(environment: dict[str, str]) -> list[dict[str, object]]:
 def _tmux(
     environment: dict[str, str], arguments: Sequence[str]
 ) -> subprocess.CompletedProcess[bytes]:
+    return _tmux_on_socket(
+        environment, environment["CLILANE_TMUX_SOCKET"], arguments
+    )
+
+
+def _tmux_on_socket(
+    environment: dict[str, str], socket: str, arguments: Sequence[str]
+) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
         [
             "tmux",
             "-L",
-            environment["CLILANE_TMUX_SOCKET"],
+            socket,
             "-f",
             "/dev/null",
             *arguments,
@@ -191,6 +212,48 @@ def _hub_context_counts(environment: dict[str, str]) -> tuple[int, int]:
     contexts = sum(line.startswith(b"@agt_hub_context_") for line in lines)
     clients = sum(line.startswith(b"@agt_hub_client_") for line in lines)
     return contexts, clients
+
+
+def _hub_popup_count(environment: dict[str, str]) -> int:
+    result = _tmux(environment, ["show-options", "-g"])
+    assert result.returncode == 0
+    return sum(
+        line.startswith(b"@agt_hub_popup_") for line in result.stdout.splitlines()
+    )
+
+
+def _hub_popup_values(environment: dict[str, str]) -> list[str]:
+    result = _tmux(environment, ["show-options", "-g"])
+    assert result.returncode == 0
+    return [
+        line.decode().split(" ", 1)[1]
+        for line in result.stdout.splitlines()
+        if line.startswith(b"@agt_hub_popup_")
+    ]
+
+
+def _call_clilane_function(
+    environment: dict[str, str], name: str, arguments: Sequence[str]
+) -> None:
+    program = (
+        "import runpy,sys; "
+        "namespace=runpy.run_path(sys.argv[1],run_name='clilane_test'); "
+        "namespace[sys.argv[2]](*sys.argv[3:])"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", program, str(CLILANE), name, *arguments],
+        cwd=ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            f"{name} exited {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
 
 
 def _cleanup(environment: dict[str, str]) -> None:
@@ -260,6 +323,325 @@ def _exercise_discovery_helpers(root: Path) -> None:
     assert "Remove it" not in explicit_notice
 
 
+def _exercise_hub_lifecycle(environment: dict[str, str]) -> None:
+    terminal: _Terminal | None = None
+    outer_terminal: _Terminal | None = None
+    reopened: subprocess.Popen[bytes] | None = None
+    outer_socket = f"outer-{os.getpid()}"
+    escape_session = f"escape-{os.getpid()}"
+    recursive_session = f"recursive-{os.getpid()}"
+    try:
+        terminal = _Terminal([], environment)
+        terminal.expect("This clilane server")
+        handshake_mark = terminal.mark()
+        terminal.send(b"\x15")
+        terminal.expect("> ▏", handshake_mark)
+        clients = _tmux(
+            environment,
+            ["list-clients", "-F", "#{client_name}|#{client_pid}"],
+        ).stdout.decode().splitlines()
+        assert len(clients) == 1, clients
+        client, _ = clients[0].split("|", 1)
+        closed = _tmux(environment, ["display-popup", "-c", client, "-C"])
+        assert closed.returncode == 0, closed.stderr.decode(errors="replace")
+        assert terminal.wait(5.0) == 0
+        terminal.close()
+        terminal = None
+
+        deadline = time.monotonic() + 5.0
+        while _hub_context_counts(environment) != (0, 0):
+            if time.monotonic() >= deadline:
+                raise AssertionError("popup-loss cleanup left a hub context behind")
+            time.sleep(0.05)
+        assert _hub_popup_count(environment) == 0
+
+        terminal = _Terminal([], environment)
+        terminal.expect("This clilane server")
+        clients = _tmux(
+            environment,
+            ["list-clients", "-F", "#{client_name}|#{client_pid}"],
+        ).stdout.decode().splitlines()
+        assert len(clients) == 1, clients
+        client, client_pid = clients[0].split("|", 1)
+        original_values = _hub_popup_values(environment)
+        assert len(original_values) == 1, original_values
+        original_popup = original_values[0]
+        redraw_mark = terminal.mark()
+        reopened = subprocess.Popen(
+            [str(CLILANE), "__hub-open", client, "hub", client_pid, ""],
+            cwd=ROOT,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        deadline = time.monotonic() + 5.0
+        current_values = original_values
+        while current_values == original_values:
+            if reopened.poll() is not None:
+                stdout, stderr = reopened.communicate()
+                raise AssertionError(
+                    "overlapping hub open exited before taking ownership\n"
+                    + stdout.decode(errors="replace")
+                    + stderr.decode(errors="replace")
+                )
+            if time.monotonic() >= deadline:
+                raise AssertionError("overlapping hub open did not take ownership")
+            time.sleep(0.05)
+            current_values = _hub_popup_values(environment)
+        assert len(current_values) == 1, current_values
+        current_popup = current_values[0]
+        terminal.expect("This clilane server", redraw_mark)
+        handshake_mark = terminal.mark()
+        terminal.send(b"\x15")
+        terminal.expect("> ▏", handshake_mark)
+        old_pid, old_context, old_generation = original_popup.split(":", 2)
+        assert old_pid == client_pid
+        _call_clilane_function(
+            environment,
+            "finish_hub_popup",
+            [client, client_pid, old_context, old_generation],
+        )
+        assert _hub_popup_values(environment) == [current_popup]
+        assert _hub_context_counts(environment) == (1, 1)
+        assert terminal.running()
+        current_pid, current_context, _ = current_popup.split(":", 2)
+        assert current_pid == client_pid
+        launch_popup = f"{current_popup}:launch"
+        _call_clilane_function(
+            environment,
+            "replace_hub_popup",
+            [client, client_pid, current_context, current_popup, launch_popup],
+        )
+        assert _hub_popup_values(environment) == [launch_popup]
+
+        created = _tmux(
+            environment,
+            ["new-session", "-d", "-s", escape_session, "--", "/bin/cat"],
+        )
+        assert created.returncode == 0, created.stderr.decode(errors="replace")
+        switched = _tmux(
+            environment,
+            ["switch-client", "-E", "-c", client, "-t", escape_session],
+        )
+        assert switched.returncode == 0, switched.stderr.decode(errors="replace")
+        closed = _tmux(environment, ["display-popup", "-c", client, "-C"])
+        assert closed.returncode == 0, closed.stderr.decode(errors="replace")
+        stdout, stderr = reopened.communicate(timeout=5)
+        assert reopened.returncode == 1, stdout.decode(errors="replace")
+        assert b"could not open the session switcher" in stderr, stderr
+        reopened = None
+        attached = _tmux(
+            environment,
+            ["list-clients", "-F", "#{client_name}|#{client_session}"],
+        ).stdout.decode().splitlines()
+        assert attached == [f"{client}|{escape_session}"], attached
+        assert terminal.running()
+        assert _hub_popup_count(environment) == 0
+        assert _hub_context_counts(environment) == (1, 1)
+        detached = _tmux(environment, ["detach-client", "-t", client])
+        assert detached.returncode == 0, detached.stderr.decode(errors="replace")
+        assert terminal.wait() == 0
+        terminal.close()
+        terminal = None
+        deadline = time.monotonic() + 5.0
+        while _hub_context_counts(environment) != (0, 0):
+            if time.monotonic() >= deadline:
+                raise AssertionError("switched client context was not removed")
+            time.sleep(0.05)
+        _tmux(environment, ["kill-session", "-t", escape_session])
+
+        terminal = _Terminal([], environment)
+        terminal.expect("This clilane server")
+        deadline = time.monotonic() + 5.0
+        standby = b""
+        while b"Switcher inactive" not in standby:
+            captured = _tmux(environment, ["capture-pane", "-p", "-t", "hub"])
+            assert captured.returncode == 0, captured.stderr.decode(errors="replace")
+            standby = captured.stdout
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    "hub backing pane did not show the standby surface:\n"
+                    + standby.decode(errors="replace")
+                )
+            time.sleep(0.05)
+        assert b"Ctrl-b w to reopen" in standby
+        pane = _tmux(
+            environment,
+            [
+                "display-message",
+                "-p",
+                "-t",
+                "hub",
+                "#{pane_current_command}|#{pane_start_command}",
+            ],
+        ).stdout.decode().strip()
+        current_command, start_command = pane.split("|", 1)
+        assert current_command not in {
+            "bash",
+            "dash",
+            "fish",
+            "sh",
+            "zsh",
+        }, pane
+        assert "__hub-standby" in start_command, pane
+        handshake_mark = terminal.mark()
+        terminal.send(b"\x15")
+        terminal.expect("> ▏", handshake_mark)
+        terminal.send(b"\x1b[D")
+        assert terminal.wait() == 0
+        terminal.close()
+        terminal = None
+
+        target_path = _tmux(
+            environment,
+            ["display-message", "-p", "-t", "hub", "#{socket_path}"],
+        ).stdout.decode().strip()
+        assert target_path
+        shell_executable = shutil.which("sh")
+        tmux_executable = shutil.which("tmux")
+        assert shell_executable is not None
+        assert tmux_executable is not None
+        before = _hub_context_counts(environment)
+        recursive_output = (
+            Path(environment["CLILANE_STATE_HOME"]) / "recursive-output.txt"
+        )
+        recursive_code = (
+            Path(environment["CLILANE_STATE_HOME"]) / "recursive-code.txt"
+        )
+        recursive_command = (
+            f"{shlex.quote(str(CLILANE))} hub >"
+            f" {shlex.quote(str(recursive_output))} 2>&1; "
+            f"printf '%s' $? > {shlex.quote(str(recursive_code))}; exec /bin/cat"
+        )
+        created = _tmux(
+            environment,
+            [
+                "new-session",
+                "-d",
+                "-s",
+                recursive_session,
+                "-e",
+                f"CLILANE_TMUX_SOCKET={environment['CLILANE_TMUX_SOCKET']}",
+                "-e",
+                f"CLILANE_STATE_HOME={environment['CLILANE_STATE_HOME']}",
+                "-e",
+                f"TMUX_TMPDIR={environment['TMUX_TMPDIR']}",
+                "--",
+                shell_executable,
+                "-c",
+                recursive_command,
+            ],
+        )
+        assert created.returncode == 0, created.stderr.decode(errors="replace")
+        deadline = time.monotonic() + 5.0
+        recursive_result = ""
+        while not recursive_result:
+            if recursive_code.exists():
+                recursive_result = recursive_code.read_text(encoding="utf-8")
+                if recursive_result:
+                    break
+            if time.monotonic() >= deadline:
+                captured = _tmux(
+                    environment,
+                    ["capture-pane", "-p", "-S", "-100", "-t", recursive_session],
+                )
+                panes = _tmux(
+                    environment,
+                    [
+                        "list-panes",
+                        "-a",
+                        "-F",
+                        "#{session_name}|#{pane_current_command}|#{pane_start_command}",
+                    ],
+                )
+                raise AssertionError(
+                    "same-socket recursive hub command did not finish\n"
+                    + panes.stdout.decode(errors="replace")
+                    + captured.stdout.decode(errors="replace")
+                    + captured.stderr.decode(errors="replace")
+                )
+            time.sleep(0.05)
+        assert recursive_result == "1"
+        assert "already inside CLI Lane" in recursive_output.read_text(
+            encoding="utf-8"
+        )
+        assert _hub_context_counts(environment) == before
+        _tmux(environment, ["kill-session", "-t", recursive_session])
+
+        outer_marker = f"outer tmux resumed {os.getpid()}"
+        outer_command = (
+            f"{shlex.quote(str(CLILANE))} hub; "
+            f"printf '%s\\n' {shlex.quote(outer_marker)}; exec /bin/cat"
+        )
+        created = _tmux_on_socket(
+            environment,
+            outer_socket,
+            [
+                "new-session",
+                "-d",
+                "-s",
+                "outer",
+                shlex.join([shell_executable, "-c", outer_command]),
+            ],
+        )
+        assert created.returncode == 0, created.stderr.decode(errors="replace")
+        outer_path = _tmux_on_socket(
+            environment,
+            outer_socket,
+            ["display-message", "-p", "-t", "outer", "#{socket_path}"],
+        ).stdout.decode().strip()
+        assert outer_path and outer_path != target_path
+        outer_terminal = _Terminal(
+            [
+                "-L",
+                outer_socket,
+                "-f",
+                "/dev/null",
+                "attach-session",
+                "-t",
+                "outer",
+            ],
+            environment,
+            executable=Path(tmux_executable),
+        )
+        outer_terminal.expect("This clilane server")
+        handshake_mark = outer_terminal.mark()
+        outer_terminal.send(b"\x15")
+        outer_terminal.expect("> ▏", handshake_mark)
+        clients = _tmux(
+            environment,
+            ["list-clients", "-F", "#{client_name}|#{client_pid}"],
+        ).stdout.decode().splitlines()
+        assert len(clients) == 1, clients
+        client, _ = clients[0].split("|", 1)
+        resume_mark = outer_terminal.mark()
+        closed = _tmux(environment, ["display-popup", "-c", client, "-C"])
+        assert closed.returncode == 0, closed.stderr.decode(errors="replace")
+        outer_terminal.expect(outer_marker, resume_mark)
+        deadline = time.monotonic() + 5.0
+        while _hub_context_counts(environment) != (0, 0):
+            if time.monotonic() >= deadline:
+                raise AssertionError("nested popup-loss cleanup left a context behind")
+            time.sleep(0.05)
+        assert _hub_popup_count(environment) == 0
+        outer_terminal.send(b"\x02d")
+        assert outer_terminal.wait() == 0
+        outer_terminal.close()
+        outer_terminal = None
+    finally:
+        if reopened is not None and reopened.poll() is None:
+            reopened.terminate()
+            reopened.wait(timeout=3)
+        if terminal is not None:
+            terminal.close()
+        if outer_terminal is not None:
+            outer_terminal.close()
+        _tmux_on_socket(environment, outer_socket, ["kill-session", "-t", "outer"])
+        _tmux(environment, ["kill-session", "-t", escape_session])
+        _tmux(environment, ["kill-session", "-t", recursive_session])
+        _cleanup(environment)
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="clp-", dir="/tmp") as temporary:
         root = Path(temporary)
@@ -294,6 +676,12 @@ def main() -> int:
             }
         )
         _exercise_discovery_helpers(root)
+        lifecycle_environment = dict(environment)
+        lifecycle_state = root / "lifecycle-state"
+        lifecycle_state.mkdir(mode=0o700)
+        lifecycle_environment["CLILANE_STATE_HOME"] = str(lifecycle_state)
+        lifecycle_environment["CLILANE_TMUX_SOCKET"] = f"clp-life-{os.getpid()}"
+        _exercise_hub_lifecycle(lifecycle_environment)
 
         tool_bin = root / "tools"
         tool_bin.mkdir(mode=0o700)
