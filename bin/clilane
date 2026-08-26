@@ -33,7 +33,7 @@ from typing import BinaryIO, Iterator, Mapping, Sequence
 
 
 PROGRAM = "clilane"
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 TASK_STATE_INITIALIZING = "initializing"
 TASK_STATE_RUNNING = "running"
 TASK_STATE_STOPPED = "stopped"
