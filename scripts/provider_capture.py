@@ -36,6 +36,7 @@ TERMINATE_GRACE_SECONDS = 1.0
 DRAIN_GRACE_SECONDS = 1.0
 PROVIDER_COMMAND_CWD = Path("/")
 CAPTURE_ID_PATTERN = re.compile(r"capture-[a-z0-9][a-z0-9-]{0,95}")
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 PROVIDER_EXIT_FAILURE = 4
 INCOMPLETE_EXIT = 3
 
@@ -79,6 +80,7 @@ class SafeArgumentParser(argparse.ArgumentParser):
 
 
 ACTIVE_SIGNAL_STATE: SignalState | None = None
+ACTIVE_PROVIDER_CONTROL_FD: int | None = None
 
 
 @dataclass(frozen=True)
@@ -140,6 +142,14 @@ class CaptureResult:
     exit_status: int
 
 
+@dataclass
+class ProviderLifecycle:
+    pid: int
+    start_announced: bool = False
+    group_verified_gone: bool = False
+    end_attempted: bool = False
+
+
 PROVIDER_SPECS = {
     "claude": ProviderSpec(
         name="claude",
@@ -196,6 +206,75 @@ def positive_timeout(value: str) -> int:
     if result > MAX_TIMEOUT_SECONDS:
         raise argparse.ArgumentTypeError("expected a positive timeout")
     return result
+
+
+def provider_control_fd(value: str) -> int:
+    if not value.isascii() or not value.isdigit() or len(value) > 10:
+        raise argparse.ArgumentTypeError("expected a provider control fd")
+    result = int(value)
+    if result < 3:
+        raise argparse.ArgumentTypeError("expected a provider control fd")
+    return result
+
+
+def sha256_digest(value: str) -> str:
+    if SHA256_PATTERN.fullmatch(value) is None:
+        raise argparse.ArgumentTypeError("expected a SHA-256 digest")
+    return value
+
+
+def _configure_provider_control_fd(descriptor: int) -> int:
+    try:
+        metadata = os.fstat(descriptor)
+        flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+        if (
+            not stat.S_ISFIFO(metadata.st_mode)
+            or flags & os.O_ACCMODE != os.O_WRONLY
+        ):
+            raise CaptureError("provider-control-fd-invalid")
+        os.set_inheritable(descriptor, False)
+        if os.get_inheritable(descriptor):
+            raise CaptureError("provider-control-fd-invalid")
+        if os.fpathconf(descriptor, "PC_PIPE_BUF") < 32:
+            raise CaptureError("provider-control-fd-invalid")
+        return descriptor
+    except (OSError, ValueError) as error:
+        raise CaptureError("provider-control-fd-invalid") from error
+
+
+def _provider_control_write(event: str, pid: int) -> None:
+    descriptor = ACTIVE_PROVIDER_CONTROL_FD
+    if descriptor is None:
+        return
+    if event not in {"S", "E"} or type(pid) is not int or pid < 1:
+        raise CaptureError("provider-control-write-failed")
+    raw = f"{event} {pid}\n".encode("ascii")
+    try:
+        if len(raw) > os.fpathconf(descriptor, "PC_PIPE_BUF"):
+            raise CaptureError("provider-control-write-failed")
+        written = os.write(descriptor, raw)
+    except OSError as error:
+        raise CaptureError("provider-control-write-failed") from error
+    if written != len(raw):
+        raise CaptureError("provider-control-write-failed")
+
+
+def _announce_provider_start(lifecycle: ProviderLifecycle) -> None:
+    _provider_control_write("S", lifecycle.pid)
+    if ACTIVE_PROVIDER_CONTROL_FD is not None:
+        lifecycle.start_announced = True
+
+
+def _finish_provider_lifecycle(
+    process: subprocess.Popen[bytes], lifecycle: ProviderLifecycle
+) -> None:
+    if process.pid != lifecycle.pid or _group_exists(process):
+        raise CaptureError("provider-cleanup-failed")
+    lifecycle.group_verified_gone = True
+    if not lifecycle.start_announced or lifecycle.end_attempted:
+        return
+    lifecycle.end_attempted = True
+    _provider_control_write("E", lifecycle.pid)
 
 
 def _metadata(metadata: os.stat_result) -> tuple[int, int, int, int]:
@@ -698,7 +777,9 @@ def _provider_environment(cwd: Path) -> dict[str, str]:
 
 
 def _terminate_and_drain(
-    process: subprocess.Popen[bytes], selector: selectors.BaseSelector
+    process: subprocess.Popen[bytes],
+    selector: selectors.BaseSelector,
+    lifecycle: ProviderLifecycle,
 ) -> int:
     with SignalDeferral():
         _signal_group(process, signal.SIGTERM)
@@ -724,14 +805,19 @@ def _terminate_and_drain(
             selector.unregister(key.fileobj)
             key.fileobj.close()
         try:
-            return process.wait(timeout=TERMINATE_GRACE_SECONDS)
+            return_code = process.wait(timeout=TERMINATE_GRACE_SECONDS)
         except subprocess.TimeoutExpired as error:
             raise CaptureError("provider-cleanup-failed") from error
+        if _group_exists(process):
+            raise CaptureError("provider-cleanup-failed")
+        _finish_provider_lifecycle(process, lifecycle)
+        return return_code
 
 
 def _small_command(command: Sequence[str], cwd: Path) -> tuple[int, bytes]:
     selector = selectors.DefaultSelector()
     process: subprocess.Popen[bytes] | None = None
+    lifecycle: ProviderLifecycle | None = None
     try:
         with SignalDeferral():
             try:
@@ -747,6 +833,8 @@ def _small_command(command: Sequence[str], cwd: Path) -> tuple[int, bytes]:
                 )
             except OSError as error:
                 raise CaptureError("provider-version-failed") from error
+            lifecycle = ProviderLifecycle(process.pid)
+            _announce_provider_start(lifecycle)
             if process.stdout is None:
                 raise CaptureError("provider-version-failed")
             selector.register(process.stdout, selectors.EVENT_READ)
@@ -754,7 +842,7 @@ def _small_command(command: Sequence[str], cwd: Path) -> tuple[int, bytes]:
         deadline = time.monotonic() + VERSION_TIMEOUT_SECONDS
         while selector.get_map() or process.poll() is None:
             if time.monotonic() >= deadline:
-                _terminate_and_drain(process, selector)
+                _terminate_and_drain(process, selector, lifecycle)
                 raise CaptureError("provider-version-timeout")
             for key, _mask in selector.select(0.05):
                 try:
@@ -767,21 +855,26 @@ def _small_command(command: Sequence[str], cwd: Path) -> tuple[int, bytes]:
                     continue
                 output.extend(chunk)
                 if len(output) > MAX_VERSION_BYTES:
-                    _terminate_and_drain(process, selector)
+                    _terminate_and_drain(process, selector, lifecycle)
                     raise CaptureError("provider-version-oversized")
         return_code = process.wait()
         if _group_exists(process):
-            _terminate_and_drain(process, selector)
+            _terminate_and_drain(process, selector, lifecycle)
             raise CaptureError("provider-version-descendant-process")
+        _finish_provider_lifecycle(process, lifecycle)
         return return_code, bytes(output)
     finally:
         selector.close()
-        if process is not None and process.poll() is None:
+        if (
+            process is not None
+            and lifecycle is not None
+            and not lifecycle.group_verified_gone
+        ):
             cleanup_selector = selectors.DefaultSelector()
             if process.stdout is not None and not process.stdout.closed:
                 cleanup_selector.register(process.stdout, selectors.EVENT_READ)
             try:
-                _terminate_and_drain(process, cleanup_selector)
+                _terminate_and_drain(process, cleanup_selector, lifecycle)
             finally:
                 cleanup_selector.close()
 
@@ -1086,7 +1179,10 @@ def resolve_executable(
     cwd: Path,
     root: CaptureRoot,
     required_capture_bytes: int,
+    expected_sha256: str | None = None,
 ) -> ExecutableIdentity:
+    if expected_sha256 is not None and SHA256_PATTERN.fullmatch(expected_sha256) is None:
+        raise CaptureError("provider-executable-hash-invalid")
     if override is None:
         selected = _secure_which(spec.executable)
     else:
@@ -1113,6 +1209,8 @@ def resolve_executable(
             )
         if not _root_identity_matches(root):
             raise CaptureError("capture-root-changed")
+        if expected_sha256 is not None and identity.sha256 != expected_sha256:
+            raise CaptureError("provider-executable-hash-mismatch")
         return_code, raw_version = _small_command(
             (str(identity.path), "--version"),
             cwd,
@@ -1286,6 +1384,7 @@ def capture_command(
         raise CaptureError("provider-stdin-invalid")
     selector = selectors.DefaultSelector()
     process: subprocess.Popen[bytes] | None = None
+    lifecycle: ProviderLifecycle | None = None
     try:
         with SignalDeferral():
             try:
@@ -1301,6 +1400,8 @@ def capture_command(
                 )
             except OSError as error:
                 raise CaptureError("provider-spawn-failed") from error
+            lifecycle = ProviderLifecycle(process.pid)
+            _announce_provider_start(lifecycle)
             if process.stdin is None or process.stdout is None or process.stderr is None:
                 for pipe in (process.stdout, process.stderr):
                     if pipe is not None:
@@ -1330,7 +1431,9 @@ def capture_command(
                 pass
             if process.stdin is not None:
                 _close_registered(selector, process.stdin, close=True)
-            return_code = _terminate_and_drain(process, selector)
+            if lifecycle is None:
+                raise CaptureError("provider-cleanup-failed")
+            return_code = _terminate_and_drain(process, selector, lifecycle)
         selector.close()
         return Observation(
             signal_observation.reason,
@@ -1347,7 +1450,9 @@ def capture_command(
                 pass
             if process.stdin is not None:
                 _close_registered(selector, process.stdin, close=True)
-            _terminate_and_drain(process, selector)
+            if lifecycle is None:
+                raise CaptureError("provider-cleanup-failed")
+            _terminate_and_drain(process, selector, lifecycle)
         selector.close()
         raise
     pending = bytearray()
@@ -1453,6 +1558,9 @@ def capture_command(
             exit_code = return_code if return_code >= 0 else None
             provider_signal = -return_code if return_code < 0 else None
             if not _group_exists(process):
+                if lifecycle is None:
+                    raise CaptureError("provider-cleanup-failed")
+                _finish_provider_lifecycle(process, lifecycle)
                 return Observation(
                     "provider_signal" if provider_signal is not None else "provider_exit",
                     exit_code,
@@ -1480,7 +1588,9 @@ def capture_command(
                     pass
                 _close_registered(selector, process.stdin, close=True)
                 try:
-                    return_code = _terminate_and_drain(process, selector)
+                    if lifecycle is None:
+                        raise CaptureError("provider-cleanup-failed")
+                    return_code = _terminate_and_drain(process, selector, lifecycle)
                 except CollectorSignal as interruption:
                     observation = _collector_signal_observation(interruption.number)
                     return_code = process.wait()
@@ -1493,13 +1603,13 @@ def capture_command(
                     observation.collector_signal,
                     observation.incomplete_reasons,
                 )
-            if process.poll() is None:
+            if lifecycle is not None and not lifecycle.group_verified_gone:
                 cleanup_selector = selectors.DefaultSelector()
                 for pipe in (process.stdout, process.stderr):
                     if pipe is not None and not pipe.closed:
                         cleanup_selector.register(pipe, selectors.EVENT_READ)
                 try:
-                    _terminate_and_drain(process, cleanup_selector)
+                    _terminate_and_drain(process, cleanup_selector, lifecycle)
                 finally:
                     cleanup_selector.close()
         finally:
@@ -1737,6 +1847,7 @@ def collect(
     stdin: BinaryIO,
     stdout: BinaryIO,
     paths: RepositoryPaths | None = None,
+    expected_executable_sha256: str | None = None,
 ) -> CaptureResult:
     validate_request(capture_id, per_capture_bytes, aggregate_bytes, timeout_seconds)
     repository = repository_paths() if paths is None else paths
@@ -1753,12 +1864,20 @@ def collect(
             per_capture_bytes,
             aggregate_bytes,
         )
-        identity = resolve_executable(
+        resolve_arguments = (
             spec,
             provider_executable,
             PROVIDER_COMMAND_CWD,
             root,
             initial_limit,
+        )
+        identity = (
+            resolve_executable(*resolve_arguments)
+            if expected_executable_sha256 is None
+            else resolve_executable(
+                *resolve_arguments,
+                expected_executable_sha256,
+            )
         )
         if not _root_identity_matches(root):
             raise CaptureError("capture-root-changed")
@@ -1988,53 +2107,86 @@ def parse_args(spec: ProviderSpec, argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--aggregate-bytes", required=True, type=positive_integer)
     parser.add_argument("--timeout-seconds", required=True, type=positive_timeout)
     parser.add_argument("--provider-executable")
+    parser.add_argument("--expected-executable-sha256", type=sha256_digest)
+    parser.add_argument("--provider-control-fd", type=provider_control_fd)
     return parser.parse_args(argv)
 
 
 def collector_main(provider: str, argv: Sequence[str] | None = None) -> int:
-    global ACTIVE_SIGNAL_STATE
+    global ACTIVE_PROVIDER_CONTROL_FD, ACTIVE_SIGNAL_STATE
     spec = PROVIDER_SPECS[provider]
     arguments = parse_args(spec, sys.argv[1:] if argv is None else argv)
-    handled_signals = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
-    previous_handlers = {number: signal.getsignal(number) for number in handled_signals}
-    previous_signal_state = ACTIVE_SIGNAL_STATE
-    ACTIVE_SIGNAL_STATE = SignalState()
-
-    def interrupt(number: int, _frame: Any) -> None:
-        state = ACTIVE_SIGNAL_STATE
-        if state is not None:
-            if state.settling:
-                return
-            if state.depth > 0:
-                if state.pending is None:
-                    state.pending = number
-                return
-        raise CollectorSignal(number)
-
-    for number in handled_signals:
-        signal.signal(number, interrupt)
+    requested_control_fd = arguments.provider_control_fd
+    previous_control_fd = ACTIVE_PROVIDER_CONTROL_FD
+    ACTIVE_PROVIDER_CONTROL_FD = None
+    control_fd: int | None = None
+    if requested_control_fd is not None:
+        try:
+            control_fd = _configure_provider_control_fd(requested_control_fd)
+            ACTIVE_PROVIDER_CONTROL_FD = control_fd
+        except CaptureError as error:
+            try:
+                os.close(requested_control_fd)
+            except OSError:
+                pass
+            ACTIVE_PROVIDER_CONTROL_FD = previous_control_fd
+            print(f"collect_{provider}_evidence: {error}", file=sys.stderr)
+            return 1
     try:
-        result = collect(
-            spec=spec,
-            capture_root_path=Path(arguments.capture_root),
-            capture_id=arguments.capture_id,
-            per_capture_bytes=arguments.per_capture_bytes,
-            aggregate_bytes=arguments.aggregate_bytes,
-            timeout_seconds=arguments.timeout_seconds,
-            provider_executable=arguments.provider_executable,
-            stdin=sys.stdin.buffer,
-            stdout=sys.stdout.buffer,
-        )
-    except CaptureError as error:
-        print(f"collect_{provider}_evidence: {error}", file=sys.stderr)
-        return 1
-    except CollectorSignal as interruption:
-        return 128 + interruption.number
-    except Exception:
-        print(f"collect_{provider}_evidence: internal-error", file=sys.stderr)
-        return 1
+        handled_signals = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+        previous_handlers: dict[int, Any] = {}
+        installed_signals: list[int] = []
+        previous_signal_state = ACTIVE_SIGNAL_STATE
+        ACTIVE_SIGNAL_STATE = SignalState()
+
+        def interrupt(number: int, _frame: Any) -> None:
+            state = ACTIVE_SIGNAL_STATE
+            if state is not None:
+                if state.settling:
+                    return
+                if state.depth > 0:
+                    if state.pending is None:
+                        state.pending = number
+                    return
+            raise CollectorSignal(number)
+
+        try:
+            for number in handled_signals:
+                previous_handlers[number] = signal.getsignal(number)
+                signal.signal(number, interrupt)
+                installed_signals.append(number)
+            try:
+                result = collect(
+                    spec=spec,
+                    capture_root_path=Path(arguments.capture_root),
+                    capture_id=arguments.capture_id,
+                    per_capture_bytes=arguments.per_capture_bytes,
+                    aggregate_bytes=arguments.aggregate_bytes,
+                    timeout_seconds=arguments.timeout_seconds,
+                    provider_executable=arguments.provider_executable,
+                    stdin=sys.stdin.buffer,
+                    stdout=sys.stdout.buffer,
+                    expected_executable_sha256=(
+                        arguments.expected_executable_sha256
+                    ),
+                )
+            except CaptureError as error:
+                print(f"collect_{provider}_evidence: {error}", file=sys.stderr)
+                return 1
+            except CollectorSignal as interruption:
+                return 128 + interruption.number
+            except Exception:
+                print(f"collect_{provider}_evidence: internal-error", file=sys.stderr)
+                return 1
+        finally:
+            for number in installed_signals:
+                signal.signal(number, previous_handlers[number])
+            ACTIVE_SIGNAL_STATE = previous_signal_state
+        return result.exit_status
     finally:
-        for number, handler in previous_handlers.items():
-            signal.signal(number, handler)
-        ACTIVE_SIGNAL_STATE = previous_signal_state
-    return result.exit_status
+        ACTIVE_PROVIDER_CONTROL_FD = previous_control_fd
+        if control_fd is not None:
+            try:
+                os.close(control_fd)
+            except OSError:
+                pass
