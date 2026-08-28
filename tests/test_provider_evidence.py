@@ -21,14 +21,6 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT_PATH = ROOT / "scripts/provider_evidence.py"
-SPEC = importlib.util.spec_from_file_location("provider_evidence", SCRIPT_PATH)
-if SPEC is None or SPEC.loader is None:
-    raise RuntimeError(f"cannot load {SCRIPT_PATH}")
-provider_evidence = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = provider_evidence
-SPEC.loader.exec_module(provider_evidence)
-
 CAPTURE_ENGINE_PATH = ROOT / "scripts/provider_capture.py"
 CAPTURE_SPEC = importlib.util.spec_from_file_location(
     "provider_capture", CAPTURE_ENGINE_PATH
@@ -38,6 +30,14 @@ if CAPTURE_SPEC is None or CAPTURE_SPEC.loader is None:
 provider_capture = importlib.util.module_from_spec(CAPTURE_SPEC)
 sys.modules[CAPTURE_SPEC.name] = provider_capture
 CAPTURE_SPEC.loader.exec_module(provider_capture)
+
+SCRIPT_PATH = ROOT / "scripts/provider_evidence.py"
+SPEC = importlib.util.spec_from_file_location("provider_evidence", SCRIPT_PATH)
+if SPEC is None or SPEC.loader is None:
+    raise RuntimeError(f"cannot load {SCRIPT_PATH}")
+provider_evidence = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = provider_evidence
+SPEC.loader.exec_module(provider_evidence)
 
 COLLECTOR_SCRIPTS = {
     provider: ROOT / f"scripts/collect_{provider}_evidence.py"
@@ -72,6 +72,7 @@ T7_ARTIFACTS = (
     Path(__file__).resolve(),
     ROOT / "tests/fixtures/provider-evidence/synthetic.jsonl",
     ROOT / "docs/designs/provider-capabilities.json",
+    ROOT / "docs/designs/provider-executables.json",
 )
 
 
@@ -117,32 +118,39 @@ def run_collector(
     per_capture_bytes: int = 1 << 20,
     aggregate_bytes: int = 1 << 21,
     timeout_seconds: int = 3,
+    provider_control_fd: int | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     environment = os.environ.copy()
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    command = [
+        sys.executable,
+        "-B",
+        str(COLLECTOR_SCRIPTS[provider]),
+        "--capture-root",
+        str(capture_root),
+        "--capture-id",
+        capture_id,
+        "--per-capture-bytes",
+        str(per_capture_bytes),
+        "--aggregate-bytes",
+        str(aggregate_bytes),
+        "--timeout-seconds",
+        str(timeout_seconds),
+        "--provider-executable",
+        str(executable),
+    ]
+    pass_fds: tuple[int, ...] = ()
+    if provider_control_fd is not None:
+        command.extend(("--provider-control-fd", str(provider_control_fd)))
+        pass_fds = (provider_control_fd,)
     return subprocess.run(
-        [
-            sys.executable,
-            "-B",
-            str(COLLECTOR_SCRIPTS[provider]),
-            "--capture-root",
-            str(capture_root),
-            "--capture-id",
-            capture_id,
-            "--per-capture-bytes",
-            str(per_capture_bytes),
-            "--aggregate-bytes",
-            str(aggregate_bytes),
-            "--timeout-seconds",
-            str(timeout_seconds),
-            "--provider-executable",
-            str(executable),
-        ],
+        command,
         cwd=ROOT,
         input=payload,
         capture_output=True,
         check=False,
         env=environment,
+        pass_fds=pass_fds,
         timeout=15,
     )
 
@@ -591,10 +599,19 @@ class CompletenessAndAuthorityTests(unittest.TestCase):
             )
         )
 
-    def test_observed_authority_requires_every_cell_and_structured_source(self) -> None:
+    def test_analyzed_observed_authority_requires_every_cell_and_structured_source(
+        self,
+    ) -> None:
         source_fixture = "tests/fixtures/provider-evidence/normalized.jsonl"
         rows = validate_rows(make_grid(evidence_mode="observed"))
-        matrix = provider_evidence.build_matrix(rows, source_fixture)
+        with self.assertRaisesRegex(
+            provider_evidence.EvidenceError,
+            "observed semantics require an analyzer",
+        ):
+            provider_evidence.build_matrix(rows, source_fixture)
+        matrix = provider_evidence.build_matrix(
+            rows, source_fixture, semantics_analyzed=True
+        )
         self.assertTrue(
             all(
                 provider["authoritative"]
@@ -613,7 +630,9 @@ class CompletenessAndAuthorityTests(unittest.TestCase):
             target["status"] = "unknown"
             with self.subTest(event_kind=event_kind):
                 degraded_matrix = provider_evidence.build_matrix(
-                    validate_rows(degraded), source_fixture
+                    validate_rows(degraded),
+                    source_fixture,
+                    semantics_analyzed=True,
                 )
                 claude = next(
                     provider
@@ -629,7 +648,7 @@ class CompletenessAndAuthorityTests(unittest.TestCase):
                 row["source_kind"] = "inferred"
                 row["source_interface"] = "claude-inferred"
         inferred_matrix = provider_evidence.build_matrix(
-            validate_rows(inferred), source_fixture
+            validate_rows(inferred), source_fixture, semantics_analyzed=True
         )
         claude = next(
             provider
@@ -643,7 +662,7 @@ class CompletenessAndAuthorityTests(unittest.TestCase):
         mixed_source[0]["source_kind"] = "acp"
         mixed_source[0]["source_interface"] = "claude-acp"
         mixed_matrix = provider_evidence.build_matrix(
-            validate_rows(mixed_source), source_fixture
+            validate_rows(mixed_source), source_fixture, semantics_analyzed=True
         )
         claude = next(
             provider
@@ -694,6 +713,30 @@ class CheckArtifactTests(unittest.TestCase):
                     matrix_path.write_bytes(document)
                     with self.assertRaises(provider_evidence.EvidenceError):
                         provider_evidence.declared_matrix_mode(matrix_path)
+
+    def test_executable_manifest_pins_exact_provider_binaries(self) -> None:
+        path = ROOT / provider_evidence.EXECUTABLE_MANIFEST_PATH
+        expected = provider_evidence.load_executable_manifest(path)
+        self.assertEqual(
+            expected,
+            {
+                "claude": "9f7c2260251765a18d0b35198669dacc1912f6e8129a3b01f6b58d93365ff1f1",
+                "codex": "f0d8762236594359b60cfbe17f4c7e945a3ce8d1c91e74778838c968d250fb6c",
+                "kimi": "92bf3b4b6643e7c4cc12c82e5680cc5b54a5a6768a301de815e5e9a02d2184bb",
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory_name:
+            invalid_path = Path(directory_name) / "provider-executables.json"
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+            manifest["providers"][0]["executable_sha256"] = "0" * 64
+            invalid_path.write_bytes(
+                (
+                    json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True)
+                    + "\n"
+                ).encode("utf-8")
+            )
+            with self.assertRaises(provider_evidence.EvidenceError):
+                provider_evidence.load_executable_manifest(invalid_path)
 
     def test_check_rejects_fixture_matrix_summary_and_provenance_drift_without_healing(
         self,
@@ -848,7 +891,9 @@ class CheckArtifactTests(unittest.TestCase):
 
             invalid_commands = (
                 ("--check", "--evidence-mode", "synthetic"),
+                ("--check", "--capture-root", "/tmp/capture-root"),
                 ("--write-matrix",),
+                ("--write-observed",),
             )
             for arguments in invalid_commands:
                 with self.subTest(arguments=arguments):
@@ -879,8 +924,268 @@ class CheckArtifactTests(unittest.TestCase):
                 imported.update(alias.name.split(".", 1)[0] for alias in node.names)
             elif isinstance(node, ast.ImportFrom) and node.module is not None:
                 imported.add(node.module.split(".", 1)[0])
-        allowed = set(sys.stdlib_module_names) | {"__future__"}
+        allowed = set(sys.stdlib_module_names) | {"__future__", "provider_capture"}
         self.assertEqual(imported - allowed, set())
+
+
+class ObservedNormalizationTests(unittest.TestCase):
+    def observed_fixture(
+        self, base: Path, *, private_payload: bytes = b'{"synthetic":"probe"}\n'
+    ) -> tuple[
+        Path,
+        list[dict[str, Any]],
+        dict[str, dict[str, Any]],
+        dict[str, str],
+    ]:
+        base = base.resolve()
+        capture_root = base / "captures"
+        executable_root = base / "executables"
+        capture_root.mkdir(mode=0o700)
+        executable_root.mkdir()
+        receipts: dict[str, dict[str, Any]] = {}
+        for provider in EXPECTED_PROVIDERS:
+            executable = write_fake_provider(
+                executable_root,
+                provider,
+                (
+                    "sys.stdin.buffer.read()\n"
+                    "os.write(1, b'{\"synthetic\":\"response\"}\\n')\n"
+                ),
+            )
+            completed = run_collector(
+                provider,
+                capture_root,
+                f"capture-{provider}-observed",
+                executable,
+                private_payload,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            receipts[provider] = read_receipt(
+                capture_root, f"capture-{provider}-observed"
+            )
+
+        declarations = {
+            "claude": ("native_hook", "claude-native-hook"),
+            "codex": ("native_hook", "codex-app-server"),
+            "kimi": ("acp", "kimi-acp"),
+        }
+        rows: list[dict[str, Any]] = []
+        for provider in EXPECTED_PROVIDERS:
+            source_kind, source_interface = declarations[provider]
+            receipt = receipts[provider]
+            for event_kind in EXPECTED_EVENT_KINDS:
+                rows.append(
+                    make_row(
+                        provider,
+                        event_kind,
+                        evidence_mode="observed",
+                        status="unknown",
+                        provider_version=receipt["provider_version"],
+                        source_kind=source_kind,
+                        source_interface=source_interface,
+                        source_capture_sha256=receipt["source_capture_sha256"],
+                    )
+                )
+        executable_hashes = {
+            provider: receipt["executable_sha256"]
+            for provider, receipt in receipts.items()
+        }
+        return capture_root, rows, receipts, executable_hashes
+
+    def test_normalization_canonicalizes_and_verifies_all_collector_sources(self) -> None:
+        canary = b"PRIVATE_CAPTURE_CANARY_61f0"
+        with tempfile.TemporaryDirectory() as directory_name:
+            capture_root, rows, _receipts, executable_hashes = self.observed_fixture(
+                Path(directory_name), private_payload=canary
+            )
+            candidate = b"".join(
+                (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
+                for row in reversed(rows)
+            )
+            normalized = provider_evidence.normalize_observed_bytes(
+                candidate, capture_root, executable_hashes
+            )
+            self.assertEqual(
+                normalized,
+                provider_evidence.canonical_row_bytes(validate_rows(rows)),
+            )
+            self.assertNotIn(canary, normalized)
+            matrix = provider_evidence.build_matrix(
+                provider_evidence.load_rows_bytes(normalized, "observed"),
+                "tests/fixtures/provider-evidence/normalized.jsonl",
+            )
+            self.assertEqual(matrix["present_cells"], 24)
+            self.assertTrue(
+                all(
+                    provider["support"] == "attach_only_unknown"
+                    for provider in matrix["providers"]
+                )
+            )
+            self.assertEqual(
+                [provider["sources"] for provider in matrix["providers"]],
+                [
+                    [{"interface": "claude-native-hook", "kind": "native_hook"}],
+                    [{"interface": "codex-app-server", "kind": "native_hook"}],
+                    [{"interface": "kimi-acp", "kind": "acp"}],
+                ],
+            )
+
+    def test_normalization_rejects_raw_receipt_and_provenance_tampering_privately(
+        self,
+    ) -> None:
+        canary = "PRIVATE_CAPTURE_CANARY_03c2"
+        with tempfile.TemporaryDirectory() as directory_name:
+            capture_root, rows, _receipts, executable_hashes = self.observed_fixture(
+                Path(directory_name), private_payload=canary.encode()
+            )
+            candidate = provider_evidence.canonical_row_bytes(validate_rows(rows))
+            capture_path = capture_root / "capture-claude-observed.capture"
+            original_capture = capture_path.read_bytes()
+            capture_path.write_bytes(original_capture[:-1] + b"X")
+            with self.assertRaises(provider_evidence.EvidenceError) as raised:
+                provider_evidence.normalize_observed_bytes(
+                    candidate, capture_root, executable_hashes
+                )
+            self.assertNotIn(canary, str(raised.exception))
+            capture_path.write_bytes(original_capture)
+            capture_path.chmod(0o600)
+
+            receipt_path = capture_root / "capture-codex-observed.receipt.json"
+            original_receipt = receipt_path.read_bytes()
+            receipt = json.loads(original_receipt)
+            receipt["streams"]["stdout"]["sha256"] = hashlib.sha256(b"wrong").hexdigest()
+            receipt_path.write_bytes(
+                (
+                    json.dumps(receipt, separators=(",", ":"), sort_keys=True) + "\n"
+                ).encode("utf-8")
+            )
+            with self.assertRaises(provider_evidence.EvidenceError) as raised:
+                provider_evidence.normalize_observed_bytes(
+                    candidate, capture_root, executable_hashes
+                )
+            self.assertNotIn(canary, str(raised.exception))
+            receipt_path.write_bytes(original_receipt)
+            receipt_path.chmod(0o600)
+
+            receipt = json.loads(original_receipt)
+            receipt["executable_sha256"] = hashlib.sha256(b"lookalike").hexdigest()
+            receipt_path.write_bytes(
+                (
+                    json.dumps(receipt, separators=(",", ":"), sort_keys=True) + "\n"
+                ).encode("utf-8")
+            )
+            with self.assertRaises(provider_evidence.EvidenceError) as raised:
+                provider_evidence.normalize_observed_bytes(
+                    candidate, capture_root, executable_hashes
+                )
+            self.assertNotIn(canary, str(raised.exception))
+            receipt_path.write_bytes(original_receipt)
+            receipt_path.chmod(0o600)
+
+            unbound = copy.deepcopy(rows)
+            unbound[0]["source_capture_sha256"] = hashlib.sha256(b"unbound").hexdigest()
+            with self.assertRaises(provider_evidence.EvidenceError) as raised:
+                provider_evidence.normalize_observed_bytes(
+                    provider_evidence.canonical_row_bytes(validate_rows(unbound)),
+                    capture_root,
+                    executable_hashes,
+                )
+            self.assertNotIn(canary, str(raised.exception))
+
+    def test_normalization_maps_malformed_receipt_types_to_evidence_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_name:
+            capture_root, rows, receipts, executable_hashes = self.observed_fixture(
+                Path(directory_name)
+            )
+            candidate = provider_evidence.canonical_row_bytes(validate_rows(rows))
+            receipt_path = capture_root / "capture-claude-observed.receipt.json"
+            original = receipt_path.read_bytes()
+            for key_path in (("capture_status",), ("termination", "reason")):
+                receipt = copy.deepcopy(receipts["claude"])
+                target = receipt
+                for key in key_path[:-1]:
+                    target = target[key]
+                target[key_path[-1]] = []
+                receipt_path.write_bytes(
+                    (
+                        json.dumps(receipt, separators=(",", ":"), sort_keys=True)
+                        + "\n"
+                    ).encode("utf-8")
+                )
+                with self.subTest(key_path=key_path), self.assertRaises(
+                    provider_evidence.EvidenceError
+                ):
+                    provider_evidence.normalize_observed_bytes(
+                        candidate, capture_root, executable_hashes
+                    )
+                receipt_path.write_bytes(original)
+                receipt_path.chmod(0o600)
+
+    def test_normalization_rejects_unsafe_capture_and_misclassified_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_name:
+            capture_root, rows, _receipts, executable_hashes = self.observed_fixture(
+                Path(directory_name)
+            )
+            candidate = provider_evidence.canonical_row_bytes(validate_rows(rows))
+            capture_path = capture_root / "capture-kimi-observed.capture"
+            capture_path.chmod(0o644)
+            with self.assertRaises(provider_evidence.EvidenceError):
+                provider_evidence.normalize_observed_bytes(
+                    candidate, capture_root, executable_hashes
+                )
+            capture_path.chmod(0o600)
+
+            misclassified = copy.deepcopy(rows)
+            codex_row = next(row for row in misclassified if row["provider"] == "codex")
+            codex_row["source_kind"] = "acp"
+            with self.assertRaises(provider_evidence.EvidenceError):
+                provider_evidence.normalize_observed_bytes(
+                    provider_evidence.canonical_row_bytes(misclassified),
+                    capture_root,
+                    executable_hashes,
+                )
+
+    def test_normalization_rejects_unanalyzed_semantic_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_name:
+            capture_root, rows, _receipts, executable_hashes = self.observed_fixture(
+                Path(directory_name)
+            )
+            heartbeat = next(
+                row
+                for row in rows
+                if row["provider"] == "claude" and row["event_kind"] == "heartbeat"
+            )
+            passing = copy.deepcopy(rows)
+            passing_heartbeat = next(
+                row
+                for row in passing
+                if row["provider"] == "claude" and row["event_kind"] == "heartbeat"
+            )
+            passing_heartbeat.update(
+                {
+                    "failure_behavior": "fail_closed",
+                    "freshness_renews_on": "adapter_heartbeat",
+                    "freshness_seconds": 60,
+                    "latency_ms": [10],
+                    "session_binding": "exact",
+                    "status": "pass",
+                    "task_binding": "exact",
+                }
+            )
+            failed = copy.deepcopy(rows)
+            failed[0]["status"] = "fail"
+            ambiguous = copy.deepcopy(rows)
+            ambiguous[rows.index(heartbeat)]["session_binding"] = "ambiguous"
+            for candidate in (passing, failed, ambiguous):
+                with self.assertRaisesRegex(
+                    provider_evidence.EvidenceError,
+                    "observed semantics require an analyzer",
+                ):
+                    provider_evidence.normalize_observed_bytes(
+                        provider_evidence.canonical_row_bytes(candidate),
+                        capture_root,
+                        executable_hashes,
+                    )
 
 
 class ProviderCollectorTests(unittest.TestCase):
@@ -967,6 +1272,154 @@ class ProviderCollectorTests(unittest.TestCase):
                     self.assertNotIn(payload, receipt_bytes)
         self.assertEqual(tree_snapshot(ROOT), before)
         self.assertFalse((ROOT / "scripts/__pycache__").exists())
+
+    def test_provider_control_fd_emits_exact_private_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            capture_root = base / "capture"
+            capture_root.mkdir(mode=0o700)
+            read_descriptor, write_descriptor = os.pipe()
+            spec = provider_capture.PROVIDER_SPECS["kimi"]
+            executable = base / "fake-kimi-control"
+            executable.write_text(
+                (
+                    "#!/usr/bin/env python3\n"
+                    "import os\n"
+                    "import sys\n"
+                    f"control_descriptor = {write_descriptor}\n"
+                    "try:\n"
+                    "    os.fstat(control_descriptor)\n"
+                    "except OSError:\n"
+                    "    pass\n"
+                    "else:\n"
+                    "    raise SystemExit(96)\n"
+                    f"version_output = {spec.version_outputs[0]!r}\n"
+                    "if sys.argv[1:] == ['--version']:\n"
+                    "    os.write(1, version_output)\n"
+                    "    raise SystemExit(0)\n"
+                    f"if sys.argv[1:] != {list(spec.command)!r}:\n"
+                    "    raise SystemExit(91)\n"
+                    "sys.stdin.buffer.read()\n"
+                ),
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            try:
+                completed = run_collector(
+                    "kimi",
+                    capture_root,
+                    "capture-control-lifecycle",
+                    executable,
+                    provider_control_fd=write_descriptor,
+                )
+            finally:
+                os.close(write_descriptor)
+            chunks = bytearray()
+            try:
+                while True:
+                    chunk = os.read(read_descriptor, 4096)
+                    if not chunk:
+                        break
+                    chunks.extend(chunk)
+            finally:
+                os.close(read_descriptor)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout, b"")
+            self.assertEqual(completed.stderr, b"")
+            text = bytes(chunks).decode("ascii")
+            records: list[tuple[str, int]] = []
+            for line in text.splitlines(keepends=True):
+                self.assertTrue(line.endswith("\n"))
+                fields = line[:-1].split(" ")
+                self.assertEqual(len(fields), 2)
+                self.assertIn(fields[0], {"S", "E"})
+                self.assertTrue(fields[1].isascii() and fields[1].isdigit())
+                self.assertGreater(int(fields[1]), 0)
+                records.append((fields[0], int(fields[1])))
+            self.assertEqual([event for event, _pid in records], ["S", "E", "S", "E"])
+            self.assertEqual(records[0][1], records[1][1])
+            self.assertEqual(records[2][1], records[3][1])
+
+    def test_provider_control_fd_validation_is_fail_closed(self) -> None:
+        self.assertEqual(provider_capture.provider_control_fd("3"), 3)
+        for value in ("0", "2", "-3", " 3", "٣"):
+            with self.subTest(value=value):
+                with self.assertRaises(provider_capture.argparse.ArgumentTypeError):
+                    provider_capture.provider_control_fd(value)
+
+        read_descriptor, write_descriptor = os.pipe()
+        try:
+            with self.assertRaisesRegex(
+                provider_capture.CaptureError,
+                "provider-control-fd-invalid",
+            ):
+                provider_capture._configure_provider_control_fd(read_descriptor)
+            os.set_inheritable(write_descriptor, True)
+            self.assertEqual(
+                provider_capture._configure_provider_control_fd(write_descriptor),
+                write_descriptor,
+            )
+            self.assertFalse(os.get_inheritable(write_descriptor))
+        finally:
+            os.close(read_descriptor)
+            os.close(write_descriptor)
+
+        with tempfile.TemporaryDirectory() as directory:
+            regular_descriptor = os.open(
+                Path(directory) / "regular",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            try:
+                with self.assertRaisesRegex(
+                    provider_capture.CaptureError,
+                    "provider-control-fd-invalid",
+                ):
+                    provider_capture._configure_provider_control_fd(regular_descriptor)
+            finally:
+                os.close(regular_descriptor)
+
+        closed_read, closed_descriptor = os.pipe()
+        os.close(closed_descriptor)
+        try:
+            with self.assertRaisesRegex(
+                provider_capture.CaptureError,
+                "provider-control-fd-invalid",
+            ):
+                provider_capture._configure_provider_control_fd(closed_descriptor)
+        finally:
+            os.close(closed_read)
+
+    def test_provider_control_write_failure_stops_before_capture(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            capture_root = base / "capture"
+            capture_root.mkdir(mode=0o700)
+            executable = write_fake_provider(base, "kimi")
+            read_descriptor, write_descriptor = os.pipe()
+            os.close(read_descriptor)
+            try:
+                completed = run_collector(
+                    "kimi",
+                    capture_root,
+                    "capture-control-write-failure",
+                    executable,
+                    provider_control_fd=write_descriptor,
+                )
+            finally:
+                os.close(write_descriptor)
+            self.assertEqual(completed.returncode, 1)
+            self.assertEqual(completed.stdout, b"")
+            self.assertEqual(
+                completed.stderr,
+                b"collect_kimi_evidence: provider-control-write-failed\n",
+            )
+            self.assertFalse(
+                (capture_root / "capture-control-write-failure.capture").exists()
+            )
+            self.assertFalse(
+                (capture_root / "capture-control-write-failure.receipt.json").exists()
+            )
 
     def test_root_rejection_precedes_executable_resolution_and_is_inode_based(
         self,

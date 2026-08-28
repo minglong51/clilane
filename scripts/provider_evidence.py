@@ -4,13 +4,38 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, NoReturn, Sequence
+from typing import Any, BinaryIO, NoReturn, Sequence
+
+
+def _load_provider_capture() -> Any:
+    loaded = sys.modules.get("provider_capture")
+    if loaded is not None:
+        return loaded
+    path = Path(__file__).resolve(strict=True).with_name("provider_capture.py")
+    spec = importlib.util.spec_from_file_location("provider_capture", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("provider capture engine unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
+    return module
+
+
+provider_capture = _load_provider_capture()
 
 
 SCHEMA_VERSION = 1
@@ -39,6 +64,7 @@ FIXTURE_PATHS = {
     "synthetic": "tests/fixtures/provider-evidence/synthetic.jsonl",
 }
 MATRIX_PATH = "docs/designs/provider-capabilities.json"
+EXECUTABLE_MANIFEST_PATH = "docs/designs/provider-executables.json"
 SOURCE_INTERFACES = {
     "claude": {
         "acp": {"claude-acp"},
@@ -49,7 +75,7 @@ SOURCE_INTERFACES = {
     "codex": {
         "acp": {"codex-acp"},
         "inferred": {"codex-inferred"},
-        "native_hook": {"codex-native-hook"},
+        "native_hook": {"codex-app-server", "codex-native-hook"},
         "unknown": {"none"},
     },
     "kimi": {
@@ -114,6 +140,58 @@ MAX_LINE_BYTES = 16 * 1024
 MAX_LATENCY_SAMPLES = 100
 MAX_LATENCY_MS = 300_000
 MAX_FRESHNESS_SECONDS = 300
+RECEIPT_KEYS = {
+    "budgets",
+    "capture_bytes",
+    "capture_id",
+    "capture_present",
+    "capture_status",
+    "duration_ms",
+    "executable_sha256",
+    "frame_count",
+    "incomplete_reasons",
+    "payload_bytes",
+    "provider",
+    "provider_outcome",
+    "provider_version",
+    "schema_version",
+    "source_capture_sha256",
+    "source_interface",
+    "streams",
+    "termination",
+}
+INCOMPLETE_REASONS = {
+    "aggregate_budget",
+    "collector_signal",
+    "descendant_process",
+    "executable_changed",
+    "per_capture_budget",
+    "timeout",
+}
+TERMINATION_REASONS = {
+    "byte_cap",
+    "collector_signal",
+    "descendant_process",
+    "hook_eof",
+    "provider_exit",
+    "provider_signal",
+    "timeout",
+}
+SOURCE_DECLARATIONS = {
+    "claude-native-hook": ("claude", "native_hook"),
+    "codex-app-server": ("codex", "native_hook"),
+    "kimi-acp": ("kimi", "acp"),
+}
+
+
+@dataclass(frozen=True)
+class VerifiedCapture:
+    provider: str
+    provider_version: str
+    source_interface: str
+    capture_status: str
+    source_capture_sha256: str
+    executable_sha256: str
 
 
 class EvidenceError(Exception):
@@ -176,6 +254,537 @@ def read_regular_file(path: Path, label: str) -> bytes:
     if len(raw) > MAX_FILE_BYTES:
         raise EvidenceError(f"{label}: file exceeds {MAX_FILE_BYTES} bytes")
     return raw
+
+
+def _metadata(metadata: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
+
+
+def _open_private_member(
+    root: provider_capture.CaptureRoot,
+    name: str,
+    maximum_bytes: int,
+    label: str,
+) -> tuple[int, os.stat_result]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=root.directory_fd)
+        metadata = os.fstat(descriptor)
+        path_metadata = os.stat(name, dir_fd=root.directory_fd, follow_symlinks=False)
+    except OSError as error:
+        if "descriptor" in locals():
+            os.close(descriptor)
+        raise EvidenceError(f"{label}: unavailable") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_nlink != 1
+        or metadata.st_size > maximum_bytes
+        or _metadata(metadata) != _metadata(path_metadata)
+    ):
+        os.close(descriptor)
+        raise EvidenceError(f"{label}: unsafe")
+    return descriptor, metadata
+
+
+def _member_unchanged(
+    root: provider_capture.CaptureRoot,
+    name: str,
+    descriptor: int,
+    original: os.stat_result,
+) -> bool:
+    try:
+        descriptor_metadata = os.fstat(descriptor)
+        path_metadata = os.stat(name, dir_fd=root.directory_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    return (
+        _metadata(original) == _metadata(descriptor_metadata)
+        and _metadata(original) == _metadata(path_metadata)
+        and provider_capture._root_identity_matches(root)
+    )
+
+
+def _read_private_member(
+    root: provider_capture.CaptureRoot,
+    name: str,
+    maximum_bytes: int,
+    label: str,
+) -> bytes:
+    descriptor, metadata = _open_private_member(root, name, maximum_bytes, label)
+    try:
+        chunks: list[bytes] = []
+        remaining = maximum_bytes + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > maximum_bytes or len(raw) != metadata.st_size:
+            raise EvidenceError(f"{label}: oversized")
+        if not _member_unchanged(root, name, descriptor, metadata):
+            raise EvidenceError(f"{label}: changed")
+        return raw
+    except OSError as error:
+        raise EvidenceError(f"{label}: read failed") from error
+    finally:
+        os.close(descriptor)
+
+
+def _require_object(value: Any, keys: set[str], label: str) -> dict[str, Any]:
+    if type(value) is not dict or set(value) != keys:
+        raise EvidenceError(f"{label}: invalid object")
+    return value
+
+
+def _require_integer(
+    value: Any,
+    label: str,
+    *,
+    minimum: int = 0,
+    maximum: int = provider_capture.MAX_BUDGET_BYTES,
+) -> int:
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise EvidenceError(f"{label}: invalid integer")
+    return value
+
+
+def _require_hash(value: Any, label: str) -> str:
+    if type(value) is not str or SHA256_PATTERN.fullmatch(value) is None:
+        raise EvidenceError(f"{label}: invalid digest")
+    return value
+
+
+def load_executable_manifest_with_digest(
+    path: Path,
+) -> tuple[dict[str, str], str]:
+    raw = read_regular_file(path, "provider executable manifest")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise EvidenceError("provider executable manifest: invalid UTF-8") from error
+    manifest = _require_object(
+        strict_json(text, "provider executable manifest"),
+        {"platform", "providers", "schema_version"},
+        "provider executable manifest",
+    )
+    if manifest["schema_version"] != SCHEMA_VERSION:
+        raise EvidenceError("provider executable manifest: unsupported schema")
+    if manifest["platform"] != "darwin-arm64":
+        raise EvidenceError("provider executable manifest: unsupported platform")
+    entries = manifest["providers"]
+    if type(entries) is not list:
+        raise EvidenceError("provider executable manifest: invalid providers")
+    expected: dict[str, str] = {}
+    for entry in entries:
+        item = _require_object(
+            entry,
+            {
+                "executable_sha256",
+                "provider",
+                "provider_version",
+                "source_interface",
+            },
+            "provider executable manifest entry",
+        )
+        provider = item["provider"]
+        if type(provider) is not str or provider not in provider_capture.PROVIDER_SPECS:
+            raise EvidenceError("provider executable manifest: invalid provider")
+        if provider in expected:
+            raise EvidenceError("provider executable manifest: duplicate provider")
+        spec = provider_capture.PROVIDER_SPECS[provider]
+        if (
+            item["provider_version"] != spec.version
+            or item["source_interface"] != spec.source_interface
+        ):
+            raise EvidenceError("provider executable manifest: identity mismatch")
+        digest = _require_hash(
+            item["executable_sha256"], "provider executable manifest"
+        )
+        if len(set(digest)) == 1:
+            raise EvidenceError("provider executable manifest: placeholder digest")
+        expected[provider] = digest
+    if set(expected) != set(PROVIDERS):
+        raise EvidenceError("provider executable manifest: incomplete providers")
+    canonical = (
+        json.dumps(manifest, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if raw != canonical:
+        raise EvidenceError("provider executable manifest: noncanonical")
+    return expected, hashlib.sha256(raw).hexdigest()
+
+
+def load_executable_manifest(path: Path) -> dict[str, str]:
+    expected, _digest = load_executable_manifest_with_digest(path)
+    return expected
+
+
+def _provider_executables_digest(value: str | None) -> str:
+    if value is None:
+        root = Path(__file__).resolve(strict=True).parents[1]
+        _expected, value = load_executable_manifest_with_digest(
+            root / EXECUTABLE_MANIFEST_PATH
+        )
+    return _require_hash(value, "provider executable manifest")
+
+
+def _validate_receipt(value: Any, expected_capture_id: str) -> dict[str, Any]:
+    receipt = _require_object(value, RECEIPT_KEYS, "capture receipt")
+    if receipt["schema_version"] != provider_capture.SCHEMA_VERSION:
+        raise EvidenceError("capture receipt: unsupported schema")
+    if receipt["capture_id"] != expected_capture_id:
+        raise EvidenceError("capture receipt: identity mismatch")
+    provider = receipt["provider"]
+    if type(provider) is not str or provider not in provider_capture.PROVIDER_SPECS:
+        raise EvidenceError("capture receipt: invalid provider")
+    spec = provider_capture.PROVIDER_SPECS[provider]
+    if receipt["provider_version"] != spec.version:
+        raise EvidenceError("capture receipt: version mismatch")
+    if receipt["source_interface"] != spec.source_interface:
+        raise EvidenceError("capture receipt: interface mismatch")
+    capture_status = receipt["capture_status"]
+    if type(capture_status) is not str or capture_status not in {
+        "complete",
+        "incomplete",
+    }:
+        raise EvidenceError("capture receipt: invalid status")
+    if receipt["provider_outcome"] != "unknown":
+        raise EvidenceError("capture receipt: invalid outcome")
+    reasons = receipt["incomplete_reasons"]
+    if (
+        type(reasons) is not list
+        or any(type(reason) is not str or reason not in INCOMPLETE_REASONS for reason in reasons)
+        or len(reasons) != len(set(reasons))
+        or (capture_status == "complete") != (not reasons)
+    ):
+        raise EvidenceError("capture receipt: invalid incompleteness")
+    if type(receipt["capture_present"]) is not bool:
+        raise EvidenceError("capture receipt: invalid presence")
+    capture_bytes = _require_integer(receipt["capture_bytes"], "capture receipt")
+    payload_bytes = _require_integer(receipt["payload_bytes"], "capture receipt")
+    frame_count = _require_integer(receipt["frame_count"], "capture receipt")
+    _require_integer(
+        receipt["duration_ms"],
+        "capture receipt",
+        maximum=(provider_capture.MAX_TIMEOUT_SECONDS + 10) * 1000,
+    )
+    executable_hash = _require_hash(receipt["executable_sha256"], "capture receipt")
+    if len(set(executable_hash)) == 1:
+        raise EvidenceError("capture receipt: placeholder executable digest")
+
+    budgets = _require_object(
+        receipt["budgets"],
+        {
+            "aggregate_bytes",
+            "aggregate_counts",
+            "capture_limit_bytes",
+            "per_capture_bytes",
+            "receipt_bytes_excluded",
+        },
+        "capture receipt budgets",
+    )
+    per_capture = _require_integer(
+        budgets["per_capture_bytes"], "capture receipt budgets", minimum=1
+    )
+    aggregate = _require_integer(
+        budgets["aggregate_bytes"], "capture receipt budgets", minimum=1
+    )
+    capture_limit = _require_integer(
+        budgets["capture_limit_bytes"], "capture receipt budgets"
+    )
+    if (
+        aggregate < per_capture
+        or capture_limit > per_capture
+        or capture_limit > aggregate
+        or budgets["aggregate_counts"] != "capture_files"
+        or budgets["receipt_bytes_excluded"] is not True
+        or capture_bytes > capture_limit
+        or payload_bytes > capture_bytes
+    ):
+        raise EvidenceError("capture receipt budgets: inconsistent")
+
+    streams = _require_object(
+        receipt["streams"], {"stdin", "stdout", "stderr"}, "capture receipt streams"
+    )
+    stream_bytes = 0
+    for stream in ("stdin", "stdout", "stderr"):
+        item = _require_object(
+            streams[stream], {"bytes", "sha256"}, "capture receipt stream"
+        )
+        stream_bytes += _require_integer(item["bytes"], "capture receipt stream")
+        _require_hash(item["sha256"], "capture receipt stream")
+    if stream_bytes != payload_bytes:
+        raise EvidenceError("capture receipt streams: inconsistent")
+
+    termination = _require_object(
+        receipt["termination"],
+        {"collector_signal", "exit_code", "reason", "signal"},
+        "capture receipt termination",
+    )
+    if (
+        type(termination["reason"]) is not str
+        or termination["reason"] not in TERMINATION_REASONS
+    ):
+        raise EvidenceError("capture receipt termination: invalid reason")
+    for key in ("collector_signal", "exit_code", "signal"):
+        value = termination[key]
+        if value is not None:
+            _require_integer(value, "capture receipt termination", maximum=255)
+
+    capture_hash = receipt["source_capture_sha256"]
+    if receipt["capture_present"]:
+        _require_hash(capture_hash, "capture receipt")
+        if capture_bytes < len(provider_capture.CAPTURE_MAGIC):
+            raise EvidenceError("capture receipt: invalid capture size")
+    elif (
+        capture_status != "incomplete"
+        or capture_hash is not None
+        or capture_bytes != 0
+        or payload_bytes != 0
+        or frame_count != 0
+    ):
+        raise EvidenceError("capture receipt: invalid absent capture")
+    return receipt
+
+
+class _DigestingReader:
+    def __init__(self, descriptor: int) -> None:
+        self.descriptor = descriptor
+        self.digest = hashlib.sha256()
+        self.bytes_read = 0
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            size = 64 * 1024
+        chunks: list[bytes] = []
+        remaining = size
+        while remaining > 0:
+            chunk = os.read(self.descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        self.digest.update(raw)
+        self.bytes_read += len(raw)
+        return raw
+
+
+def _verify_capture(
+    root: provider_capture.CaptureRoot,
+    capture_id: str,
+    receipt: dict[str, Any],
+) -> VerifiedCapture | None:
+    if not receipt["capture_present"]:
+        return None
+    name = f"{capture_id}.capture"
+    descriptor, metadata = _open_private_member(
+        root, name, provider_capture.MAX_BUDGET_BYTES, "capture"
+    )
+    reader = _DigestingReader(descriptor)
+    streams = {
+        "I": {"bytes": 0, "sha256": hashlib.sha256()},
+        "O": {"bytes": 0, "sha256": hashlib.sha256()},
+        "E": {"bytes": 0, "sha256": hashlib.sha256()},
+    }
+    frame_count = 0
+    payload_bytes = 0
+    try:
+        for stream, _observed_ns, payload in provider_capture.iter_capture_frames(reader):
+            streams[stream]["bytes"] += len(payload)
+            streams[stream]["sha256"].update(payload)
+            payload_bytes += len(payload)
+            frame_count += 1
+        if not _member_unchanged(root, name, descriptor, metadata):
+            raise EvidenceError("capture: changed")
+    except provider_capture.CaptureError as error:
+        raise EvidenceError("capture: invalid framing") from error
+    except OSError as error:
+        raise EvidenceError("capture: read failed") from error
+    finally:
+        os.close(descriptor)
+
+    receipt_streams = receipt["streams"]
+    if (
+        reader.bytes_read != metadata.st_size
+        or reader.bytes_read != receipt["capture_bytes"]
+        or reader.digest.hexdigest() != receipt["source_capture_sha256"]
+        or payload_bytes != receipt["payload_bytes"]
+        or frame_count != receipt["frame_count"]
+        or any(
+            streams[key]["bytes"] != receipt_streams[name]["bytes"]
+            or streams[key]["sha256"].hexdigest() != receipt_streams[name]["sha256"]
+            for key, name in (("I", "stdin"), ("O", "stdout"), ("E", "stderr"))
+        )
+    ):
+        raise EvidenceError("capture: receipt mismatch")
+    return VerifiedCapture(
+        provider=receipt["provider"],
+        provider_version=receipt["provider_version"],
+        source_interface=receipt["source_interface"],
+        capture_status=receipt["capture_status"],
+        source_capture_sha256=receipt["source_capture_sha256"],
+        executable_sha256=receipt["executable_sha256"],
+    )
+
+
+def _verified_captures(capture_root: Path) -> set[VerifiedCapture]:
+    try:
+        repository = provider_capture.repository_paths(Path(__file__))
+        root = provider_capture.validate_capture_root(capture_root, repository)
+        provider_capture._lock_root(root)
+    except provider_capture.CaptureError as error:
+        raise EvidenceError("capture root: invalid") from error
+    captures: set[VerifiedCapture] = set()
+    try:
+        try:
+            names = sorted(os.listdir(root.directory_fd))
+        except OSError as error:
+            raise EvidenceError("capture root: unreadable") from error
+        receipt_names = [name for name in names if name.endswith(".receipt.json")]
+        for receipt_name in receipt_names:
+            capture_id = receipt_name.removesuffix(".receipt.json")
+            if provider_capture.CAPTURE_ID_PATTERN.fullmatch(capture_id) is None:
+                raise EvidenceError("capture receipt: invalid name")
+            raw_receipt = _read_private_member(
+                root,
+                receipt_name,
+                provider_capture.MAX_RECEIPT_BYTES,
+                "capture receipt",
+            )
+            try:
+                receipt_text = raw_receipt.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise EvidenceError("capture receipt: invalid UTF-8") from error
+            receipt = _validate_receipt(
+                strict_json(receipt_text, "capture receipt"), capture_id
+            )
+            expected = (
+                json.dumps(
+                    receipt,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("utf-8")
+            if raw_receipt != expected:
+                raise EvidenceError("capture receipt: noncanonical")
+            capture = _verify_capture(root, capture_id, receipt)
+            if capture is not None:
+                captures.add(capture)
+        return captures
+    finally:
+        root.close()
+
+
+def _candidate_rows(raw: bytes) -> list[dict[str, Any]]:
+    if len(raw) > MAX_FILE_BYTES or not raw.endswith(b"\n"):
+        raise EvidenceError("candidate fixture: invalid size or termination")
+    rows: list[dict[str, Any]] = []
+    for line_number, raw_line in enumerate(raw.splitlines(), start=1):
+        if not raw_line or len(raw_line) > MAX_LINE_BYTES:
+            raise EvidenceError(f"line {line_number}: empty or oversized row")
+        try:
+            text = raw_line.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise EvidenceError(f"line {line_number}: invalid UTF-8") from error
+        row = validate_row(strict_json(text, f"line {line_number}"), line_number)
+        if row["evidence_mode"] != "observed":
+            raise EvidenceError(f"line {line_number}: expected observed evidence")
+        rows.append(row)
+    if not rows:
+        raise EvidenceError("candidate fixture: no rows")
+    return rows
+
+
+def verify_observed_provenance(
+    rows: Sequence[dict[str, Any]],
+    capture_root: Path,
+    expected_executable_sha256: dict[str, str],
+) -> None:
+    captures = _verified_captures(capture_root)
+    for line_number, row in enumerate(rows, start=1):
+        declaration = SOURCE_DECLARATIONS.get(row["source_interface"])
+        if declaration != (row["provider"], row["source_kind"]):
+            raise EvidenceError(f"line {line_number}: unsupported observed source")
+        expected = VerifiedCapture(
+            provider=row["provider"],
+            provider_version=row["provider_version"],
+            source_interface=row["source_interface"],
+            capture_status=row["capture_status"],
+            source_capture_sha256=row["source_capture_sha256"],
+            executable_sha256=expected_executable_sha256[row["provider"]],
+        )
+        if expected not in captures:
+            raise EvidenceError(f"line {line_number}: unverified source capture")
+
+
+def validate_unanalyzed_observed_rows(rows: Sequence[dict[str, Any]]) -> None:
+    relevance = {
+        "duplicate_handling": "duplicate",
+        "stale_session_handling": "stale_session",
+        "reconnect_result": "reconnect",
+        "recovery_result": "request_recovery",
+    }
+    for line_number, row in enumerate(rows, start=1):
+        event_kind = row["event_kind"]
+        lifecycle_event = (
+            event_kind in REQUEST_LIFECYCLE_EVENT_KINDS or event_kind == "turn_state"
+        )
+        expected = {
+            "status": "unknown",
+            "task_binding": "unknown",
+            "session_binding": "unknown",
+            "request_binding": "unknown"
+            if event_kind in REQUEST_EVENT_KINDS
+            else "not_applicable",
+            "open_behavior": "unknown" if lifecycle_event else "not_applicable",
+            "close_behavior": "unknown" if lifecycle_event else "not_applicable",
+            "latency_ms": [],
+            "freshness_seconds": None,
+            "freshness_renews_on": None,
+            "failure_behavior": "unknown",
+        }
+        expected.update(
+            {
+                key: "unknown" if event_kind == relevant_event else "not_applicable"
+                for key, relevant_event in relevance.items()
+            }
+        )
+        if any(row[key] != value for key, value in expected.items()):
+            raise EvidenceError(
+                f"line {line_number}: observed semantics require an analyzer"
+            )
+
+
+def normalize_observed_bytes(
+    raw: bytes,
+    capture_root: Path,
+    expected_executable_sha256: dict[str, str],
+    provider_executables_sha256: str | None = None,
+) -> bytes:
+    rows = _candidate_rows(raw)
+    canonical = canonical_row_bytes(rows)
+    build_matrix(
+        rows,
+        FIXTURE_PATHS["observed"],
+        hashlib.sha256(canonical).hexdigest(),
+        provider_executables_sha256=provider_executables_sha256,
+    )
+    verify_observed_provenance(rows, capture_root, expected_executable_sha256)
+    return canonical
 
 
 def require_exact_keys(row: dict[str, Any], line_number: int) -> None:
@@ -603,12 +1212,21 @@ def build_matrix(
     rows: Sequence[dict[str, Any]],
     source_fixture: str,
     source_fixture_sha256: str | None = None,
+    *,
+    provider_executables_sha256: str | None = None,
+    semantics_analyzed: bool = False,
 ) -> dict[str, Any]:
     validate_source_fixture(source_fixture)
+    executable_manifest_digest = _provider_executables_digest(
+        provider_executables_sha256
+    )
     validated = [validate_row(dict(row), index) for index, row in enumerate(rows, 1)]
     modes = {row["evidence_mode"] for row in validated}
     if len(modes) != 1:
         raise EvidenceError("fixture: mixed evidence modes")
+    mode = next(iter(modes))
+    if mode == "observed" and not semantics_analyzed:
+        validate_unanalyzed_observed_rows(validated)
     canonical = canonical_row_bytes(validated)
     fixture_digest = hashlib.sha256(canonical).hexdigest()
     if source_fixture_sha256 is not None and source_fixture_sha256 != fixture_digest:
@@ -633,7 +1251,6 @@ def build_matrix(
     if missing or extra:
         raise EvidenceError(f"fixture: capability grid mismatch: missing={missing}, extra={extra}")
     provider_rows: list[dict[str, Any]] = []
-    mode = next(iter(modes))
     for provider in PROVIDERS:
         if len(versions[provider]) != 1:
             raise EvidenceError(f"fixture: provider needs one exact version: {provider}")
@@ -689,6 +1306,7 @@ def build_matrix(
         "complete": True,
         "evidence_mode": mode,
         "present_cells": len(by_cell),
+        "provider_executables_sha256": executable_manifest_digest,
         "providers": provider_rows,
         "required_cells": len(required),
         "required_event_kinds": list(EVENT_KINDS),
@@ -718,8 +1336,17 @@ def build_matrix_bytes(
     rows: Sequence[dict[str, Any]],
     source_fixture: str,
     source_fixture_sha256: str | None = None,
+    *,
+    provider_executables_sha256: str | None = None,
 ) -> bytes:
-    return matrix_bytes(build_matrix(rows, source_fixture, source_fixture_sha256))
+    return matrix_bytes(
+        build_matrix(
+            rows,
+            source_fixture,
+            source_fixture_sha256,
+            provider_executables_sha256=provider_executables_sha256,
+        )
+    )
 
 
 def check_artifacts(
@@ -727,6 +1354,8 @@ def check_artifacts(
     matrix_path: Path,
     expected_mode: str,
     source_fixture: str,
+    *,
+    provider_executables_sha256: str | None = None,
 ) -> None:
     if source_fixture != FIXTURE_PATHS.get(expected_mode):
         raise EvidenceError("fixture: unexpected source declaration")
@@ -736,6 +1365,7 @@ def check_artifacts(
         rows,
         source_fixture,
         hashlib.sha256(fixture_bytes).hexdigest(),
+        provider_executables_sha256=provider_executables_sha256,
     )
     committed = read_regular_file(matrix_path, "capability matrix")
     if committed != expected:
@@ -766,7 +1396,12 @@ def artifact_paths(root: Path, evidence_mode: str) -> tuple[Path, Path, str]:
     return root / fixture_relative, root / MATRIX_PATH, fixture_relative
 
 
-def matrix_for_mode(root: Path, evidence_mode: str) -> dict[str, Any]:
+def matrix_for_mode(
+    root: Path,
+    evidence_mode: str,
+    *,
+    provider_executables_sha256: str | None = None,
+) -> dict[str, Any]:
     fixture_path, _matrix_path, source_fixture = artifact_paths(root, evidence_mode)
     fixture_bytes = read_regular_file(fixture_path, "fixture")
     rows = load_rows_bytes(fixture_bytes, evidence_mode)
@@ -774,6 +1409,7 @@ def matrix_for_mode(root: Path, evidence_mode: str) -> dict[str, Any]:
         rows,
         source_fixture,
         hashlib.sha256(fixture_bytes).hexdigest(),
+        provider_executables_sha256=provider_executables_sha256,
     )
 
 
@@ -798,12 +1434,20 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     operation.add_argument("--check", action="store_true")
     operation.add_argument("--write-matrix", action="store_true")
     operation.add_argument("--print-summary", action="store_true")
+    operation.add_argument("--write-observed", action="store_true")
     parser.add_argument("--evidence-mode", choices=sorted(FIXTURE_PATHS))
+    parser.add_argument("--capture-root")
     arguments = parser.parse_args(argv)
-    if arguments.check and arguments.evidence_mode is not None:
-        parser.error("--check does not accept --evidence-mode")
-    if not arguments.check and arguments.evidence_mode is None:
-        parser.error("--evidence-mode is required for this operation")
+    if arguments.write_observed:
+        if arguments.evidence_mode is not None or arguments.capture_root is None:
+            parser.error("--write-observed requires only --capture-root")
+    else:
+        if arguments.capture_root is not None:
+            parser.error("--capture-root is only valid with --write-observed")
+        if arguments.check and arguments.evidence_mode is not None:
+            parser.error("--check does not accept --evidence-mode")
+        if not arguments.check and arguments.evidence_mode is None:
+            parser.error("--evidence-mode is required for this operation")
     return arguments
 
 
@@ -811,6 +1455,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parse_args(sys.argv[1:] if argv is None else argv)
     try:
         root = Path(__file__).resolve(strict=True).parents[1]
+        (
+            expected_executable_sha256,
+            provider_executables_sha256,
+        ) = load_executable_manifest_with_digest(
+            root / EXECUTABLE_MANIFEST_PATH
+        )
         if arguments.check:
             evidence_mode = declared_matrix_mode(root / MATRIX_PATH)
             fixture_path, matrix_path, source_fixture = artifact_paths(
@@ -821,17 +1471,41 @@ def main(argv: Sequence[str] | None = None) -> int:
                 matrix_path,
                 evidence_mode,
                 source_fixture,
+                provider_executables_sha256=provider_executables_sha256,
             )
             print(
                 f"provider evidence check passed: {len(PROVIDERS) * len(EVENT_KINDS)} cells"
             )
+        elif arguments.write_observed:
+            raw = sys.stdin.buffer.read(MAX_FILE_BYTES + 1)
+            if len(raw) > MAX_FILE_BYTES:
+                raise EvidenceError("candidate fixture: oversized")
+            canonical = normalize_observed_bytes(
+                raw,
+                Path(arguments.capture_root),
+                expected_executable_sha256,
+                provider_executables_sha256,
+            )
+            fixture_path = root / FIXTURE_PATHS["observed"]
+            write_bytes_atomic(fixture_path, canonical)
+            print(
+                f"provider evidence fixture written: {FIXTURE_PATHS['observed']}"
+            )
         elif arguments.write_matrix:
-            matrix = matrix_for_mode(root, arguments.evidence_mode)
+            matrix = matrix_for_mode(
+                root,
+                arguments.evidence_mode,
+                provider_executables_sha256=provider_executables_sha256,
+            )
             matrix_path = root / MATRIX_PATH
             write_bytes_atomic(matrix_path, matrix_bytes(matrix))
             print(f"provider evidence matrix written: {MATRIX_PATH}")
         else:
-            matrix = matrix_for_mode(root, arguments.evidence_mode)
+            matrix = matrix_for_mode(
+                root,
+                arguments.evidence_mode,
+                provider_executables_sha256=provider_executables_sha256,
+            )
             sys.stdout.write(matrix["human_summary"])
     except (EvidenceError, OSError) as error:
         print(f"provider_evidence: {error}", file=sys.stderr)
