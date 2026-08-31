@@ -286,8 +286,8 @@ clilane
 | `Right` / `Enter` | Open the selected job when the composer is empty. |
 | `Left` / `Right` | Move the composer cursor while typing. |
 | `Esc` | Clear the composer. With an empty composer, return to the job you came from, or leave the switcher when you opened it from your shell. |
-| `Ctrl-C` | Clear the composer. Press twice within 2 seconds on an empty composer to leave the switcher. |
-| `Ctrl-D` twice / `Ctrl-Q` | Leave the switcher. Every job keeps running. |
+| `Ctrl-C` / `Ctrl-D` | Clear the composer. With an empty composer, press the same key twice within 2 seconds to leave the switcher. |
+| `Ctrl-Q` | Leave the switcher immediately. Every job keeps running. |
 | `Ctrl-Q` or `Ctrl-b w` in a job | Background that job and return to the switcher. |
 
 The dashboard identifies jobs started from a terminal as `LOCAL` and jobs started

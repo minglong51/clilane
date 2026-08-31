@@ -56,7 +56,7 @@ HUB_CONFIG_SCHEMA_VERSIONS = frozenset({1, 2})
 HUB_CONTEXT_SCHEMA_VERSION = 2
 HUB_REFRESH_SECONDS = 0.5
 HUB_EXIT_CONFIRM_SECONDS = 2.0
-HUB_KEY_SEQUENCE_SECONDS = 0.03
+HUB_KEY_SEQUENCE_SECONDS = 0.1
 HUB_KEY_PARAMETER_MAX_BYTES = 16
 HUB_ARROW_KEYS = {b"A": "up", b"B": "down", b"C": "right", b"D": "left"}
 HUB_PROMPT_MAX_CHARS = 8000
@@ -3948,12 +3948,14 @@ def hub_key(descriptor: int) -> tuple[str, str] | None:
         parameters = bytearray()
         while True:
             byte = hub_read_byte(descriptor, HUB_KEY_SEQUENCE_SECONDS)
-            if byte is None or len(parameters) > HUB_KEY_PARAMETER_MAX_BYTES:
+            if byte is None:
                 return "ignore", ""
             if 0x40 <= byte[0] <= 0x7E:
                 final = byte
                 break
             parameters.extend(byte)
+        if len(parameters) > HUB_KEY_PARAMETER_MAX_BYTES:
+            return "ignore", ""
         if not parameters:
             if final == b"Z":
                 return "backtab", ""
@@ -4357,6 +4359,8 @@ def hub_ui(
     prompt = ""
     cursor = 0
     exit_deadline = 0.0
+    exit_key = ""
+    exit_hint = ""
     notice = str(data["environment_error"])
     if not notice and not presets:
         notice = hub_no_presets_notice(
@@ -4378,12 +4382,28 @@ def hub_ui(
             selected = item_keys.index(selected_key)
             item_count = len(item_keys)
             preset = presets[agent_index] if presets else None
-            hub_draw(tasks, selected, presets, agent_index, prompt, cursor, notice)
+            if exit_deadline and time.monotonic() >= exit_deadline:
+                exit_deadline = 0.0
+                exit_key = ""
+                exit_hint = ""
+            hub_draw(
+                tasks,
+                selected,
+                presets,
+                agent_index,
+                prompt,
+                cursor,
+                notice or exit_hint,
+            )
             event = hub_key(descriptor)
             if event is None:
                 continue
             notice = ""
             key, text_value = event
+            if key not in {"interrupt", "eof"}:
+                exit_deadline = 0.0
+                exit_key = ""
+                exit_hint = ""
             if key == "up":
                 selected = (selected - 1) % max(1, item_count)
                 selected_key = item_keys[selected]
@@ -4404,24 +4424,28 @@ def hub_ui(
                     prompt = ""
                     cursor = 0
                     continue
-                if source_task is not None:
+                if any(task.session == source for task in tasks):
                     switch_hub_popup(
-                        client, client_pid, context, popup_value, source_task.session
+                        client, client_pid, context, popup_value, source
                     )
                     return 0
                 detach_hub_popup(client, client_pid, context, popup_value)
                 return 0
             if key in {"interrupt", "eof"}:
-                if key == "interrupt" and prompt:
+                if prompt:
                     prompt = ""
                     cursor = 0
+                    exit_deadline = 0.0
+                    exit_key = ""
+                    exit_hint = ""
                     continue
-                if time.monotonic() < exit_deadline:
+                if key == exit_key and time.monotonic() < exit_deadline:
                     detach_hub_popup(client, client_pid, context, popup_value)
                     return 0
                 exit_deadline = time.monotonic() + HUB_EXIT_CONFIRM_SECONDS
+                exit_key = key
                 label = "Ctrl-C" if key == "interrupt" else "Ctrl-D"
-                notice = f"Press {label} again to leave · jobs keep running"
+                exit_hint = f"Press {label} again to leave · jobs keep running"
                 continue
             if key == "right" and prompt:
                 cursor = min(len(prompt), cursor + 1)
