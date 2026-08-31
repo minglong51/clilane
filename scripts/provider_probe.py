@@ -1063,13 +1063,13 @@ def _close_selector(selector: selectors.BaseSelector) -> None:
 
 
 def _process_group_exists(process_group_id: int) -> bool:
+    # EPERM means the id no longer names the same-user group this probe
+    # spawned (the pgid was recycled after the group died), so it is gone.
     try:
         os.killpg(process_group_id, 0)
         return True
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         return False
-    except PermissionError:
-        return True
 
 
 def _wait_for_process_group_exit(
@@ -1087,10 +1087,8 @@ def _wait_for_process_group_exit(
 def _signal_process_group(process_group_id: int, number: int) -> None:
     try:
         os.killpg(process_group_id, number)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
-    except PermissionError as error:
-        raise ProbeError("provider-termination-failed") from error
 
 
 def _sync_and_close_descriptors(descriptors: Sequence[int]) -> None:
