@@ -1,11 +1,12 @@
 # Changelog
 
-## [Unreleased]
+## [0.9.0] - 2026-08-31
 
 ### Fixed
 
 - `Left` in the switcher no longer detaches the client; it only moves the composer cursor. A bare `Esc` clears the composer, returns to the job the switcher was opened from, and detaches only when there is no job to return to.
 - Unrecognised key sequences such as `Delete`, `Home`, `PageUp`, and `Ctrl-Left` are consumed whole instead of leaking stray `~` or `;5D` characters into the composer.
+- `killpg` returning `EPERM` for a reported provider process group is treated as the group having exited, since a recycled group id no longer names a group the probe owns; this removes a macOS CI flake in the collector-cleanup tests.
 
 ### Changed
 
