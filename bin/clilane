@@ -56,7 +56,9 @@ HUB_CONFIG_SCHEMA_VERSIONS = frozenset({1, 2})
 HUB_CONTEXT_SCHEMA_VERSION = 2
 HUB_REFRESH_SECONDS = 0.5
 HUB_PROMPT_MAX_CHARS = 8000
-HUB_PROMPT_AGENT_ORDER = ("codex", "kimi", "claude")
+HUB_AGENT_READY_TIMEOUT_SECONDS = 10.0
+HUB_AGENT_READY_POLL_SECONDS = 0.05
+HUB_PROMPT_AGENT_ORDER = ("codex", "kimi", "claude", "omp")
 FIELD_SEPARATOR = "|"
 ON_EXIT_TIMEOUT = 30.0
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -4047,6 +4049,66 @@ def revalidate_hub_preset(
     return selected
 
 
+def wait_for_hub_agent_ready(preset: dict[str, object], task: Task) -> None:
+    if hub_preset_kind(preset) != "omp":
+        return
+    tty_result = tmux(
+        ["display-message", "-p", "-t", task.pane, "#{pane_tty}"], check=False
+    )
+    if tty_result.returncode != 0:
+        return
+    tty_path = tty_result.stdout.decode(errors="replace").strip()
+    if not tty_path:
+        return
+    try:
+        descriptor = os.open(
+            tty_path,
+            os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOCTTY", 0),
+        )
+    except OSError:
+        return
+    try:
+        deadline = time.monotonic() + HUB_AGENT_READY_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                attributes = termios.tcgetattr(descriptor)
+            except termios.error:
+                return
+            if not attributes[3] & termios.ICANON:
+                return
+            time.sleep(HUB_AGENT_READY_POLL_SECONDS)
+    finally:
+        os.close(descriptor)
+
+
+def wait_for_hub_prompt_visible(task: Task, prompt: str) -> None:
+    normalized = " ".join(prompt.split())
+    if not normalized:
+        return
+    probe = normalized[-16:]
+    deadline = time.monotonic() + HUB_AGENT_READY_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        captured = tmux(
+            ["capture-pane", "-p", "-J", "-t", task.pane], check=False
+        )
+        if captured.returncode != 0:
+            return
+        visible = " ".join(captured.stdout.decode(errors="replace").split())
+        if probe in visible:
+            return
+        time.sleep(HUB_AGENT_READY_POLL_SECONDS)
+
+
+def send_hub_prompt(preset: dict[str, object], task: Task, prompt: str) -> None:
+    if hub_preset_kind(preset) != "omp":
+        send_task(task.id, prompt, True)
+        return
+    wait_for_hub_agent_ready(preset, task)
+    send_task(task.id, prompt, False)
+    wait_for_hub_prompt_visible(task, prompt)
+    key_task(task.id, ["Enter"])
+
+
 def launch_hub_preset(
     preset: dict[str, object], name: str, context: str, prompt: str = ""
 ) -> Task:
@@ -4085,7 +4147,7 @@ def launch_hub_preset(
     )
     task = run_task(spec)
     if prompt:
-        send_task(task.id, prompt, True)
+        send_hub_prompt(selected, task, prompt)
     return task
 
 
@@ -4138,7 +4200,7 @@ def hub_no_presets_notice(
         return f"Add agent presets to {config}"
     if config_present:
         return f"Config disables discovery · Remove it or add agent presets to {config}"
-    return f"Install Codex, Kimi, or Claude · Add agent presets to {config}"
+    return f"Install Codex, Kimi, or Claude · Or install OMP · Add agent presets to {config}"
 
 
 def hub_draw(
