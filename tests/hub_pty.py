@@ -642,6 +642,129 @@ def _exercise_hub_lifecycle(environment: dict[str, str]) -> None:
         _cleanup(environment)
 
 
+def _last_frame(terminal: _Terminal, since: int) -> str:
+    frames = bytes(terminal.output[since:]).split(b"\x1b[H\x1b[J")
+    return frames[-1].decode(errors="replace")
+
+
+def _client_sessions(environment: dict[str, str]) -> list[str]:
+    return _tmux(
+        environment, ["list-clients", "-F", "#{client_session}"]
+    ).stdout.decode().split()
+
+
+def _wait_for_client_session(
+    environment: dict[str, str], terminal: _Terminal, session: str
+) -> None:
+    deadline = time.monotonic() + 10.0
+    while _client_sessions(environment) != [session]:
+        assert time.monotonic() < deadline, _client_sessions(environment)
+        terminal.settle(quiet=0.1, timeout=0.5)
+
+
+def _exercise_switcher_keys(environment: dict[str, str]) -> None:
+    terminal: _Terminal | None = None
+    try:
+        terminal = _Terminal([], environment)
+        terminal.expect("This clilane server")
+        mark = terminal.mark()
+        terminal.send(b"\x15")
+        terminal.expect("> ▏", mark)
+        terminal.send(b"\x1b[D")
+        terminal.settle()
+        assert terminal.running(), "Left on an empty composer detached the client"
+        mark = terminal.mark()
+        terminal.send(b"\x1b[3~\x1b[1~\x1b[1;5D")
+        terminal.expect("> ▏", mark)
+        terminal.settle()
+        frame = _last_frame(terminal, mark)
+        assert "> ▏" in frame and "~" not in frame and ";5D" not in frame, frame
+        terminal.send(b"abc")
+        mark = terminal.mark()
+        terminal.send(b"\x04")
+        terminal.expect("> ▏", mark)
+        terminal.settle()
+        assert "abc" not in _last_frame(terminal, mark)
+        assert terminal.running(), "Ctrl-D with composer text detached the client"
+        mark = terminal.mark()
+        terminal.send(b"\x03")
+        terminal.expect("Press Ctrl-C again to leave", mark)
+        terminal.send(b"\x04")
+        terminal.settle()
+        assert terminal.running(), "Ctrl-C then Ctrl-D detached the client"
+        terminal.send(b"\x04")
+        assert terminal.wait() == 0
+        terminal.close()
+
+        terminal = _Terminal([], environment)
+        terminal.expect("This clilane server")
+        mark = terminal.mark()
+        terminal.send(b"\x15")
+        terminal.expect("> ▏", mark)
+        mark = terminal.mark()
+        terminal.send(b"\x03")
+        terminal.expect("Press Ctrl-C again to leave", mark)
+        terminal.settle()
+        mark = terminal.mark()
+        time.sleep(2.8)
+        terminal.settle()
+        assert "Press Ctrl-C again" not in _last_frame(terminal, mark), "hint outlived its window"
+        terminal.send(b"\x03")
+        terminal.settle()
+        assert terminal.running(), "Ctrl-C after the window detached the client"
+        terminal.send(b"x\x15")
+        terminal.settle()
+        mark = terminal.mark()
+        terminal.send(b"\x03")
+        terminal.expect("Press Ctrl-C again to leave", mark)
+        terminal.settle()
+        assert terminal.running(), "typing did not disarm the exit countdown"
+        terminal.send(b"\x03")
+        assert terminal.wait() == 0
+        terminal.close()
+
+        terminal = _Terminal([], environment)
+        terminal.expect("This clilane server")
+        mark = terminal.mark()
+        terminal.send(b"\x15")
+        terminal.expect("> ▏", mark)
+        terminal.send(b"\x1b")
+        assert terminal.wait() == 0, "Esc with no source job did not detach"
+        terminal.close()
+
+        _run(environment, ["run", "keys-job", "--", "/bin/cat"])
+        sessions = _tmux(
+            environment, ["list-sessions", "-F", "#{session_name}"]
+        ).stdout.decode().split()
+        job_session = next(session for session in sessions if session != "hub")
+        terminal = _Terminal(["attach", "keys-job"], environment)
+        _wait_for_client_session(environment, terminal, job_session)
+        mark = terminal.mark()
+        terminal.send(b"\x11")
+        terminal.expect("This clilane server", mark)
+        mark = terminal.mark()
+        terminal.send(b"\x15")
+        terminal.expect("> ▏", mark)
+        terminal.send(b"\x1b")
+        _wait_for_client_session(environment, terminal, job_session)
+        assert terminal.running(), "Esc detached instead of returning to the job"
+        mark = terminal.mark()
+        terminal.send(b"\x11")
+        terminal.expect("This clilane server", mark)
+        mark = terminal.mark()
+        terminal.send(b"\x15")
+        terminal.expect("> ▏", mark)
+        _run(environment, ["rm", "keys-job", "--force", "--grace", "0"])
+        terminal.send(b"\x1b")
+        assert terminal.wait() == 0, "Esc with a removed source job did not detach"
+        terminal.close()
+        terminal = None
+    finally:
+        if terminal is not None:
+            terminal.close()
+        _cleanup(environment)
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="clp-", dir="/tmp") as temporary:
         root = Path(temporary)
@@ -682,6 +805,12 @@ def main() -> int:
         lifecycle_environment["CLILANE_STATE_HOME"] = str(lifecycle_state)
         lifecycle_environment["CLILANE_TMUX_SOCKET"] = f"clp-life-{os.getpid()}"
         _exercise_hub_lifecycle(lifecycle_environment)
+        keys_environment = dict(environment)
+        keys_state = root / "keys-state"
+        keys_state.mkdir(mode=0o700)
+        keys_environment["CLILANE_STATE_HOME"] = str(keys_state)
+        keys_environment["CLILANE_TMUX_SOCKET"] = f"clp-keys-{os.getpid()}"
+        _exercise_switcher_keys(keys_environment)
 
         tool_bin = root / "tools"
         tool_bin.mkdir(mode=0o700)
