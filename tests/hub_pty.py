@@ -487,7 +487,7 @@ def _exercise_hub_lifecycle(environment: dict[str, str]) -> None:
         handshake_mark = terminal.mark()
         terminal.send(b"\x15")
         terminal.expect("> ▏", handshake_mark)
-        terminal.send(b"\x1b[D")
+        terminal.send(b"\x11")
         assert terminal.wait() == 0
         terminal.close()
         terminal = None
@@ -730,7 +730,7 @@ def main() -> int:
             handshake_mark = discovery_terminal.mark()
             discovery_terminal.send(b"\x15")
             discovery_terminal.expect("> ▏", handshake_mark)
-            discovery_terminal.send(b"\x1b[D")
+            discovery_terminal.send(b"\x11")
             assert discovery_terminal.wait() == 0
             discovery_terminal.close()
             discovery_terminal = None
@@ -782,7 +782,7 @@ def main() -> int:
             handshake_mark = discovery_terminal.mark()
             discovery_terminal.send(b"\x15")
             discovery_terminal.expect("> ▏", handshake_mark)
-            discovery_terminal.send(b"\x1b[D")
+            discovery_terminal.send(b"\x11")
             assert discovery_terminal.wait() == 0
             discovery_terminal.close()
             discovery_terminal = None
