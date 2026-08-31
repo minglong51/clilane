@@ -4424,7 +4424,7 @@ def hub_ui(
                     prompt = ""
                     cursor = 0
                     continue
-                if any(task.session == source for task in tasks):
+                if source_task is not None and not tmux_session_absent(source):
                     switch_hub_popup(
                         client, client_pid, context, popup_value, source
                     )
