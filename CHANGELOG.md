@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `Space` in the switcher peeks at the selected job's latest terminal output without opening it, and turns the composer into a reply composer for that job; `Enter` delivers the message through the same path as `clilane send --enter`. `Space` or `Esc` closes the peek.
+- `Ctrl-X` in the switcher stops the selected running job or removes a finished one. It asks for a second press within 2 seconds, and any other key cancels.
+
 ## [0.9.0] - 2026-08-31
 
 ### Fixed
