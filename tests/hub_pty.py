@@ -804,10 +804,27 @@ def _exercise_switcher_actions(environment: dict[str, str]) -> None:
         while "ping-from-switcher" not in _run(environment, ["read", "act-job"]).stdout:
             assert time.monotonic() < deadline, "reply never reached the job"
             time.sleep(0.2)
-        terminal.expect("ping-from-switcher", mark, timeout=10.0)
+        deadline = time.monotonic() + 10.0
+        while True:
+            terminal.settle()
+            frame = _last_frame(terminal, mark)
+            if "ping-from-switcher" in frame and "> ▏" in frame:
+                break
+            assert time.monotonic() < deadline, frame
+        assert "reply · act-job" in frame, frame
+
+        terminal.send(b"draft")
+        mark = terminal.mark()
+        terminal.send(b"\x1b[B")
+        terminal.expect("Reply discarded", mark)
         terminal.settle()
         frame = _last_frame(terminal, mark)
-        assert "> ▏" in frame and "reply · act-job" in frame, frame
+        assert "reply · act-job" not in frame and "draft" not in frame, frame
+        terminal.send(b"\x1b[A")
+        terminal.settle()
+        mark = terminal.mark()
+        terminal.send(b" ")
+        terminal.expect("reply · act-job", mark)
 
         mark = terminal.mark()
         terminal.send(b"\x1b")
@@ -956,7 +973,7 @@ def main() -> int:
             discovery_terminal.send(b"\x11")
             discovery_terminal.expect("This clilane server", mark)
             discovery_terminal.expect("codex-launch-project", mark)
-            discovery_terminal.expect("empty message: →/Enter view", mark)
+            discovery_terminal.expect("empty: →/Enter view", mark)
             handshake_mark = discovery_terminal.mark()
             discovery_terminal.send(b"\x15")
             discovery_terminal.expect("> ▏", handshake_mark)
@@ -1008,7 +1025,7 @@ def main() -> int:
             discovery_terminal.send(b"\x11")
             discovery_terminal.expect("This clilane server", mark)
             discovery_terminal.expect("kimi-source-project", mark)
-            discovery_terminal.expect("empty message: →/Enter view", mark)
+            discovery_terminal.expect("empty: →/Enter view", mark)
             handshake_mark = discovery_terminal.mark()
             discovery_terminal.send(b"\x15")
             discovery_terminal.expect("> ▏", handshake_mark)
@@ -1112,7 +1129,7 @@ def main() -> int:
             terminal.expect("codex / kimi / claude / hermes", mark)
             terminal.expect("bot-ui", mark)
             terminal.expect("local-ui", mark)
-            terminal.expect("empty message: →/Enter view", mark)
+            terminal.expect("empty: →/Enter view", mark)
             time.sleep(0.25)
 
             mark = terminal.mark()
@@ -1123,7 +1140,7 @@ def main() -> int:
             mark = terminal.mark()
             terminal.send(b"\x11")
             terminal.expect("This clilane server", mark)
-            terminal.expect("empty message: →/Enter view", mark)
+            terminal.expect("empty: →/Enter view", mark)
             time.sleep(0.25)
             ordered = sorted(
                 _tasks(environment),
@@ -1155,7 +1172,7 @@ def main() -> int:
             mark = terminal.mark()
             terminal.send(b"\x11")
             terminal.expect("This clilane server", mark)
-            terminal.expect("empty message: →/Enter view", mark)
+            terminal.expect("empty: →/Enter view", mark)
             time.sleep(0.25)
             terminal.expect("[codex ·", mark)
             agent_mark = terminal.mark()
@@ -1212,7 +1229,7 @@ def main() -> int:
             terminal.expect("This clilane server", mark)
             terminal.expect("kimi-", mark)
             terminal.expect("[kimi ·", mark)
-            terminal.expect("empty message: →/Enter view", mark)
+            terminal.expect("empty: →/Enter view", mark)
             time.sleep(0.25)
             terminal.send(b"\x11")
             assert terminal.wait() == 0

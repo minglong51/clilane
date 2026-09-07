@@ -4168,10 +4168,14 @@ def launch_hub_preset(
 
 
 def hub_peek_lines(task: Task) -> list[str]:
-    captured = tmux(
-        ["capture-pane", "-p", "-J", "-S", f"-{HUB_PEEK_CAPTURE_LINES}", "-t", task.pane],
-        check=False,
-    )
+    try:
+        captured = tmux(
+            ["capture-pane", "-p", "-J", "-S", f"-{HUB_PEEK_CAPTURE_LINES}", "-t", task.pane],
+            check=False,
+            timeout=HUB_ACTION_GRACE_SECONDS,
+        )
+    except CliLaneError:
+        return ["terminal not responding"]
     if captured.returncode != 0:
         return [f"terminal gone · run: {PROGRAM} log {task.name}"]
     lines = [
@@ -4306,16 +4310,21 @@ def hub_draw(
         lines.append(f"\033[1m{fleet_display_cell(notice, width)}\033[0m")
     else:
         lines.append("")
-    reply_to = peek[0] if peek is not None else None
+    reply_to = peek[0] if peek is not None and not peek[0].dead else None
     if reply_to is not None:
         hints = [
             f"type reply to {reply_to.name} · Enter send · ↑↓ jobs",
-            "empty message: →/Enter view · Space/Esc close · Ctrl-X stop/remove · Ctrl-Q leave",
+            "empty: →/Enter view · Space/Esc close · Ctrl-X stop · Ctrl-Q leave",
+        ]
+    elif peek is not None:
+        hints = [
+            f"{peek[0].name} finished · Ctrl-X removes it · Tab agent ({agents}) · Enter start",
+            "empty: →/Enter view · Space/Esc close · Ctrl-Q leave",
         ]
     else:
         hints = [
             f"type message · Tab agent ({agents}) · Enter start · ↑↓ jobs",
-            "empty message: →/Enter view · Space peek · Ctrl-X stop/remove · Esc back · Ctrl-Q leave",
+            "empty: →/Enter view · Space peek · Ctrl-X stop · Esc back · Ctrl-Q leave",
         ]
     lines.extend(
         [
@@ -4414,7 +4423,11 @@ def hub_ui(
     exit_key = ""
     exit_hint = ""
     confirm_task = ""
-    peek_open = False
+    confirm_action = ""
+    peek_key = ""
+    peek_live = False
+    peek_cache: tuple[str, list[str]] | None = None
+    refresh_peek = False
     notice = str(data["environment_error"])
     if not notice and not presets:
         notice = hub_no_presets_notice(
@@ -4426,7 +4439,7 @@ def hub_ui(
     previous = termios.tcgetattr(descriptor)
     try:
         tty.setraw(descriptor)
-        sys.stdout.write("\033[?1049h\033[?25l\033[?2004h")
+        sys.stdout.write("\033[?1049h\033[?25l\033[?2004h\033[?7l")
         sys.stdout.flush()
         while True:
             tasks = hub_task_order(list_tasks())
@@ -4440,10 +4453,23 @@ def hub_ui(
                 exit_deadline = 0.0
                 exit_key = ""
                 exit_hint = ""
-                confirm_task = ""
+                confirm_task = confirm_action = ""
+            if peek_key and (
+                selected >= len(tasks) or tasks[selected].id != peek_key
+            ):
+                peek_key = ""
+                peek_cache = None
+                if prompt and peek_live:
+                    prompt = ""
+                    cursor = 0
+                    notice = notice or "Reply discarded · that job is no longer selected"
             peek = None
-            if peek_open and selected < len(tasks):
-                peek = (tasks[selected], hub_peek_lines(tasks[selected]))
+            if peek_key:
+                peek_live = not tasks[selected].dead
+                if peek_cache is None or refresh_peek:
+                    peek_cache = (peek_key, hub_peek_lines(tasks[selected]))
+                refresh_peek = False
+                peek = (tasks[selected], peek_cache[1])
             hub_draw(
                 tasks,
                 selected,
@@ -4456,6 +4482,7 @@ def hub_ui(
             )
             event = hub_key(descriptor)
             if event is None:
+                refresh_peek = True
                 continue
             notice = ""
             key, text_value = event
@@ -4463,7 +4490,7 @@ def hub_ui(
                 exit_deadline = 0.0
                 exit_key = ""
                 exit_hint = ""
-                confirm_task = ""
+                confirm_task = confirm_action = ""
             if key == "up":
                 selected = (selected - 1) % max(1, item_count)
                 selected_key = item_keys[selected]
@@ -4484,8 +4511,8 @@ def hub_ui(
                     prompt = ""
                     cursor = 0
                     continue
-                if peek_open:
-                    peek_open = False
+                if peek_key:
+                    peek_key = ""
                     continue
                 if source_task is not None and not tmux_session_absent(source):
                     switch_hub_popup(
@@ -4515,7 +4542,7 @@ def hub_ui(
                     exit_deadline = 0.0
                     exit_key = ""
                     exit_hint = ""
-                    confirm_task = ""
+                    confirm_task = confirm_action = ""
                     notice = "Select a job to stop or remove"
                     continue
                 target = tasks[selected]
@@ -4523,12 +4550,13 @@ def hub_ui(
                 if (
                     exit_key == key
                     and confirm_task == target.id
+                    and confirm_action == action
                     and time.monotonic() < exit_deadline
                 ):
                     exit_deadline = 0.0
                     exit_key = ""
                     exit_hint = ""
-                    confirm_task = ""
+                    confirm_task = confirm_action = ""
                     hub_draw(
                         tasks,
                         selected,
@@ -4550,10 +4578,14 @@ def hub_ui(
                             selected_key = remaining[min(selected, len(remaining) - 1)]
                     except CliLaneError as error:
                         notice = str(error)
+                    with suppress(termios.error):
+                        termios.tcflush(descriptor, termios.TCIFLUSH)
+                    refresh_peek = True
                     continue
                 exit_deadline = time.monotonic() + HUB_EXIT_CONFIRM_SECONDS
                 exit_key = key
                 confirm_task = target.id
+                confirm_action = action
                 detail = " (finished)" if target.dead else ""
                 exit_hint = f"Press Ctrl-X again to {action} {target.name}{detail}"
                 continue
@@ -4581,10 +4613,11 @@ def hub_ui(
                     cursor -= 1
                 continue
             if key == "text" and text_value == " " and not prompt:
-                if peek_open:
-                    peek_open = False
+                if peek_key:
+                    peek_key = ""
                 elif selected < len(tasks):
-                    peek_open = True
+                    peek_key = tasks[selected].id
+                    peek_cache = None
                 else:
                     notice = "Select a job to peek at its output"
                 continue
@@ -4610,15 +4643,18 @@ def hub_ui(
                     return 0
                 notice = "Type a message to start a new session"
                 continue
-            if peek_open and selected < len(tasks):
+            if peek_key and selected < len(tasks) and not tasks[selected].dead:
                 target = tasks[selected]
                 try:
                     send_task(target.id, prompt, True)
                 except CliLaneError as error:
                     notice = str(error)
                     continue
+                with suppress(termios.error):
+                    termios.tcflush(descriptor, termios.TCIFLUSH)
                 prompt = ""
                 cursor = 0
+                refresh_peek = True
                 notice = f"Sent to {target.name}"
                 continue
             if preset is None:
@@ -4664,7 +4700,7 @@ def hub_ui(
         with suppress(termios.error):
             termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
         with suppress(OSError):
-            sys.stdout.write("\033[?2004l\033[?25h\033[?1049l")
+            sys.stdout.write("\033[?7h\033[?2004l\033[?25h\033[?1049l")
             sys.stdout.flush()
 
 
