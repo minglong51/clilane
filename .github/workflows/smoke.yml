@@ -51,13 +51,27 @@ jobs:
 
       - name: Install tmux
         shell: bash
+        env:
+          TMUX_SOURCE_VERSION: 3.7c
+          TMUX_SOURCE_SHA256: 7c60cae9a0e25288e2e24750aafc9e8800fc7fd4555e447e1b29ee4201cfb3bf
         run: |
+          set -euo pipefail
           if [ "$RUNNER_OS" = "macOS" ]; then
             brew install tmux
           else
             sudo apt-get update
-            sudo apt-get install -y tmux
+            sudo apt-get install -y bison libevent-dev libncurses-dev pkg-config
+            archive="$RUNNER_TEMP/tmux-$TMUX_SOURCE_VERSION.tar.gz"
+            curl -fsSL -o "$archive" \
+              "https://github.com/tmux/tmux/releases/download/$TMUX_SOURCE_VERSION/tmux-$TMUX_SOURCE_VERSION.tar.gz"
+            printf '%s  %s\n' "$TMUX_SOURCE_SHA256" "$archive" | sha256sum -c -
+            tar -xzf "$archive" -C "$RUNNER_TEMP"
+            cd "$RUNNER_TEMP/tmux-$TMUX_SOURCE_VERSION"
+            ./configure --prefix=/usr/local >/dev/null
+            make -j"$(nproc)" >/dev/null
+            sudo make install >/dev/null
           fi
+          tmux -V
 
       - name: Verify isolated environment
         shell: bash
