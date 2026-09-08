@@ -41,15 +41,18 @@ Laptop / Termius / another node
 
 - macOS or Linux
 - Python 3.10 or newer
-- tmux 3.3 or newer
+- tmux 3.6 or newer
 - `tail` for persistent log reading
 - OpenSSH and key-based host access for `clilane fleet`
 
 CLI Lane uses only the Python standard library. The lifecycle, fleet, and
-interactive switcher paths are verified on macOS and Ubuntu in CI. tmux 3.3 is
-required because older releases do not report the signal that ended a task,
-which would silently corrupt exit statuses; `run` refuses to start on an older
-tmux.
+interactive switcher paths are verified on macOS and Ubuntu in CI, both on
+tmux 3.7. tmux 3.6 is required because the 3.4 and 3.5 servers can crash while
+the switcher opens and closes its popup, which ends every lane on that server
+at once; Ubuntu 24.04's packaged tmux is 3.4, so build a newer release or use
+Homebrew there. Releases older than 3.3 also do not report the signal that
+ended a task, which would silently corrupt exit statuses; `run` refuses to
+start on those.
 
 ## Install
 
