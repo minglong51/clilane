@@ -284,8 +284,10 @@ clilane
 | `Up` / `Down` | Select a running or finished job. |
 | `Enter` | Start the chosen agent when the composer has text. |
 | `Right` / `Enter` | Open the selected job when the composer is empty. |
+| `Space` | With an empty composer, peek at the selected job's latest output without opening it. While the peek is open, the composer replies to that job: type a message and press `Enter` to deliver it through the job's terminal. `Space` again closes the peek. |
+| `Ctrl-X` | Stop the selected running job, or remove a finished one. Press it twice within 2 seconds; any other key cancels. |
 | `Left` / `Right` | Move the composer cursor while typing. |
-| `Esc` | Clear the composer. With an empty composer, return to the job you came from, or leave the switcher when you opened it from your shell. |
+| `Esc` | Clear the composer, or close an open peek. With an empty composer, return to the job you came from, or leave the switcher when you opened it from your shell. |
 | `Ctrl-C` / `Ctrl-D` | Clear the composer. With an empty composer, press the same key twice within 2 seconds to leave the switcher. |
 | `Ctrl-Q` | Leave the switcher immediately. Every job keeps running. |
 | `Ctrl-Q` or `Ctrl-b w` in a job | Background that job and return to the switcher. |

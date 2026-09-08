@@ -60,6 +60,8 @@ HUB_KEY_SEQUENCE_SECONDS = 0.1
 HUB_KEY_PARAMETER_MAX_BYTES = 16
 HUB_ARROW_KEYS = {b"A": "up", b"B": "down", b"C": "right", b"D": "left"}
 HUB_PROMPT_MAX_CHARS = 8000
+HUB_PEEK_CAPTURE_LINES = 40
+HUB_ACTION_GRACE_SECONDS = 3.0
 HUB_AGENT_READY_TIMEOUT_SECONDS = 10.0
 HUB_AGENT_READY_POLL_SECONDS = 0.05
 HUB_PROMPT_AGENT_ORDER = ("codex", "kimi", "claude", "omp")
@@ -3973,6 +3975,7 @@ def hub_key(descriptor: int) -> tuple[str, str] | None:
         b"\x7f": "backspace",
         b"\x11": "quit",
         b"\x15": "clear",
+        b"\x18": "stop",
     }
     if first in controls:
         return controls[first], ""
@@ -4164,6 +4167,32 @@ def launch_hub_preset(
     return task
 
 
+def hub_peek_lines(task: Task) -> list[str]:
+    try:
+        captured = tmux(
+            ["capture-pane", "-p", "-J", "-S", f"-{HUB_PEEK_CAPTURE_LINES}", "-t", task.pane],
+            check=False,
+            timeout=HUB_ACTION_GRACE_SECONDS,
+        )
+    except CliLaneError:
+        return ["terminal not responding"]
+    if captured.returncode != 0:
+        return [f"terminal gone · run: {PROGRAM} log {task.name}"]
+    lines = [
+        sanitized_log_text(line).rstrip()
+        for line in captured.stdout.decode(errors="replace").splitlines()
+    ]
+    while lines and not lines[-1]:
+        lines.pop()
+    return lines[-HUB_PEEK_CAPTURE_LINES:]
+
+
+def hub_peek_title(task: Task) -> str:
+    if task.dead:
+        return f"{task.name} · {task.state} · last output"
+    return f"{task.name} · {task.state} · latest output"
+
+
 def hub_task_line(task: Task) -> str:
     markers = {
         TASK_STATE_INITIALIZING: "○",
@@ -4184,9 +4213,15 @@ def hub_task_line(task: Task) -> str:
 
 
 def hub_composer_line(
-    preset: dict[str, object] | None, prompt: str, cursor: int, width: int
+    preset: dict[str, object] | None,
+    prompt: str,
+    cursor: int,
+    width: int,
+    reply_to: Task | None = None,
 ) -> str:
-    if preset:
+    if reply_to is not None:
+        agent = fleet_display_cell(f"reply · {reply_to.name}", max(1, width - 10))
+    elif preset:
         project = Path(str(preset["dir"])).name or str(preset["dir"])
         agent = fleet_display_cell(
             f"{preset['name']} · {project}", max(1, width - 10)
@@ -4224,6 +4259,7 @@ def hub_draw(
     prompt: str,
     cursor: int,
     notice: str,
+    peek: tuple[Task, Sequence[str]] | None = None,
 ) -> None:
     width, height = shutil.get_terminal_size((80, 24))
     width = max(24, width)
@@ -4234,6 +4270,19 @@ def hub_draw(
     rows.append("+  New session")
     selected = max(0, min(selected, len(rows) - 1))
     body_height = max(1, height - 9)
+    peek_lines: list[str] = []
+    if peek is not None:
+        peek_task, captured = peek
+        peek_height = max(2, min(body_height - 3, body_height // 2 + 2))
+        body_height = max(1, body_height - peek_height)
+        title = fleet_display_cell(f"── {hub_peek_title(peek_task)} ", width - 4)
+        peek_lines.append(f"\033[2m{title}{'─' * max(0, width - len(title) - 1)}\033[0m")
+        tail = list(captured[-(peek_height - 1) :]) if peek_height > 1 else []
+        peek_lines.extend(
+            f" {fleet_display_cell(line, max(1, width - 2))}" for line in tail
+        )
+        while len(peek_lines) < peek_height:
+            peek_lines.append("")
     start = max(0, min(selected - body_height // 2, len(rows) - body_height))
     visible = rows[start : start + body_height]
     lines = [
@@ -4254,22 +4303,34 @@ def hub_draw(
             lines.append(f"\033[7m{padded}\033[0m")
         else:
             lines.append(padded)
-    while len(lines) < height - 4:
+    while len(lines) < height - 4 - len(peek_lines):
         lines.append("")
+    lines.extend(peek_lines)
     if notice:
         lines.append(f"\033[1m{fleet_display_cell(notice, width)}\033[0m")
     else:
         lines.append("")
+    reply_to = peek[0] if peek is not None and not peek[0].dead else None
+    if reply_to is not None:
+        hints = [
+            f"type reply to {reply_to.name} · Enter send · ↑↓ jobs",
+            "empty: →/Enter view · Space/Esc close · Ctrl-X stop · Ctrl-Q leave",
+        ]
+    elif peek is not None:
+        hints = [
+            f"{peek[0].name} finished · Ctrl-X removes it · Tab agent ({agents}) · Enter start",
+            "empty: →/Enter view · Space/Esc close · Ctrl-Q leave",
+        ]
+    else:
+        hints = [
+            f"type message · Tab agent ({agents}) · Enter start · ↑↓ jobs",
+            "empty: →/Enter view · Space peek · Ctrl-X stop · Esc back · Ctrl-Q leave",
+        ]
     lines.extend(
         [
-            hub_composer_line(preset, prompt, cursor, width),
-            fleet_display_cell(
-                f"type message · Tab agent ({agents}) · Enter start · ↑↓ jobs", width
-            ),
-            fleet_display_cell(
-                "empty message: →/Enter view · Esc back · Ctrl-Q leave (jobs keep running)",
-                width,
-            ),
+            hub_composer_line(preset, prompt, cursor, width, reply_to),
+            fleet_display_cell(hints[0], width),
+            fleet_display_cell(hints[1], width),
         ]
     )
     sys.stdout.write("\033[H\033[2J" + "\r\n".join(lines[:height]))
@@ -4361,6 +4422,12 @@ def hub_ui(
     exit_deadline = 0.0
     exit_key = ""
     exit_hint = ""
+    confirm_task = ""
+    confirm_action = ""
+    peek_key = ""
+    peek_live = False
+    peek_cache: tuple[str, list[str]] | None = None
+    refresh_peek = False
     notice = str(data["environment_error"])
     if not notice and not presets:
         notice = hub_no_presets_notice(
@@ -4372,7 +4439,7 @@ def hub_ui(
     previous = termios.tcgetattr(descriptor)
     try:
         tty.setraw(descriptor)
-        sys.stdout.write("\033[?1049h\033[?25l\033[?2004h")
+        sys.stdout.write("\033[?1049h\033[?25l\033[?2004h\033[?7l")
         sys.stdout.flush()
         while True:
             tasks = hub_task_order(list_tasks())
@@ -4386,6 +4453,23 @@ def hub_ui(
                 exit_deadline = 0.0
                 exit_key = ""
                 exit_hint = ""
+                confirm_task = confirm_action = ""
+            if peek_key and (
+                selected >= len(tasks) or tasks[selected].id != peek_key
+            ):
+                peek_key = ""
+                peek_cache = None
+                if prompt and peek_live:
+                    prompt = ""
+                    cursor = 0
+                    notice = notice or "Reply discarded · that job is no longer selected"
+            peek = None
+            if peek_key:
+                peek_live = not tasks[selected].dead
+                if peek_cache is None or refresh_peek:
+                    peek_cache = (peek_key, hub_peek_lines(tasks[selected]))
+                refresh_peek = False
+                peek = (tasks[selected], peek_cache[1])
             hub_draw(
                 tasks,
                 selected,
@@ -4394,16 +4478,19 @@ def hub_ui(
                 prompt,
                 cursor,
                 notice or exit_hint,
+                peek,
             )
             event = hub_key(descriptor)
             if event is None:
+                refresh_peek = True
                 continue
             notice = ""
             key, text_value = event
-            if key not in {"interrupt", "eof"}:
+            if key not in {"interrupt", "eof", "stop"}:
                 exit_deadline = 0.0
                 exit_key = ""
                 exit_hint = ""
+                confirm_task = confirm_action = ""
             if key == "up":
                 selected = (selected - 1) % max(1, item_count)
                 selected_key = item_keys[selected]
@@ -4423,6 +4510,9 @@ def hub_ui(
                 if prompt:
                     prompt = ""
                     cursor = 0
+                    continue
+                if peek_key:
+                    peek_key = ""
                     continue
                 if source_task is not None and not tmux_session_absent(source):
                     switch_hub_popup(
@@ -4447,6 +4537,58 @@ def hub_ui(
                 label = "Ctrl-C" if key == "interrupt" else "Ctrl-D"
                 exit_hint = f"Press {label} again to leave · jobs keep running"
                 continue
+            if key == "stop":
+                if selected >= len(tasks):
+                    exit_deadline = 0.0
+                    exit_key = ""
+                    exit_hint = ""
+                    confirm_task = confirm_action = ""
+                    notice = "Select a job to stop or remove"
+                    continue
+                target = tasks[selected]
+                action = "remove" if target.dead else "stop"
+                if (
+                    exit_key == key
+                    and confirm_task == target.id
+                    and confirm_action == action
+                    and time.monotonic() < exit_deadline
+                ):
+                    exit_deadline = 0.0
+                    exit_key = ""
+                    exit_hint = ""
+                    confirm_task = confirm_action = ""
+                    hub_draw(
+                        tasks,
+                        selected,
+                        presets,
+                        agent_index,
+                        prompt,
+                        cursor,
+                        f"{'Stopping' if action == 'stop' else 'Removing'} {target.name}…",
+                        peek,
+                    )
+                    try:
+                        if action == "stop":
+                            stop_task(target.id, HUB_ACTION_GRACE_SECONDS)
+                            notice = f"Stopped {target.name}"
+                        else:
+                            remove_task(target.id, False, HUB_ACTION_GRACE_SECONDS)
+                            notice = f"Removed {target.name}"
+                            remaining = [item for item in item_keys if item != target.id]
+                            selected_key = remaining[min(selected, len(remaining) - 1)]
+                    except CliLaneError as error:
+                        notice = str(error)
+                    with suppress(termios.error):
+                        termios.tcflush(descriptor, termios.TCIFLUSH)
+                    refresh_peek = True
+                    continue
+                exit_deadline = time.monotonic() + HUB_EXIT_CONFIRM_SECONDS
+                exit_key = key
+                confirm_task = target.id
+                confirm_action = action
+                detail = " (finished)" if target.dead else ""
+                exit_hint = f"Press Ctrl-X again to {action} {target.name}{detail}"
+                continue
             if key == "right" and prompt:
                 cursor = min(len(prompt), cursor + 1)
                 continue
@@ -4470,6 +4612,15 @@ def hub_ui(
                     prompt = prompt[: cursor - 1] + prompt[cursor:]
                     cursor -= 1
                 continue
+            if key == "text" and text_value == " " and not prompt:
+                if peek_key:
+                    peek_key = ""
+                elif selected < len(tasks):
+                    peek_key = tasks[selected].id
+                    peek_cache = None
+                else:
+                    notice = "Select a job to peek at its output"
+                continue
             if key == "text":
                 available = HUB_PROMPT_MAX_CHARS - len(prompt)
                 inserted = text_value[:available]
@@ -4491,6 +4642,20 @@ def hub_ui(
                     )
                     return 0
                 notice = "Type a message to start a new session"
+                continue
+            if peek_key and selected < len(tasks) and not tasks[selected].dead:
+                target = tasks[selected]
+                try:
+                    send_task(target.id, prompt, True)
+                except CliLaneError as error:
+                    notice = str(error)
+                    continue
+                with suppress(termios.error):
+                    termios.tcflush(descriptor, termios.TCIFLUSH)
+                prompt = ""
+                cursor = 0
+                refresh_peek = True
+                notice = f"Sent to {target.name}"
                 continue
             if preset is None:
                 notice = hub_no_presets_notice(
@@ -4535,7 +4700,7 @@ def hub_ui(
         with suppress(termios.error):
             termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
         with suppress(OSError):
-            sys.stdout.write("\033[?2004l\033[?25h\033[?1049l")
+            sys.stdout.write("\033[?7h\033[?2004l\033[?25h\033[?1049l")
             sys.stdout.flush()
 
 
