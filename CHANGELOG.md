@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- The documented tmux minimum is now 3.6. tmux 3.4 and 3.5 servers can crash while the switcher opens and closes its popup, ending every lane on that server; `run` still refuses only releases older than 3.3.
+
 ## [0.10.0] - 2026-09-07
 
 ### Added
