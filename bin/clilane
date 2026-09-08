@@ -3005,15 +3005,33 @@ def print_tasks(tasks: Sequence[Task], as_json: bool) -> None:
         )
 
 
+def character_width(character: str) -> int:
+    if unicodedata.combining(character):
+        return 0
+    return 2 if unicodedata.east_asian_width(character) in "WF" else 1
+
+
+def display_width(value: str) -> int:
+    return sum(character_width(character) for character in value)
+
+
 def fleet_display_cell(value: str, limit: int | None = None) -> str:
     normalized = "".join(
         " " if character.isspace() and character != " " else character
         for character in value
     )
     cleaned = "".join(character for character in normalized if character.isprintable())
-    if limit is None or len(cleaned) <= limit:
+    if limit is None or display_width(cleaned) <= limit:
         return cleaned
-    return cleaned[: limit - 1] + "…"
+    kept: list[str] = []
+    used = 0
+    for character in cleaned:
+        width = character_width(character)
+        if used + width > limit - 1:
+            break
+        kept.append(character)
+        used += width
+    return "".join(kept) + "…"
 
 
 def fleet_verb_target(hosts: Sequence[FleetHost], target: str) -> tuple[FleetHost, str]:
@@ -4298,7 +4316,7 @@ def hub_draw(
     ]
     for offset, row in enumerate(visible, start=start):
         cleaned = fleet_display_cell(row, max(1, width - 2))
-        padded = f" {cleaned:<{max(1, width - 2)}}"
+        padded = f" {cleaned}{' ' * max(0, width - 2 - display_width(cleaned))}"
         if offset == selected:
             lines.append(f"\033[7m{padded}\033[0m")
         else:
@@ -4439,7 +4457,7 @@ def hub_ui(
     previous = termios.tcgetattr(descriptor)
     try:
         tty.setraw(descriptor)
-        sys.stdout.write("\033[?1049h\033[?25l\033[?2004h\033[?7l")
+        sys.stdout.write("\033[?1049h\033[?25l\033[?2004h")
         sys.stdout.flush()
         while True:
             tasks = hub_task_order(list_tasks())
@@ -4700,7 +4718,7 @@ def hub_ui(
         with suppress(termios.error):
             termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
         with suppress(OSError):
-            sys.stdout.write("\033[?7h\033[?2004l\033[?25h\033[?1049l")
+            sys.stdout.write("\033[?2004l\033[?25h\033[?1049l")
             sys.stdout.flush()
 
 
