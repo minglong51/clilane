@@ -62,6 +62,8 @@ HUB_ARROW_KEYS = {b"A": "up", b"B": "down", b"C": "right", b"D": "left"}
 HUB_PROMPT_MAX_CHARS = 8000
 HUB_PEEK_CAPTURE_LINES = 40
 HUB_ACTION_GRACE_SECONDS = 3.0
+HUB_HISTORY_BATCH_DEFAULT = 20
+HUB_HISTORY_BATCH_MAX = 1000
 HUB_RESUME_ARGUMENTS: dict[str, tuple[list[str], frozenset[str], frozenset[str]]] = {
     "claude": (
         ["--continue"],
@@ -4314,6 +4316,27 @@ def resume_hub_task(
     return resumed
 
 
+def hub_history_batch(environment: Mapping[str, object]) -> int:
+    raw = environment.get("CLILANE_HUB_HISTORY")
+    if raw is None or raw == "":
+        return HUB_HISTORY_BATCH_DEFAULT
+    try:
+        value = int(str(raw))
+    except ValueError as error:
+        raise CliLaneError(f"CLILANE_HUB_HISTORY must be an integer: {raw!r}") from error
+    if not 1 <= value <= HUB_HISTORY_BATCH_MAX:
+        raise CliLaneError(
+            f"CLILANE_HUB_HISTORY must be between 1 and {HUB_HISTORY_BATCH_MAX}"
+        )
+    return value
+
+
+def hub_resume_kind(task: Task, presets: Sequence[dict[str, object]]) -> str | None:
+    preset = hub_matching_preset(task, presets)
+    kind = hub_preset_kind(preset) if preset is not None else hub_command_kind(task.command)
+    return kind if kind in HUB_RESUME_ARGUMENTS else None
+
+
 def hub_claimed_launch(
     client: str,
     client_pid: str,
@@ -4427,20 +4450,43 @@ def hub_draw(
     prompt: str,
     cursor: int,
     notice: str,
-    peek: tuple[Task, Sequence[str]] | None = None,
+    peek: tuple[Task, Sequence[str], bool] | None = None,
+    hidden_history: int = 0,
 ) -> None:
     width, height = shutil.get_terminal_size((80, 24))
     width = max(24, width)
     height = max(12, height)
     preset = presets[agent_index] if presets else None
     agents = " / ".join(str(item["name"]) for item in presets) or "no presets"
-    rows = [hub_task_line(task) for task in tasks]
-    rows.append("+  New session")
-    selected = max(0, min(selected, len(rows) - 1))
+    ongoing_total = sum(1 for task in tasks if not task.dead)
+    shown_history = len(tasks) - ongoing_total
+    history_total = shown_history + hidden_history
+    rows: list[tuple[str, int | None]] = []
+    for index, task in enumerate(tasks):
+        if index == 0 and not task.dead:
+            rows.append((f"\033[1mONGOING ({ongoing_total})\033[0m", None))
+        if task.dead and index == ongoing_total:
+            label = (
+                f"HISTORY (showing {shown_history} of {history_total})"
+                if hidden_history
+                else f"HISTORY ({history_total})"
+            )
+            rows.append((f"\033[1m{label}\033[0m", None))
+        rows.append((hub_task_line(task), index))
+    if hidden_history:
+        if shown_history == 0:
+            rows.append((f"\033[1mHISTORY (showing 0 of {history_total})\033[0m", None))
+        rows.append((f"\033[2m   … {hidden_history} more · ↓ to reveal\033[0m", None))
+    rows.append(("+  New session", len(tasks)))
+    selected = max(0, min(selected, len(tasks)))
+    selected_row = next(
+        (position for position, (_, index) in enumerate(rows) if index == selected),
+        len(rows) - 1,
+    )
     body_height = max(1, height - 9)
     peek_lines: list[str] = []
     if peek is not None:
-        peek_task, captured = peek
+        peek_task, captured, _ = peek
         peek_height = max(2, min(body_height - 3, body_height // 2 + 2))
         body_height = max(1, body_height - peek_height)
         title = fleet_display_cell(f"── {hub_peek_title(peek_task)} ", width - 4)
@@ -4451,7 +4497,7 @@ def hub_draw(
         )
         while len(peek_lines) < peek_height:
             peek_lines.append("")
-    start = max(0, min(selected - body_height // 2, len(rows) - body_height))
+    start = max(0, min(selected_row - body_height // 2, len(rows) - body_height))
     visible = rows[start : start + body_height]
     lines = [
         "\033[1mCLI LANE\033[0m",
@@ -4464,10 +4510,13 @@ def hub_draw(
             width,
         ),
     ]
-    for offset, row in enumerate(visible, start=start):
-        cleaned = fleet_display_cell(row, max(1, width - 2))
+    for text, index in visible:
+        if index is None:
+            lines.append(f" {text}")
+            continue
+        cleaned = fleet_display_cell(text, max(1, width - 2))
         padded = f" {cleaned}{' ' * max(0, width - 2 - display_width(cleaned))}"
-        if offset == selected:
+        if index == selected:
             lines.append(f"\033[7m{padded}\033[0m")
         else:
             lines.append(padded)
@@ -4485,8 +4534,12 @@ def hub_draw(
             "empty: →/Enter view · Space/Esc close · Ctrl-X stop · Ctrl-Q leave",
         ]
     elif peek is not None:
+        if peek[2]:
+            first = f"{peek[0].name} finished · Enter/Ctrl-R resume · → open pane · Ctrl-X remove"
+        else:
+            first = f"{peek[0].name} finished · Enter/→ open pane · Ctrl-R rerun · Ctrl-X remove"
         hints = [
-            f"{peek[0].name} finished · Ctrl-R resume · Ctrl-X remove · →/Enter open pane",
+            first,
             f"type message · Enter start new ({agents}) · Space/Esc close · Ctrl-Q leave",
         ]
     else:
@@ -4592,6 +4645,15 @@ def hub_ui(
     exit_hint = ""
     confirm_task = ""
     confirm_action = ""
+    history_batch = hub_history_batch(
+        context_environment if isinstance(context_environment, dict) else {}
+    )
+    history_limit = history_batch
+    if source_task is not None and source_task.dead:
+        position = [task.id for task in tasks if task.dead].index(source_task.id)
+        while history_limit <= position:
+            history_limit += history_batch
+    hidden_history = 0
     peek_key = ""
     peek_live = False
     peek_cache: tuple[str, list[str]] | None = None
@@ -4610,7 +4672,10 @@ def hub_ui(
         sys.stdout.write("\033[?1049h\033[?25l\033[?2004h")
         sys.stdout.flush()
         while True:
-            tasks = hub_task_order(list_tasks())
+            all_tasks = hub_task_order(list_tasks())
+            ongoing_count = sum(1 for task in all_tasks if not task.dead)
+            hidden_history = max(0, len(all_tasks) - ongoing_count - history_limit)
+            tasks = all_tasks[: len(all_tasks) - hidden_history]
             item_keys = [task.id for task in tasks] + [""]
             if selected_key not in item_keys:
                 selected_key = ""
@@ -4637,7 +4702,11 @@ def hub_ui(
                 if peek_cache is None or (refresh_peek and peek_live):
                     peek_cache = (peek_key, hub_peek_lines(tasks[selected]))
                 refresh_peek = False
-                peek = (tasks[selected], peek_cache[1])
+                peek = (
+                    tasks[selected],
+                    peek_cache[1],
+                    hub_resume_kind(tasks[selected], presets) is not None,
+                )
             hub_draw(
                 tasks,
                 selected,
@@ -4647,6 +4716,7 @@ def hub_ui(
                 cursor,
                 notice or exit_hint,
                 peek,
+                hidden_history,
             )
             event = hub_key(descriptor)
             if event is None:
@@ -4664,6 +4734,10 @@ def hub_ui(
                 selected_key = item_keys[selected]
                 continue
             if key == "down":
+                if hidden_history and selected == len(tasks) - 1:
+                    history_limit += history_batch
+                    selected_key = all_tasks[len(tasks)].id
+                    continue
                 selected = (selected + 1) % max(1, item_count)
                 selected_key = item_keys[selected]
                 continue
@@ -4836,13 +4910,32 @@ def hub_ui(
                 continue
             if not prompt:
                 if selected < len(tasks):
-                    if (
-                        key == "enter"
-                        and tasks[selected].dead
-                        and peek_key != tasks[selected].id
-                    ):
-                        peek_key = tasks[selected].id
-                        peek_cache = None
+                    target = tasks[selected]
+                    if key == "enter" and target.dead and hub_resume_kind(target, presets):
+                        hub_draw(
+                            tasks,
+                            selected,
+                            presets,
+                            agent_index,
+                            prompt,
+                            cursor,
+                            f"Resuming {target.name}…",
+                            peek,
+                            hidden_history,
+                        )
+                        alive, error = hub_claimed_launch(
+                            client,
+                            client_pid,
+                            context,
+                            popup_value,
+                            lambda: resume_hub_task(target, presets, context),
+                        )
+                        if not alive:
+                            return 0
+                        if error is None:
+                            return 0
+                        notice = error
+                        peek_key = ""
                         continue
                     switch_hub_popup(
                         client,

@@ -5,7 +5,8 @@
 ### Added
 
 - `Ctrl-R` in the switcher resumes a finished job: the same command relaunches in the same directory under the same name, with `--continue` for Claude and Kimi and `resume --last` for Codex. Jobs matching a configured preset relaunch through it, profile included; others use the raw environment. The previous log becomes the new job's `.previous` log until the new log rotates. Commands whose flags cannot combine with the continue flag are refused before anything is removed.
-- `Enter` on a finished job now opens its peek instead of landing on a dead pane; `Right` still opens the pane for scrollback.
+- `Enter` on a finished Claude, Codex, or Kimi job resumes it and opens the new session; on any other finished job it opens the dead pane. `Right` always opens the pane.
+- The switcher list is split into `ONGOING` and `HISTORY` sections. History shows the latest 20 finished jobs and reveals the next batch when the selection moves past the last one; `CLILANE_HUB_HISTORY` sets the batch size.
 
 ### Changed
 
