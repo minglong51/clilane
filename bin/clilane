@@ -4334,7 +4334,13 @@ def hub_history_batch(environment: Mapping[str, object]) -> int:
 def hub_resume_kind(task: Task, presets: Sequence[dict[str, object]]) -> str | None:
     preset = hub_matching_preset(task, presets)
     kind = hub_preset_kind(preset) if preset is not None else hub_command_kind(task.command)
-    return kind if kind in HUB_RESUME_ARGUMENTS else None
+    if kind not in HUB_RESUME_ARGUMENTS:
+        return None
+    try:
+        hub_resume_command(task.command, kind, task.name)
+    except CliLaneError:
+        return None
+    return kind
 
 
 def hub_claimed_launch(
@@ -4461,26 +4467,26 @@ def hub_draw(
     ongoing_total = sum(1 for task in tasks if not task.dead)
     shown_history = len(tasks) - ongoing_total
     history_total = shown_history + hidden_history
-    rows: list[tuple[str, int | None]] = []
+    rows: list[tuple[str, int | None, str]] = []
     for index, task in enumerate(tasks):
         if index == 0 and not task.dead:
-            rows.append((f"\033[1mONGOING ({ongoing_total})\033[0m", None))
+            rows.append((f"ONGOING ({ongoing_total})", None, "1"))
         if task.dead and index == ongoing_total:
             label = (
                 f"HISTORY (showing {shown_history} of {history_total})"
                 if hidden_history
                 else f"HISTORY ({history_total})"
             )
-            rows.append((f"\033[1m{label}\033[0m", None))
-        rows.append((hub_task_line(task), index))
+            rows.append((label, None, "1"))
+        rows.append((hub_task_line(task), index, ""))
     if hidden_history:
         if shown_history == 0:
-            rows.append((f"\033[1mHISTORY (showing 0 of {history_total})\033[0m", None))
-        rows.append((f"\033[2m   … {hidden_history} more · ↓ to reveal\033[0m", None))
-    rows.append(("+  New session", len(tasks)))
+            rows.append((f"HISTORY (showing 0 of {history_total})", None, "1"))
+        rows.append((f"   … {hidden_history} more · ↓ to reveal", None, "2"))
+    rows.append(("+  New session", len(tasks), ""))
     selected = max(0, min(selected, len(tasks)))
     selected_row = next(
-        (position for position, (_, index) in enumerate(rows) if index == selected),
+        (position for position, (_, index, _) in enumerate(rows) if index == selected),
         len(rows) - 1,
     )
     body_height = max(1, height - 9)
@@ -4510,11 +4516,11 @@ def hub_draw(
             width,
         ),
     ]
-    for text, index in visible:
-        if index is None:
-            lines.append(f" {text}")
-            continue
+    for text, index, style in visible:
         cleaned = fleet_display_cell(text, max(1, width - 2))
+        if index is None:
+            lines.append(f" \033[{style}m{cleaned}\033[0m" if style else f" {cleaned}")
+            continue
         padded = f" {cleaned}{' ' * max(0, width - 2 - display_width(cleaned))}"
         if index == selected:
             lines.append(f"\033[7m{padded}\033[0m")
@@ -4645,9 +4651,14 @@ def hub_ui(
     exit_hint = ""
     confirm_task = ""
     confirm_action = ""
-    history_batch = hub_history_batch(
-        context_environment if isinstance(context_environment, dict) else {}
-    )
+    history_notice = ""
+    try:
+        history_batch = hub_history_batch(
+            context_environment if isinstance(context_environment, dict) else {}
+        )
+    except CliLaneError as error:
+        history_batch = HUB_HISTORY_BATCH_DEFAULT
+        history_notice = f"{error}; showing {history_batch}"
     history_limit = history_batch
     if source_task is not None and source_task.dead:
         position = [task.id for task in tasks if task.dead].index(source_task.id)
@@ -4658,7 +4669,7 @@ def hub_ui(
     peek_live = False
     peek_cache: tuple[str, list[str]] | None = None
     refresh_peek = False
-    notice = str(data["environment_error"])
+    notice = str(data["environment_error"]) or history_notice
     if not notice and not presets:
         notice = hub_no_presets_notice(
             config,
@@ -4671,6 +4682,19 @@ def hub_ui(
         tty.setraw(descriptor)
         sys.stdout.write("\033[?1049h\033[?25l\033[?2004h")
         sys.stdout.flush()
+        def redraw(text: str) -> None:
+            hub_draw(
+                tasks,
+                selected,
+                presets,
+                agent_index,
+                prompt,
+                cursor,
+                text,
+                peek,
+                hidden_history,
+            )
+
         while True:
             all_tasks = hub_task_order(list_tasks())
             ongoing_count = sum(1 for task in all_tasks if not task.dead)
@@ -4699,14 +4723,16 @@ def hub_ui(
             peek = None
             if peek_key:
                 peek_live = not tasks[selected].dead
-                if peek_cache is None or (refresh_peek and peek_live):
-                    peek_cache = (peek_key, hub_peek_lines(tasks[selected]))
+                if peek_cache is None:
+                    peek_cache = (
+                        peek_key,
+                        hub_peek_lines(tasks[selected]),
+                        hub_resume_kind(tasks[selected], presets) is not None,
+                    )
+                elif refresh_peek and peek_live:
+                    peek_cache = (peek_key, hub_peek_lines(tasks[selected]), peek_cache[2])
                 refresh_peek = False
-                peek = (
-                    tasks[selected],
-                    peek_cache[1],
-                    hub_resume_kind(tasks[selected], presets) is not None,
-                )
+                peek = (tasks[selected], peek_cache[1], peek_cache[2])
             hub_draw(
                 tasks,
                 selected,
@@ -4799,16 +4825,7 @@ def hub_ui(
                     exit_key = ""
                     exit_hint = ""
                     confirm_task = confirm_action = ""
-                    hub_draw(
-                        tasks,
-                        selected,
-                        presets,
-                        agent_index,
-                        prompt,
-                        cursor,
-                        f"{'Stopping' if action == 'stop' else 'Removing'} {target.name}…",
-                        peek,
-                    )
+                    redraw(f"{'Stopping' if action == 'stop' else 'Removing'} {target.name}…")
                     try:
                         if action == "stop":
                             stop_task(target.id, HUB_ACTION_GRACE_SECONDS)
@@ -4816,8 +4833,13 @@ def hub_ui(
                         else:
                             remove_task(target.id, False, HUB_ACTION_GRACE_SECONDS)
                             notice = f"Removed {target.name}"
-                            remaining = [item for item in item_keys if item != target.id]
-                            selected_key = remaining[min(selected, len(remaining) - 1)]
+                            survivors = [item.id for item in all_tasks if item.id != target.id]
+                            position = [item.id for item in all_tasks].index(target.id)
+                            selected_key = (
+                                survivors[min(position, len(survivors) - 1)]
+                                if survivors
+                                else ""
+                            )
                     except CliLaneError as error:
                         notice = str(error)
                     with suppress(termios.error):
@@ -4831,6 +4853,14 @@ def hub_ui(
                 detail = " (finished)" if target.dead else ""
                 exit_hint = f"Press Ctrl-X again to {action} {target.name}{detail}"
                 continue
+            if (
+                key == "enter"
+                and not prompt
+                and selected < len(tasks)
+                and tasks[selected].dead
+                and hub_resume_kind(tasks[selected], presets)
+            ):
+                key = "resume"
             if key == "resume":
                 if selected >= len(tasks):
                     notice = "Select a finished job to resume"
@@ -4842,16 +4872,7 @@ def hub_ui(
                 if prompt:
                     notice = "Clear the composer first (Esc), then Ctrl-R"
                     continue
-                hub_draw(
-                    tasks,
-                    selected,
-                    presets,
-                    agent_index,
-                    prompt,
-                    cursor,
-                    f"Resuming {target.name}…",
-                    peek,
-                )
+                redraw(f"Resuming {target.name}…")
                 alive, error = hub_claimed_launch(
                     client,
                     client_pid,
@@ -4910,33 +4931,6 @@ def hub_ui(
                 continue
             if not prompt:
                 if selected < len(tasks):
-                    target = tasks[selected]
-                    if key == "enter" and target.dead and hub_resume_kind(target, presets):
-                        hub_draw(
-                            tasks,
-                            selected,
-                            presets,
-                            agent_index,
-                            prompt,
-                            cursor,
-                            f"Resuming {target.name}…",
-                            peek,
-                            hidden_history,
-                        )
-                        alive, error = hub_claimed_launch(
-                            client,
-                            client_pid,
-                            context,
-                            popup_value,
-                            lambda: resume_hub_task(target, presets, context),
-                        )
-                        if not alive:
-                            return 0
-                        if error is None:
-                            return 0
-                        notice = error
-                        peek_key = ""
-                        continue
                     switch_hub_popup(
                         client,
                         client_pid,
@@ -4968,16 +4962,8 @@ def hub_ui(
                     config_required=config_required,
                 )
                 continue
-            name = hub_task_name(preset, tasks)
-            hub_draw(
-                tasks,
-                selected,
-                presets,
-                agent_index,
-                prompt,
-                cursor,
-                f"Starting {name}…",
-            )
+            name = hub_task_name(preset, all_tasks)
+            redraw(f"Starting {name}…")
             launch_preset = preset
             launch_prompt = prompt
             alive, error = hub_claimed_launch(
