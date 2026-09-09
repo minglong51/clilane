@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- `Ctrl-R` in the switcher resumes a finished job: the same command relaunches in the same directory under the same name, with `--continue` for Claude and Kimi and `resume --last` for Codex, and the previous log becomes the new job's `.previous` log.
+- `Enter` on a finished job now opens its peek instead of landing on a dead pane; `Right` still opens the pane for scrollback.
+
 ### Changed
 
 - The documented tmux minimum is now 3.6. tmux 3.4 and 3.5 servers can crash while the switcher opens and closes its popup, ending every lane on that server; `run` still refuses only releases older than 3.3.

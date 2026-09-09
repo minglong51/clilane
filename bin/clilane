@@ -62,6 +62,11 @@ HUB_ARROW_KEYS = {b"A": "up", b"B": "down", b"C": "right", b"D": "left"}
 HUB_PROMPT_MAX_CHARS = 8000
 HUB_PEEK_CAPTURE_LINES = 40
 HUB_ACTION_GRACE_SECONDS = 3.0
+HUB_RESUME_ARGUMENTS: dict[str, tuple[list[str], frozenset[str]]] = {
+    "claude": (["--continue"], frozenset({"--continue", "-c", "--resume", "-r"})),
+    "codex": (["resume", "--last"], frozenset({"resume"})),
+    "kimi": (["--continue"], frozenset({"--continue", "-c", "--session", "-S"})),
+}
 HUB_AGENT_READY_TIMEOUT_SECONDS = 10.0
 HUB_AGENT_READY_POLL_SECONDS = 0.05
 HUB_PROMPT_AGENT_ORDER = ("codex", "kimi", "claude", "omp")
@@ -3992,6 +3997,7 @@ def hub_key(descriptor: int) -> tuple[str, str] | None:
         b"\x08": "backspace",
         b"\x7f": "backspace",
         b"\x11": "quit",
+        b"\x12": "resume",
         b"\x15": "clear",
         b"\x18": "stop",
     }
@@ -4185,6 +4191,102 @@ def launch_hub_preset(
     return task
 
 
+def hub_command_kind(command: Sequence[str]) -> str | None:
+    return hub_preset_kind({"name": "", "command": list(command)})
+
+
+def hub_resume_command(command: Sequence[str]) -> list[str]:
+    entry = HUB_RESUME_ARGUMENTS.get(hub_command_kind(command) or "")
+    if entry is None:
+        return list(command)
+    extra, markers = entry
+    if any(item in markers for item in command[1:]):
+        return list(command)
+    return [*command, *extra]
+
+
+def hub_base_command(command: Sequence[str]) -> list[str]:
+    entry = HUB_RESUME_ARGUMENTS.get(hub_command_kind(command) or "")
+    if entry is None:
+        return list(command)
+    extra = entry[0]
+    if len(command) > len(extra) and list(command[-len(extra) :]) == extra:
+        return list(command[: -len(extra)])
+    return list(command)
+
+
+def hub_matching_preset(
+    task: Task, presets: Sequence[dict[str, object]]
+) -> dict[str, object] | None:
+    base = hub_base_command(task.command)
+    task_dir = Path(task.cwd).resolve()
+    for preset in presets:
+        if (
+            list(preset["command"]) == base
+            and Path(str(preset["dir"])).resolve() == task_dir
+        ):
+            return preset
+    return None
+
+
+def resume_hub_task(
+    task: Task, presets: Sequence[dict[str, object]], context: str
+) -> Task:
+    if not task.committed:
+        raise CliLaneError(f"task is still initializing: {task.name}")
+    if not task.dead:
+        raise CliLaneError(f"task is still running: {task.name}")
+    data = hub_context_data(context)
+    environment = hub_launch_environment(context)
+    preset = hub_matching_preset(task, presets)
+    profile_name: str | None = None
+    provider: str | None = None
+    launch_environment = legacy_launch_environment(environment)
+    if preset is not None:
+        selected = revalidate_hub_preset(
+            preset, str(data["config"]), str(data["profiles"]), environment
+        )
+        if selected.get("launch_mode") == "profile":
+            profile = selected.get("profile_value")
+            if not isinstance(profile, Profile):
+                raise CliLaneError("corrupt resolved hub profile")
+            launch_environment = profile_launch_environment(profile, environment)
+            profile_name = profile.name
+            provider = profile.provider
+    spec = complete_launch_spec(
+        name=task.name,
+        cwd_value=task.cwd,
+        command=hub_resume_command(task.command),
+        wait=False,
+        timeout=None,
+        on_exit=None,
+        environment=launch_environment,
+        profile=profile_name,
+        provider=provider,
+    )
+    old_log = validated_log_path(task)
+    carried: Path | None = None
+    if old_log.exists():
+        carried = state_root() / f"resume-{uuid.uuid4().hex}.log"
+        os.replace(old_log, carried)
+    try:
+        remove_task(task.id, False, HUB_ACTION_GRACE_SECONDS)
+    except CliLaneError:
+        if carried is not None:
+            os.replace(carried, old_log)
+        raise
+    try:
+        resumed = run_task(spec)
+    except CliLaneError as error:
+        if carried is not None:
+            raise CliLaneError(f"{error}; previous log kept at {carried}") from error
+        raise
+    if carried is not None:
+        new_log = validated_log_path(resumed)
+        os.replace(carried, new_log.with_suffix(new_log.suffix + ".previous"))
+    return resumed
+
+
 def hub_peek_lines(task: Task) -> list[str]:
     try:
         captured = tmux(
@@ -4196,10 +4298,11 @@ def hub_peek_lines(task: Task) -> list[str]:
         return ["terminal not responding"]
     if captured.returncode != 0:
         return [f"terminal gone · run: {PROGRAM} log {task.name}"]
-    lines = [
-        sanitized_log_text(line).rstrip()
-        for line in captured.stdout.decode(errors="replace").splitlines()
-    ]
+    lines: list[str] = []
+    for raw in captured.stdout.decode(errors="replace").splitlines():
+        line = sanitized_log_text(raw).rstrip()
+        if line or (lines and lines[-1]):
+            lines.append(line)
     while lines and not lines[-1]:
         lines.pop()
     return lines[-HUB_PEEK_CAPTURE_LINES:]
@@ -4336,8 +4439,8 @@ def hub_draw(
         ]
     elif peek is not None:
         hints = [
-            f"{peek[0].name} finished · Ctrl-X removes it · Tab agent ({agents}) · Enter start",
-            "empty: →/Enter view · Space/Esc close · Ctrl-Q leave",
+            f"{peek[0].name} finished · Ctrl-R resume · Ctrl-X remove · →/Enter open pane",
+            f"type message · Enter start new ({agents}) · Space/Esc close · Ctrl-Q leave",
         ]
     else:
         hints = [
@@ -4607,6 +4710,43 @@ def hub_ui(
                 detail = " (finished)" if target.dead else ""
                 exit_hint = f"Press Ctrl-X again to {action} {target.name}{detail}"
                 continue
+            if key == "resume":
+                if selected >= len(tasks):
+                    notice = "Select a finished job to resume"
+                    continue
+                target = tasks[selected]
+                if not target.dead:
+                    notice = f"{target.name} is still running"
+                    continue
+                hub_draw(
+                    tasks,
+                    selected,
+                    presets,
+                    agent_index,
+                    prompt,
+                    cursor,
+                    f"Resuming {target.name}…",
+                    peek,
+                )
+                claim_value = f"{popup_value}:launch"
+                if not replace_hub_popup(
+                    client, client_pid, context, popup_value, claim_value
+                ):
+                    return 0
+                try:
+                    resumed = resume_hub_task(target, presets, context)
+                except CliLaneError as error:
+                    if not replace_hub_popup(
+                        client, client_pid, context, claim_value, popup_value
+                    ):
+                        return 0
+                    notice = str(error)
+                    peek_key = ""
+                    continue
+                switch_hub_popup(
+                    client, client_pid, context, claim_value, resumed.session
+                )
+                return 0
             if key == "right" and prompt:
                 cursor = min(len(prompt), cursor + 1)
                 continue
@@ -4651,6 +4791,14 @@ def hub_ui(
                 continue
             if not prompt:
                 if selected < len(tasks):
+                    if (
+                        key == "enter"
+                        and tasks[selected].dead
+                        and peek_key != tasks[selected].id
+                    ):
+                        peek_key = tasks[selected].id
+                        peek_cache = None
+                        continue
                     switch_hub_popup(
                         client,
                         client_pid,
