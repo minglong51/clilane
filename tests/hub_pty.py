@@ -893,14 +893,14 @@ def _exercise_switcher_resume(environment: dict[str, str]) -> None:
         terminal.expect("> ▏", mark)
 
         mark = terminal.mark()
-        terminal.send(b"\r")
+        terminal.send(b" ")
         terminal.expect("res-job · succeeded · last output", mark)
         terminal.expect("first-run-output", mark)
         terminal.settle()
         frame = _last_frame(terminal, mark)
-        assert "Ctrl-R resume" in frame, frame
+        assert "Ctrl-R rerun" in frame, frame
         assert "reply · res-job" not in frame, frame
-        assert terminal.running(), "Enter on a finished job left the switcher"
+        assert terminal.running(), "Space on a finished job left the switcher"
 
         mark = terminal.mark()
         terminal.send(b"\x12")
@@ -932,6 +932,95 @@ def _exercise_switcher_resume(environment: dict[str, str]) -> None:
         terminal.expect("live-job is still running", mark)
         terminal.send(b"\x11")
         assert terminal.wait() == 0
+        terminal.close()
+        terminal = None
+    finally:
+        if terminal is not None:
+            terminal.close()
+        _cleanup(environment)
+
+
+def _exercise_switcher_sections(environment: dict[str, str], tool_bin: Path) -> None:
+    terminal: _Terminal | None = None
+    fake_claude = tool_bin / "claude"
+    fake_claude.write_text("#!/bin/sh\nprintf 'fake-claude args:%s\\n' \"$*\"\nexit 0\n")
+    fake_claude.chmod(0o700)
+    environment = dict(environment)
+    environment["CLILANE_HUB_HISTORY"] = "2"
+    try:
+        for name in ("hist-1", "hist-2", "hist-3"):
+            _run(environment, ["run", name, "--", "/bin/sh", "-c", f"echo {name}; exit 0"])
+            _wait_for_state(environment, name, "succeeded")
+        _run(environment, ["run", "agent-job", "--", str(fake_claude)])
+        _wait_for_state(environment, "agent-job", "succeeded")
+        _run(environment, ["run", "live-1", "--", "/bin/cat"])
+        _wait_for_state(environment, "live-1", "running")
+
+        terminal = _Terminal([], environment)
+        terminal.expect("This clilane server")
+        mark = terminal.mark()
+        terminal.send(b"\x15")
+        terminal.expect("> ▏", mark)
+        terminal.settle()
+        frame = _last_frame(terminal, mark)
+        assert "ONGOING (1)" in frame, frame
+        assert "HISTORY (showing 2 of 4)" in frame, frame
+        assert "… 2 more · ↓ to reveal" in frame, frame
+        assert "agent-job" in frame and "hist-3" in frame, frame
+        assert "hist-2" not in frame and "hist-1" not in frame, frame
+
+        terminal.send(b"\x1b[B\x1b[B")
+        terminal.settle()
+        mark = terminal.mark()
+        terminal.send(b"\x1b[B")
+        terminal.expect("HISTORY (4)", mark)
+        terminal.settle()
+        frame = _last_frame(terminal, mark)
+        assert "hist-2" in frame and "hist-1" in frame, frame
+        assert "more · ↓ to reveal" not in frame, frame
+
+        terminal.send(b"\x1b[B")
+        terminal.settle()
+        sessions = _tmux(
+            environment, ["list-sessions", "-F", "#{session_name}"]
+        ).stdout.decode().split()
+        before = set(sessions)
+        mark = terminal.mark()
+        terminal.send(b"\r")
+        terminal.expect("Pane is dead", mark)
+        assert terminal.running(), "Enter on a finished plain job left the client"
+        mark = terminal.mark()
+        terminal.send(b"\x11")
+        terminal.expect("This clilane server", mark)
+        assert set(
+            _tmux(environment, ["list-sessions", "-F", "#{session_name}"])
+            .stdout.decode()
+            .split()
+        ) == before, "opening a finished plain job changed the session set"
+
+        mark = terminal.mark()
+        terminal.send(b"\x15")
+        terminal.expect("> ▏", mark)
+        terminal.send(b"\x1b[A\x1b[A\x1b[A")
+        terminal.settle()
+        mark = terminal.mark()
+        terminal.send(b" ")
+        terminal.expect("agent-job · succeeded · last output", mark)
+        terminal.expect("Enter/Ctrl-R resume", mark)
+        agent_id = next(task["id"] for task in _tasks(environment) if task["name"] == "agent-job")
+        terminal.send(b"\r")
+        deadline = time.monotonic() + 15.0
+        while True:
+            entries = {task["name"]: task for task in _tasks(environment)}
+            resumed = entries.get("agent-job")
+            if resumed is not None and resumed["id"] != agent_id:
+                break
+            assert time.monotonic() < deadline, entries
+            time.sleep(0.2)
+        assert resumed["command"] == [str(fake_claude), "--continue"], resumed
+        _wait_for_state(environment, "agent-job", "succeeded")
+        logged = _run(environment, ["log", "agent-job", "--lines", "50"]).stdout
+        assert "fake-claude args:--continue" in logged, logged
         terminal.close()
         terminal = None
     finally:
@@ -998,6 +1087,14 @@ def main() -> int:
         resume_environment["CLILANE_STATE_HOME"] = str(resume_state)
         resume_environment["CLILANE_TMUX_SOCKET"] = f"clp-resume-{os.getpid()}"
         _exercise_switcher_resume(resume_environment)
+        sections_environment = dict(environment)
+        sections_state = root / "sections-state"
+        sections_state.mkdir(mode=0o700)
+        sections_tools = root / "sections-tools"
+        sections_tools.mkdir(mode=0o700)
+        sections_environment["CLILANE_STATE_HOME"] = str(sections_state)
+        sections_environment["CLILANE_TMUX_SOCKET"] = f"clp-sections-{os.getpid()}"
+        _exercise_switcher_sections(sections_environment, sections_tools)
 
         tool_bin = root / "tools"
         tool_bin.mkdir(mode=0o700)
