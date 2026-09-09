@@ -288,7 +288,7 @@ clilane
 | `Enter` | Start the chosen agent when the composer has text. |
 | `Right` / `Enter` | Open the selected running job when the composer is empty. On a finished job, `Enter` opens its peek first and `Right` opens the dead pane directly. |
 | `Space` | With an empty composer, peek at the selected job's latest output without opening it. While the peek is open, the composer replies to that job: type a message and press `Enter` to deliver it through the job's terminal. `Space` again closes the peek. |
-| `Ctrl-R` | Resume the selected finished job: relaunch the same command in the same directory under the same name, with `--continue` for Claude and Kimi and `resume --last` for Codex, so the agent picks up its newest conversation in that directory. The previous log is kept as the new job's `.previous` log. |
+| `Ctrl-R` | Resume the selected finished job: relaunch the same command in the same directory under the same name, with `--continue` for Claude and Kimi and `resume --last` for Codex, so the agent picks up its newest conversation in that directory. A job that matches a configured preset relaunches through that preset, including its clean profile; any other job relaunches with the raw environment. The previous log becomes the new job's `.previous` log until the new log rotates. |
 | `Ctrl-X` | Stop the selected running job, or remove a finished one. Press it twice within 2 seconds; any other key cancels. |
 | `Left` / `Right` | Move the composer cursor while typing. |
 | `Esc` | Clear the composer, or close an open peek. With an empty composer, return to the job you came from, or leave the switcher when you opened it from your shell. |
