@@ -877,6 +877,69 @@ def _exercise_switcher_actions(environment: dict[str, str]) -> None:
         _cleanup(environment)
 
 
+def _exercise_switcher_resume(environment: dict[str, str]) -> None:
+    terminal: _Terminal | None = None
+    try:
+        _run(
+            environment,
+            ["run", "res-job", "--", "/bin/sh", "-c", "echo first-run-output; exit 0"],
+        )
+        _wait_for_state(environment, "res-job", "succeeded")
+        first_id = _tasks(environment)[0]["id"]
+        terminal = _Terminal([], environment)
+        terminal.expect("This clilane server")
+        mark = terminal.mark()
+        terminal.send(b"\x15")
+        terminal.expect("> ▏", mark)
+
+        mark = terminal.mark()
+        terminal.send(b"\r")
+        terminal.expect("res-job · succeeded · last output", mark)
+        terminal.expect("first-run-output", mark)
+        terminal.settle()
+        frame = _last_frame(terminal, mark)
+        assert "Ctrl-R resume" in frame, frame
+        assert "reply · res-job" not in frame, frame
+        assert terminal.running(), "Enter on a finished job left the switcher"
+
+        mark = terminal.mark()
+        terminal.send(b"\x12")
+        deadline = time.monotonic() + 15.0
+        while True:
+            tasks = _tasks(environment)
+            if len(tasks) == 1 and tasks[0]["id"] != first_id:
+                break
+            assert time.monotonic() < deadline, tasks
+            time.sleep(0.2)
+        resumed = tasks[0]
+        assert resumed["name"] == "res-job", resumed
+        assert resumed["command"] == ["/bin/sh", "-c", "echo first-run-output; exit 0"], resumed
+        _wait_for_state(environment, "res-job", "succeeded")
+        logged = _run(environment, ["log", "res-job", "--lines", "50"]).stdout
+        assert logged.count("first-run-output") >= 2, logged
+        terminal.close()
+        terminal = None
+
+        _run(environment, ["run", "live-job", "--", "/bin/cat"])
+        _wait_for_state(environment, "live-job", "running")
+        terminal = _Terminal([], environment)
+        terminal.expect("This clilane server")
+        mark = terminal.mark()
+        terminal.send(b"\x15")
+        terminal.expect("> ▏", mark)
+        mark = terminal.mark()
+        terminal.send(b"\x12")
+        terminal.expect("live-job is still running", mark)
+        terminal.send(b"\x11")
+        assert terminal.wait() == 0
+        terminal.close()
+        terminal = None
+    finally:
+        if terminal is not None:
+            terminal.close()
+        _cleanup(environment)
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="clp-", dir="/tmp") as temporary:
         root = Path(temporary)
@@ -929,6 +992,12 @@ def main() -> int:
         actions_environment["CLILANE_STATE_HOME"] = str(actions_state)
         actions_environment["CLILANE_TMUX_SOCKET"] = f"clp-actions-{os.getpid()}"
         _exercise_switcher_actions(actions_environment)
+        resume_environment = dict(environment)
+        resume_state = root / "resume-state"
+        resume_state.mkdir(mode=0o700)
+        resume_environment["CLILANE_STATE_HOME"] = str(resume_state)
+        resume_environment["CLILANE_TMUX_SOCKET"] = f"clp-resume-{os.getpid()}"
+        _exercise_switcher_resume(resume_environment)
 
         tool_bin = root / "tools"
         tool_bin.mkdir(mode=0o700)

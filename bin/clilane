@@ -29,7 +29,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import BinaryIO, Iterator, Mapping, Sequence
+from typing import BinaryIO, Callable, Iterator, Mapping, Sequence
 
 
 PROGRAM = "clilane"
@@ -62,6 +62,19 @@ HUB_ARROW_KEYS = {b"A": "up", b"B": "down", b"C": "right", b"D": "left"}
 HUB_PROMPT_MAX_CHARS = 8000
 HUB_PEEK_CAPTURE_LINES = 40
 HUB_ACTION_GRACE_SECONDS = 3.0
+HUB_RESUME_ARGUMENTS: dict[str, tuple[list[str], frozenset[str], frozenset[str]]] = {
+    "claude": (
+        ["--continue"],
+        frozenset({"--continue", "-c", "--resume", "-r"}),
+        frozenset({"--session-id"}),
+    ),
+    "codex": (["resume", "--last"], frozenset({"resume"}), frozenset()),
+    "kimi": (
+        ["--continue"],
+        frozenset({"--continue", "-c", "--session", "-S"}),
+        frozenset({"--agent", "--agent-file"}),
+    ),
+}
 HUB_AGENT_READY_TIMEOUT_SECONDS = 10.0
 HUB_AGENT_READY_POLL_SECONDS = 0.05
 HUB_PROMPT_AGENT_ORDER = ("codex", "kimi", "claude", "omp")
@@ -3992,6 +4005,7 @@ def hub_key(descriptor: int) -> tuple[str, str] | None:
         b"\x08": "backspace",
         b"\x7f": "backspace",
         b"\x11": "quit",
+        b"\x12": "resume",
         b"\x15": "clear",
         b"\x18": "stop",
     }
@@ -4148,26 +4162,9 @@ def launch_hub_preset(
 ) -> Task:
     if prompt:
         validate_message_text(prompt)
-    data = hub_context_data(context)
-    environment = hub_launch_environment(context)
-    selected = revalidate_hub_preset(
-        preset,
-        str(data["config"]),
-        str(data["profiles"]),
-        environment,
+    selected, launch_environment, profile_name, provider = hub_preset_launch_settings(
+        preset, context
     )
-
-    if selected.get("launch_mode") == "profile":
-        profile = selected.get("profile_value")
-        if not isinstance(profile, Profile):
-            raise CliLaneError("corrupt resolved hub profile")
-        launch_environment = profile_launch_environment(profile, environment)
-        profile_name: str | None = profile.name
-        provider: str | None = profile.provider
-    else:
-        launch_environment = legacy_launch_environment(environment)
-        profile_name = None
-        provider = None
     spec = complete_launch_spec(
         name=name,
         cwd_value=str(selected["dir"]),
@@ -4185,6 +4182,158 @@ def launch_hub_preset(
     return task
 
 
+def hub_command_kind(command: Sequence[str]) -> str | None:
+    return hub_preset_kind({"name": "", "command": list(command)})
+
+
+def hub_resume_command(command: Sequence[str], kind: str | None, name: str) -> list[str]:
+    if kind is None:
+        return list(command)
+    entry = HUB_RESUME_ARGUMENTS.get(kind)
+    if entry is None:
+        raise CliLaneError(f"resume is not supported for {kind}: {name}")
+    extra, markers, conflicts = entry
+    clashing = sorted(item for item in command[1:] if item in conflicts)
+    if clashing:
+        raise CliLaneError(
+            f"cannot resume {name}: {', '.join(clashing)} cannot combine with "
+            f"{' '.join(extra)}"
+        )
+    if any(item in markers for item in command[1:]):
+        return list(command)
+    return [*command, *extra]
+
+
+def hub_base_command(command: Sequence[str], kind: str | None) -> list[str]:
+    entry = HUB_RESUME_ARGUMENTS.get(kind or "")
+    if entry is None:
+        return list(command)
+    extra = entry[0]
+    if len(command) > len(extra) and list(command[-len(extra) :]) == extra:
+        return list(command[: -len(extra)])
+    return list(command)
+
+
+def hub_matching_preset(
+    task: Task, presets: Sequence[dict[str, object]]
+) -> dict[str, object] | None:
+    base = hub_base_command(task.command, hub_command_kind(task.command))
+    task_dir = Path(task.cwd).resolve()
+    candidates = [
+        preset
+        for preset in presets
+        if hub_base_command(list(preset["command"]), hub_preset_kind(preset)) == base
+        and Path(str(preset["dir"])).resolve() == task_dir
+    ]
+    named = [
+        preset
+        for preset in candidates
+        if task.name == str(preset["name"])
+        or task.name.startswith(f"{preset['name']}-")
+    ]
+    if named:
+        return max(named, key=lambda preset: len(str(preset["name"])))
+    return candidates[0] if candidates else None
+
+
+def hub_preset_launch_settings(
+    preset: dict[str, object], context: str
+) -> tuple[dict[str, object], dict[str, str], str | None, str | None]:
+    data = hub_context_data(context)
+    environment = hub_launch_environment(context)
+    selected = revalidate_hub_preset(
+        preset,
+        str(data["config"]),
+        str(data["profiles"]),
+        environment,
+    )
+    if selected.get("launch_mode") == "profile":
+        profile = selected.get("profile_value")
+        if not isinstance(profile, Profile):
+            raise CliLaneError("corrupt resolved hub profile")
+        return (
+            selected,
+            profile_launch_environment(profile, environment),
+            profile.name,
+            profile.provider,
+        )
+    return selected, legacy_launch_environment(environment), None, None
+
+
+def resume_hub_task(
+    task: Task, presets: Sequence[dict[str, object]], context: str
+) -> Task:
+    if not task.committed:
+        raise CliLaneError(f"task is still initializing: {task.name}")
+    if not task.dead:
+        raise CliLaneError(f"task is still running: {task.name}")
+    preset = hub_matching_preset(task, presets)
+    if preset is not None:
+        selected, launch_environment, profile_name, provider = (
+            hub_preset_launch_settings(preset, context)
+        )
+        kind = hub_preset_kind(selected)
+    else:
+        launch_environment = legacy_launch_environment(hub_launch_environment(context))
+        profile_name = provider = None
+        kind = hub_command_kind(task.command)
+    spec = complete_launch_spec(
+        name=task.name,
+        cwd_value=task.cwd,
+        command=hub_resume_command(task.command, kind, task.name),
+        wait=False,
+        timeout=None,
+        on_exit=None,
+        environment=launch_environment,
+        profile=profile_name,
+        provider=provider,
+    )
+    old_log = validated_log_path(task)
+    carried: Path | None = None
+    if old_log.exists():
+        carried = state_root() / f"resume-{uuid.uuid4().hex}.log"
+        os.replace(old_log, carried)
+    try:
+        remove_task(task.id, False, HUB_ACTION_GRACE_SECONDS)
+    except CliLaneError:
+        if carried is not None:
+            os.replace(carried, old_log)
+        raise
+    try:
+        resumed = run_task(spec)
+    except CliLaneError as error:
+        if carried is not None:
+            os.replace(carried, old_log)
+            raise CliLaneError(
+                f"{error}; previous log kept as an orphan, see '{PROGRAM} orphans'"
+            ) from error
+        raise
+    if carried is not None:
+        new_log = validated_log_path(resumed)
+        os.replace(carried, new_log.with_suffix(new_log.suffix + ".previous"))
+    return resumed
+
+
+def hub_claimed_launch(
+    client: str,
+    client_pid: str,
+    context: str,
+    popup_value: str,
+    launch: Callable[[], Task],
+) -> tuple[bool, str | None]:
+    claim_value = f"{popup_value}:launch"
+    if not replace_hub_popup(client, client_pid, context, popup_value, claim_value):
+        return False, None
+    try:
+        task = launch()
+    except CliLaneError as error:
+        if not replace_hub_popup(client, client_pid, context, claim_value, popup_value):
+            return False, None
+        return True, str(error)
+    switch_hub_popup(client, client_pid, context, claim_value, task.session)
+    return True, None
+
+
 def hub_peek_lines(task: Task) -> list[str]:
     try:
         captured = tmux(
@@ -4196,10 +4345,11 @@ def hub_peek_lines(task: Task) -> list[str]:
         return ["terminal not responding"]
     if captured.returncode != 0:
         return [f"terminal gone · run: {PROGRAM} log {task.name}"]
-    lines = [
-        sanitized_log_text(line).rstrip()
-        for line in captured.stdout.decode(errors="replace").splitlines()
-    ]
+    lines: list[str] = []
+    for raw in captured.stdout.decode(errors="replace").splitlines():
+        line = sanitized_log_text(raw).rstrip()
+        if line or (lines and lines[-1]):
+            lines.append(line)
     while lines and not lines[-1]:
         lines.pop()
     return lines[-HUB_PEEK_CAPTURE_LINES:]
@@ -4336,8 +4486,8 @@ def hub_draw(
         ]
     elif peek is not None:
         hints = [
-            f"{peek[0].name} finished · Ctrl-X removes it · Tab agent ({agents}) · Enter start",
-            "empty: →/Enter view · Space/Esc close · Ctrl-Q leave",
+            f"{peek[0].name} finished · Ctrl-R resume · Ctrl-X remove · →/Enter open pane",
+            f"type message · Enter start new ({agents}) · Space/Esc close · Ctrl-Q leave",
         ]
     else:
         hints = [
@@ -4484,7 +4634,7 @@ def hub_ui(
             peek = None
             if peek_key:
                 peek_live = not tasks[selected].dead
-                if peek_cache is None or refresh_peek:
+                if peek_cache is None or (refresh_peek and peek_live):
                     peek_cache = (peek_key, hub_peek_lines(tasks[selected]))
                 refresh_peek = False
                 peek = (tasks[selected], peek_cache[1])
@@ -4607,6 +4757,41 @@ def hub_ui(
                 detail = " (finished)" if target.dead else ""
                 exit_hint = f"Press Ctrl-X again to {action} {target.name}{detail}"
                 continue
+            if key == "resume":
+                if selected >= len(tasks):
+                    notice = "Select a finished job to resume"
+                    continue
+                target = tasks[selected]
+                if not target.dead:
+                    notice = f"{target.name} is still running"
+                    continue
+                if prompt:
+                    notice = "Clear the composer first (Esc), then Ctrl-R"
+                    continue
+                hub_draw(
+                    tasks,
+                    selected,
+                    presets,
+                    agent_index,
+                    prompt,
+                    cursor,
+                    f"Resuming {target.name}…",
+                    peek,
+                )
+                alive, error = hub_claimed_launch(
+                    client,
+                    client_pid,
+                    context,
+                    popup_value,
+                    lambda: resume_hub_task(target, presets, context),
+                )
+                if not alive:
+                    return 0
+                if error is None:
+                    return 0
+                notice = error
+                peek_key = ""
+                continue
             if key == "right" and prompt:
                 cursor = min(len(prompt), cursor + 1)
                 continue
@@ -4651,6 +4836,14 @@ def hub_ui(
                 continue
             if not prompt:
                 if selected < len(tasks):
+                    if (
+                        key == "enter"
+                        and tasks[selected].dead
+                        and peek_key != tasks[selected].id
+                    ):
+                        peek_key = tasks[selected].id
+                        peek_cache = None
+                        continue
                     switch_hub_popup(
                         client,
                         client_pid,
@@ -4692,28 +4885,21 @@ def hub_ui(
                 cursor,
                 f"Starting {name}…",
             )
-            claim_value = f"{popup_value}:launch"
-            if not replace_hub_popup(
-                client, client_pid, context, popup_value, claim_value
-            ):
-                return 0
-            try:
-                task = launch_hub_preset(preset, name, context, prompt)
-            except CliLaneError as error:
-                if not replace_hub_popup(
-                    client, client_pid, context, claim_value, popup_value
-                ):
-                    return 0
-                notice = str(error)
-                continue
-            switch_hub_popup(
+            launch_preset = preset
+            launch_prompt = prompt
+            alive, error = hub_claimed_launch(
                 client,
                 client_pid,
                 context,
-                claim_value,
-                task.session,
+                popup_value,
+                lambda: launch_hub_preset(launch_preset, name, context, launch_prompt),
             )
-            return 0
+            if not alive:
+                return 0
+            if error is None:
+                return 0
+            notice = error
+            continue
     finally:
         with suppress(termios.error):
             termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
