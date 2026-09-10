@@ -1043,26 +1043,55 @@ def _exercise_terminfo(environment: dict[str, str], terminfo_dir: Path) -> None:
         text=True,
     )
     assert compiled.returncode == 0, compiled.stderr
-    exotic = dict(environment)
-    exotic["TERM"] = name
-    exotic["TERMINFO"] = str(terminfo_dir)
+    exotic = {**environment, "TERM": name, "TERMINFO": str(terminfo_dir)}
+    unresolved = {
+        **environment,
+        "TERM": name,
+        "CLILANE_TMUX_SOCKET": environment["CLILANE_TMUX_SOCKET"] + "-none",
+    }
+    _exercise_terminfo_case(exotic, name, expect_notice=False)
+    _exercise_terminfo_case(unresolved, name, expect_notice=True)
+
+
+def _exercise_terminfo_case(
+    environment: dict[str, str], name: str, *, expect_notice: bool
+) -> None:
+    terminal: _Terminal | None = None
+    notice = f"cannot find terminfo for {name}"
     try:
-        terminal = _Terminal([], exotic)
-        terminal.expect("This clilane server")
-        assert "cannot find terminfo" not in bytes(terminal.output).decode(errors="replace")
+        terminal = _Terminal(["run", "ti-job", "--", "/bin/cat"], environment)
+        assert terminal.wait() == 0, "run from an interactive terminal failed"
+        terminal.close()
+        terminal = _Terminal(["ps"], environment)
+        terminal.expect("ti-job")
+        assert terminal.wait() == 0, "ps from an interactive terminal failed"
+        terminal.close()
+        _wait_for_state(environment, "ti-job", "running")
+
+        job_session = next(
+            session
+            for session in _tmux(environment, ["list-sessions", "-F", "#{session_name}"])
+            .stdout.decode()
+            .split()
+            if session != "hub"
+        )
+        terminal = _Terminal(["attach", "ti-job"], environment)
+        if expect_notice:
+            terminal.expect(notice)
+        _wait_for_client_session(environment, terminal, job_session)
+        mark = terminal.mark()
+        terminal.send(b"\x11")
+        terminal.expect("This clilane server", mark)
         terminal.send(b"\x11")
         assert terminal.wait() == 0
         terminal.close()
-        terminal = None
-        _cleanup(exotic)
 
-        unresolved = dict(environment)
-        unresolved["TERM"] = name
-        unresolved["CLILANE_TMUX_SOCKET"] = environment["CLILANE_TMUX_SOCKET"] + "-none"
-        exotic["CLILANE_TMUX_SOCKET"] = unresolved["CLILANE_TMUX_SOCKET"]
-        terminal = _Terminal([], unresolved)
-        terminal.expect(f"cannot find terminfo for {name}")
+        terminal = _Terminal([], environment)
+        if expect_notice:
+            terminal.expect(notice)
         terminal.expect("This clilane server")
+        transcript = bytes(terminal.output).decode(errors="replace")
+        assert (notice in transcript) == expect_notice, transcript[-600:]
         terminal.send(b"\x11")
         assert terminal.wait() == 0
         terminal.close()
@@ -1070,7 +1099,7 @@ def _exercise_terminfo(environment: dict[str, str], terminfo_dir: Path) -> None:
     finally:
         if terminal is not None:
             terminal.close()
-        _cleanup(exotic)
+        _cleanup(environment)
 
 
 def main() -> int:
