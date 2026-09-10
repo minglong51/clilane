@@ -131,10 +131,13 @@ TMUX_ENV_KEYS = {
     "PATH",
     "SHELL",
     "TERM",
+    "TERMINFO",
+    "TERMINFO_DIRS",
     "TMPDIR",
     "TMUX_TMPDIR",
     "USER",
 }
+TERM_FALLBACK = "xterm-256color"
 LOG_MAX_BYTES = 50 * 1024 * 1024
 RECORD_SCHEMA_VERSION = 1
 RECORD_PHASE_PENDING = "pending"
@@ -3221,21 +3224,51 @@ def print_status(task: Task, as_json: bool) -> None:
     print(f"command: {shlex.join(task.command)}")
 
 
-def attach_task(task: Task) -> int:
-    configure_task_status(task.session)
-    context = create_hub_context(None)
-    bind_hub_keys()
+def ensure_terminal_supported() -> None:
+    term = os.environ.get("TERM", "")
+    if not term or term == TERM_FALLBACK or not sys.stdin.isatty():
+        return
+    infocmp = shutil.which("infocmp")
+    if infocmp is None:
+        return
+    probe = subprocess.run(
+        [infocmp, term],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=os.environ,
+        check=False,
+    )
+    if probe.returncode == 0:
+        return
+    sys.stderr.write(
+        f"{PROGRAM}: cannot find terminfo for {term}; using {TERM_FALLBACK} for this "
+        f"session. Install the entry on this host (for example: "
+        f"infocmp -x {term} | tic -x -) to keep {term}.\n"
+    )
+    sys.stderr.flush()
+    os.environ["TERM"] = TERM_FALLBACK
+
+
+def attach_client(arguments: Sequence[str]) -> int:
     environment = os.environ.copy()
     environment.pop("TMUX", None)
     environment.pop("TMUX_PANE", None)
     binary = tmux_binary()
     os.execvpe(
         binary,
+        [binary, *tmux_socket_arguments(), "-f", "/dev/null", *arguments],
+        environment,
+    )
+    return 1
+
+
+def attach_task(task: Task) -> int:
+    ensure_terminal_supported()
+    configure_task_status(task.session)
+    context = create_hub_context(None)
+    bind_hub_keys()
+    return attach_client(
         [
-            binary,
-            *tmux_socket_arguments(),
-            "-f",
-            "/dev/null",
             "attach-session",
             "-E",
             "-t",
@@ -3243,10 +3276,8 @@ def attach_task(task: Task) -> int:
             ";",
             "run-shell",
             hub_register_command(context),
-        ],
-        environment,
+        ]
     )
-    return 1
 
 
 def tmux_literal(text: str, expansions: int) -> str:
@@ -5080,22 +5111,14 @@ def hub_command(configured: str | None) -> int:
         raise CliLaneError(
             "already inside CLI Lane; press Ctrl-b w or Ctrl-Q to open the switcher"
         )
+    ensure_terminal_supported()
     load_hub_presets(configured)
     ensure_server_available()
     ensure_hub_session()
     context = create_hub_context(configured)
     bind_hub_keys()
-    environment = os.environ.copy()
-    environment.pop("TMUX", None)
-    environment.pop("TMUX_PANE", None)
-    binary = tmux_binary()
-    os.execvpe(
-        binary,
+    return attach_client(
         [
-            binary,
-            *tmux_socket_arguments(),
-            "-f",
-            "/dev/null",
             "attach-session",
             "-E",
             "-t",
@@ -5104,10 +5127,8 @@ def hub_command(configured: str | None) -> int:
             "run-shell",
             "-b",
             hub_open_command(context),
-        ],
-        environment,
+        ]
     )
-    return 1
 
 
 def read_task(task: Task, all_history: bool) -> int:

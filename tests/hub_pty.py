@@ -1029,6 +1029,50 @@ def _exercise_switcher_sections(environment: dict[str, str], tool_bin: Path) -> 
         _cleanup(environment)
 
 
+def _exercise_terminfo(environment: dict[str, str], terminfo_dir: Path) -> None:
+    terminal: _Terminal | None = None
+    source = subprocess.run(
+        ["infocmp", "-x", "xterm-256color"], capture_output=True, text=True, check=True
+    ).stdout
+    name = "xterm-clilanetest"
+    entry = source.replace("xterm-256color|", f"{name}|", 1)
+    compiled = subprocess.run(
+        ["tic", "-x", "-o", str(terminfo_dir), "-"],
+        input=entry,
+        capture_output=True,
+        text=True,
+    )
+    assert compiled.returncode == 0, compiled.stderr
+    exotic = dict(environment)
+    exotic["TERM"] = name
+    exotic["TERMINFO"] = str(terminfo_dir)
+    try:
+        terminal = _Terminal([], exotic)
+        terminal.expect("This clilane server")
+        assert "cannot find terminfo" not in bytes(terminal.output).decode(errors="replace")
+        terminal.send(b"\x11")
+        assert terminal.wait() == 0
+        terminal.close()
+        terminal = None
+        _cleanup(exotic)
+
+        unresolved = dict(environment)
+        unresolved["TERM"] = name
+        unresolved["CLILANE_TMUX_SOCKET"] = environment["CLILANE_TMUX_SOCKET"] + "-none"
+        exotic["CLILANE_TMUX_SOCKET"] = unresolved["CLILANE_TMUX_SOCKET"]
+        terminal = _Terminal([], unresolved)
+        terminal.expect(f"cannot find terminfo for {name}")
+        terminal.expect("This clilane server")
+        terminal.send(b"\x11")
+        assert terminal.wait() == 0
+        terminal.close()
+        terminal = None
+    finally:
+        if terminal is not None:
+            terminal.close()
+        _cleanup(exotic)
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="clp-", dir="/tmp") as temporary:
         root = Path(temporary)
@@ -1095,6 +1139,14 @@ def main() -> int:
         sections_environment["CLILANE_STATE_HOME"] = str(sections_state)
         sections_environment["CLILANE_TMUX_SOCKET"] = f"clp-sections-{os.getpid()}"
         _exercise_switcher_sections(sections_environment, sections_tools)
+        terminfo_environment = dict(environment)
+        terminfo_state = root / "terminfo-state"
+        terminfo_state.mkdir(mode=0o700)
+        terminfo_dir = root / "terminfo"
+        terminfo_dir.mkdir(mode=0o700)
+        terminfo_environment["CLILANE_STATE_HOME"] = str(terminfo_state)
+        terminfo_environment["CLILANE_TMUX_SOCKET"] = f"clp-terminfo-{os.getpid()}"
+        _exercise_terminfo(terminfo_environment, terminfo_dir)
 
         tool_bin = root / "tools"
         tool_bin.mkdir(mode=0o700)
