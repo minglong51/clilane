@@ -1029,6 +1029,79 @@ def _exercise_switcher_sections(environment: dict[str, str], tool_bin: Path) -> 
         _cleanup(environment)
 
 
+def _exercise_terminfo(environment: dict[str, str], terminfo_dir: Path) -> None:
+    terminal: _Terminal | None = None
+    source = subprocess.run(
+        ["infocmp", "-x", "xterm-256color"], capture_output=True, text=True, check=True
+    ).stdout
+    name = "xterm-clilanetest"
+    entry = source.replace("xterm-256color|", f"{name}|", 1)
+    compiled = subprocess.run(
+        ["tic", "-x", "-o", str(terminfo_dir), "-"],
+        input=entry,
+        capture_output=True,
+        text=True,
+    )
+    assert compiled.returncode == 0, compiled.stderr
+    exotic = {**environment, "TERM": name, "TERMINFO": str(terminfo_dir)}
+    unresolved = {
+        **environment,
+        "TERM": name,
+        "CLILANE_TMUX_SOCKET": environment["CLILANE_TMUX_SOCKET"] + "-none",
+    }
+    _exercise_terminfo_case(exotic, name, expect_notice=False)
+    _exercise_terminfo_case(unresolved, name, expect_notice=True)
+
+
+def _exercise_terminfo_case(
+    environment: dict[str, str], name: str, *, expect_notice: bool
+) -> None:
+    terminal: _Terminal | None = None
+    notice = f"cannot find terminfo for {name}"
+    try:
+        terminal = _Terminal(["run", "ti-job", "--", "/bin/cat"], environment)
+        assert terminal.wait() == 0, "run from an interactive terminal failed"
+        terminal.close()
+        terminal = _Terminal(["ps"], environment)
+        terminal.expect("ti-job")
+        assert terminal.wait() == 0, "ps from an interactive terminal failed"
+        terminal.close()
+        _wait_for_state(environment, "ti-job", "running")
+
+        job_session = next(
+            session
+            for session in _tmux(environment, ["list-sessions", "-F", "#{session_name}"])
+            .stdout.decode()
+            .split()
+            if session != "hub"
+        )
+        terminal = _Terminal(["attach", "ti-job"], environment)
+        if expect_notice:
+            terminal.expect(notice)
+        _wait_for_client_session(environment, terminal, job_session)
+        mark = terminal.mark()
+        terminal.send(b"\x11")
+        terminal.expect("This clilane server", mark)
+        terminal.send(b"\x11")
+        assert terminal.wait() == 0
+        terminal.close()
+
+        terminal = _Terminal([], environment)
+        if expect_notice:
+            terminal.expect(notice)
+        terminal.expect("This clilane server")
+        transcript = bytes(terminal.output).decode(errors="replace")
+        assert (notice in transcript) == expect_notice, transcript[-600:]
+        terminal.send(b"\x11")
+        assert terminal.wait() == 0
+        terminal.close()
+        terminal = None
+    finally:
+        if terminal is not None:
+            terminal.close()
+        _cleanup(environment)
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="clp-", dir="/tmp") as temporary:
         root = Path(temporary)
@@ -1095,6 +1168,14 @@ def main() -> int:
         sections_environment["CLILANE_STATE_HOME"] = str(sections_state)
         sections_environment["CLILANE_TMUX_SOCKET"] = f"clp-sections-{os.getpid()}"
         _exercise_switcher_sections(sections_environment, sections_tools)
+        terminfo_environment = dict(environment)
+        terminfo_state = root / "terminfo-state"
+        terminfo_state.mkdir(mode=0o700)
+        terminfo_dir = root / "terminfo"
+        terminfo_dir.mkdir(mode=0o700)
+        terminfo_environment["CLILANE_STATE_HOME"] = str(terminfo_state)
+        terminfo_environment["CLILANE_TMUX_SOCKET"] = f"clp-terminfo-{os.getpid()}"
+        _exercise_terminfo(terminfo_environment, terminfo_dir)
 
         tool_bin = root / "tools"
         tool_bin.mkdir(mode=0o700)

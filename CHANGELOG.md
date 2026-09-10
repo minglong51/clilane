@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Terminals whose terminfo is provided through `TERMINFO` or `TERMINFO_DIRS`, such as Ghostty's `xterm-ghostty`, no longer fail every command with `missing or unsuitable terminal`. tmux resolves terminfo in each client, so CLI Lane's internal tmux commands now run without a terminal on stdin (tmux then skips the lookup) and forward both variables. When the host has no entry for the terminal at all, `attach` and the switcher retry as `xterm-256color` for that session and print how to install the entry.
+
 ## [0.11.0] - 2026-09-09
 
 ### Added

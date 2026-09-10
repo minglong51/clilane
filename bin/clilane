@@ -131,10 +131,13 @@ TMUX_ENV_KEYS = {
     "PATH",
     "SHELL",
     "TERM",
+    "TERMINFO",
+    "TERMINFO_DIRS",
     "TMPDIR",
     "TMUX_TMPDIR",
     "USER",
 }
+TERM_FALLBACK = "xterm-256color"
 LOG_MAX_BYTES = 50 * 1024 * 1024
 RECORD_SCHEMA_VERSION = 1
 RECORD_PHASE_PENDING = "pending"
@@ -431,6 +434,7 @@ def tmux(
         completed = subprocess.run(
             [tmux_binary(), *tmux_socket_arguments(), "-f", "/dev/null", *arguments],
             input=input_data,
+            stdin=None if input_data is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=tmux_client_environment(),
@@ -3221,21 +3225,38 @@ def print_status(task: Task, as_json: bool) -> None:
     print(f"command: {shlex.join(task.command)}")
 
 
+def attach_client(arguments: Sequence[str]) -> int:
+    environment = os.environ.copy()
+    environment.pop("TMUX", None)
+    environment.pop("TMUX_PANE", None)
+    command = [tmux_binary(), *tmux_socket_arguments(), "-f", "/dev/null", *arguments]
+    completed = subprocess.run(command, env=environment, stderr=subprocess.PIPE)
+    detail = completed.stderr.decode(errors="replace")
+    term = environment.get("TERM", "")
+    if (
+        completed.returncode == 0
+        or "unsuitable terminal" not in detail
+        or term == TERM_FALLBACK
+    ):
+        sys.stderr.write(detail)
+        sys.stderr.flush()
+        return completed.returncode
+    sys.stderr.write(
+        f"{PROGRAM}: cannot find terminfo for {term}; using {TERM_FALLBACK} for this "
+        f"session. Install the entry on this host (for example: "
+        f"infocmp -x {term} | tic -x -) to keep {term}.\n"
+    )
+    sys.stderr.flush()
+    environment["TERM"] = TERM_FALLBACK
+    return subprocess.run(command, env=environment).returncode
+
+
 def attach_task(task: Task) -> int:
     configure_task_status(task.session)
     context = create_hub_context(None)
     bind_hub_keys()
-    environment = os.environ.copy()
-    environment.pop("TMUX", None)
-    environment.pop("TMUX_PANE", None)
-    binary = tmux_binary()
-    os.execvpe(
-        binary,
+    return attach_client(
         [
-            binary,
-            *tmux_socket_arguments(),
-            "-f",
-            "/dev/null",
             "attach-session",
             "-E",
             "-t",
@@ -3243,10 +3264,8 @@ def attach_task(task: Task) -> int:
             ";",
             "run-shell",
             hub_register_command(context),
-        ],
-        environment,
+        ]
     )
-    return 1
 
 
 def tmux_literal(text: str, expansions: int) -> str:
@@ -5085,17 +5104,8 @@ def hub_command(configured: str | None) -> int:
     ensure_hub_session()
     context = create_hub_context(configured)
     bind_hub_keys()
-    environment = os.environ.copy()
-    environment.pop("TMUX", None)
-    environment.pop("TMUX_PANE", None)
-    binary = tmux_binary()
-    os.execvpe(
-        binary,
+    return attach_client(
         [
-            binary,
-            *tmux_socket_arguments(),
-            "-f",
-            "/dev/null",
             "attach-session",
             "-E",
             "-t",
@@ -5104,10 +5114,8 @@ def hub_command(configured: str | None) -> int:
             "run-shell",
             "-b",
             hub_open_command(context),
-        ],
-        environment,
+        ]
     )
-    return 1
 
 
 def read_task(task: Task, all_history: bool) -> int:

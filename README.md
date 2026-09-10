@@ -496,6 +496,11 @@ logs under `~/.local/state/agt` remain readable for compatibility.
   `ssh ALIAS 'zsh -lc "clilane --version"'` succeeds.
 - A task is missing from `ps`: confirm it was started by the same Unix user with
   the same `CLILANE_TMUX_SOCKET` value.
+- `cannot find terminfo for xterm-ghostty` (or another uncommon `TERM`): this
+  host has no terminfo entry for your terminal, so `attach` and the switcher use
+  `xterm-256color` for that session and say so. To keep the real terminal,
+  install the entry on this host, for example
+  `infocmp -x xterm-ghostty | ssh HOST tic -x -` from the machine that has it.
 
 ## Limitations
 
