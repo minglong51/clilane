@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `Left` at an empty Claude, Codex, or Kimi prompt returns to the switcher, like Claude's agent view. CLI Lane reads the prompt row the agent drew: the cursor must sit right after the prompt glyph with nothing after it but spaces, borders, or a faint placeholder. Anywhere else `Left` reaches the agent unchanged, and `Ctrl-Q` still works everywhere.
+
 ## [0.11.1] - 2026-09-09
 
 ### Fixed

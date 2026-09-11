@@ -295,6 +295,7 @@ clilane
 | `Ctrl-C` / `Ctrl-D` | Clear the composer. With an empty composer, press the same key twice within 2 seconds to leave the switcher. |
 | `Ctrl-Q` | Leave the switcher immediately. Every job keeps running. |
 | `Ctrl-Q` or `Ctrl-b w` in a job | Background that job and return to the switcher. |
+| `Left` in an agent job | At an empty Claude, Codex, or Kimi prompt, background the job and return to the switcher, like Claude's agent view. Anywhere else `Left` moves the cursor as usual. |
 
 The list is split into `ONGOING` jobs and `HISTORY`, newest first. History shows
 the latest 20 finished jobs; moving the selection past the last one reveals the

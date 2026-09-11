@@ -64,6 +64,8 @@ HUB_PEEK_CAPTURE_LINES = 40
 HUB_ACTION_GRACE_SECONDS = 3.0
 HUB_HISTORY_BATCH_DEFAULT = 20
 HUB_HISTORY_BATCH_MAX = 1000
+HUB_LEFT_GATE_COLUMNS = 8
+HUB_LEFT_AGENT_KINDS = frozenset({"claude", "codex", "kimi"})
 HUB_RESUME_ARGUMENTS: dict[str, tuple[list[str], frozenset[str], frozenset[str]]] = {
     "claude": (
         ["--continue"],
@@ -2691,7 +2693,8 @@ def tmux_session_absent(session: str) -> bool:
     raise CliLaneError(detail.strip() or f"could not inspect tmux session: {session}")
 
 
-def configure_task_status(session: str) -> None:
+def configure_task_status(session: str, command: Sequence[str]) -> None:
+    agent = hub_command_kind(command) in HUB_LEFT_AGENT_KINDS
     tmux(
         [
             "set-option",
@@ -2709,8 +2712,14 @@ def configure_task_status(session: str) -> None:
             "-t",
             session,
             "status-right",
-            " C-q / C-b w switcher ",
+            " C-q / ← switcher " if agent else " C-q / C-b w switcher ",
         ],
+        check=False,
+    )
+    tmux(
+        ["set-option", "-t", session, "@agt_agent", "1"]
+        if agent
+        else ["set-option", "-u", "-t", session, "@agt_agent"],
         check=False,
     )
 
@@ -2914,7 +2923,7 @@ def run_task(spec: LaunchSpec) -> Task:
                 check=False,
             )
             tmux(["rename-window", "-t", pane, spec.name], check=False)
-            configure_task_status(session)
+            configure_task_status(session, command)
             sink = (
                 f"exec {shlex.quote(python_binary)} {shlex.quote(str(script))} __log "
                 f"{shlex.quote(control_binary)} {shlex.quote(control_socket)} "
@@ -3252,7 +3261,7 @@ def attach_client(arguments: Sequence[str]) -> int:
 
 
 def attach_task(task: Task) -> int:
-    configure_task_status(task.session)
+    configure_task_status(task.session, task.command)
     context = create_hub_context(None)
     bind_hub_keys()
     return attach_client(
@@ -3562,6 +3571,107 @@ def hub_forget_command(client: str, client_pid: str, context: str) -> str:
     return f"{prefix}'#{{hook_client}}' {arguments}"
 
 
+HUB_LEFT_PROBE_SOURCE = r'''
+import re
+import subprocess
+import sys
+import unicodedata
+
+GLYPHS = "❯>›"
+BORDERS = "│┃|"
+SGR = re.compile(r"\x1b\[([0-9;:]*)m")
+ESCAPE = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[()*+].|[@-_])"
+)
+
+
+def width(character):
+    if unicodedata.combining(character):
+        return 0
+    return 2 if unicodedata.east_asian_width(character) in "WF" else 1
+
+
+def cells(row):
+    found = []
+    faint = False
+    position = 0
+    while position < len(row):
+        if row[position] != "\x1b":
+            character = row[position]
+            found.append((" " if character == "\xa0" else character, faint))
+            position += 1
+            continue
+        sgr = SGR.match(row, position)
+        if sgr is None:
+            other = ESCAPE.match(row, position)
+            position = other.end() if other else position + 1
+            continue
+        parameters = (sgr.group(1) or "0").split(";")
+        index = 0
+        while index < len(parameters):
+            parameter = parameters[index].split(":")[0] or "0"
+            if parameter in ("38", "48", "58") and ":" not in parameters[index]:
+                mode = parameters[index + 1] if index + 1 < len(parameters) else ""
+                index += 3 if mode == "5" else 5 if mode == "2" else 1
+                continue
+            if parameter in ("0", "22"):
+                faint = False
+            elif parameter == "2":
+                faint = True
+            index += 1
+        position = sgr.end()
+    return found
+
+
+def empty(row, cursor):
+    column = 0
+    start = None
+    for character, faint in cells(row):
+        size = width(character)
+        if start is None:
+            if character.isspace() or character in BORDERS:
+                column += size
+                continue
+            if faint or character not in GLYPHS:
+                return False
+            start = column + size + 1
+        elif not (faint or character.isspace() or character in BORDERS):
+            return False
+        column += size
+    return start == cursor
+
+
+if __name__ == "__main__":
+    binary, socket_path, pane, cursor_x, cursor_y = sys.argv[1:6]
+    captured = subprocess.run(
+        [binary, "-S", socket_path, "-f", "/dev/null", "capture-pane", "-p", "-e",
+         "-t", pane, "-S", cursor_y, "-E", cursor_y],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=1.0,
+        check=True,
+    )
+    row = captured.stdout.decode(errors="replace").rstrip("\n")
+    sys.exit(0 if empty(row, int(cursor_x)) else 1)
+'''
+
+
+def hub_left_check_command() -> str:
+    python_binary = str(Path(sys.executable).resolve())
+    control_binary, control_socket = tmux_control_paths()
+    probe = base64.b64encode(HUB_LEFT_PROBE_SOURCE.encode()).decode()
+    command = " ".join(
+        (
+            shlex.quote(python_binary),
+            "-c",
+            shlex.quote(f'import base64;exec(base64.b64decode("{probe}"))'),
+            shlex.quote(control_binary),
+            shlex.quote(control_socket),
+        )
+    )
+    return tmux_literal(command + " ", 1) + "'#{pane_id}' '#{cursor_x}' '#{cursor_y}'"
+
+
 def bind_hub_keys() -> None:
     open_command = hub_open_command()
     tmux(
@@ -3580,6 +3690,29 @@ def bind_hub_keys() -> None:
             "prefix",
             "w",
             f"run-shell -b {tmux_quoted(open_command)}",
+        ]
+    )
+    left_check = hub_left_check_command()
+    left_gate = (
+        "#{&&:#{@agt_agent},#{&&:#{e|<=:#{cursor_x},"
+        f"{HUB_LEFT_GATE_COLUMNS}"
+        "},#{?pane_in_mode,0,1}}}"
+    )
+    tmux(
+        [
+            "bind-key",
+            "-T",
+            "root",
+            "Left",
+            "if-shell",
+            "-F",
+            left_gate,
+            (
+                f"if-shell {tmux_quoted(left_check)} "
+                f"{tmux_quoted('run-shell -b ' + tmux_quoted(open_command))} "
+                '"send-keys Left"'
+            ),
+            "send-keys Left",
         ]
     )
     tmux(["unbind-key", "-T", "root", "M-h"], check=False)
@@ -3892,7 +4025,7 @@ def hub_open(
     )
     ensure_hub_session()
     for task in list_tasks():
-        configure_task_status(task.session)
+        configure_task_status(task.session, task.command)
     tmux(["switch-client", "-E", "-c", client, "-t", HUB_SESSION])
     generation = uuid.uuid4().hex
     popup_value = f"{client_pid}:{context}:{generation}"
