@@ -226,7 +226,7 @@ def fleet_remote_command(script_body: str) -> str:
 
 
 FLEET_REMOTE_COMMAND = fleet_remote_command("clilane list --json")
-TMUX_MIN_VERSION = (3, 3)
+TMUX_MIN_VERSION = (3, 6)
 TMUX_VERSION_PATTERN = re.compile(r"(\d+)\.(\d+)")
 
 
@@ -412,7 +412,8 @@ def ensure_tmux_version() -> None:
     if version < TMUX_MIN_VERSION:
         floor = ".".join(str(part) for part in TMUX_MIN_VERSION)
         raise CliLaneError(
-            f"tmux {floor} or newer is required for exit-status reporting; "
+            f"tmux {floor} or newer is required; older servers can crash under the "
+            f"switcher and lose every lane; "
             f"found {reported}"
         )
 
