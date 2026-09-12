@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- `run` now refuses tmux older than 3.6, matching the documented minimum. tmux 3.4 and 3.5 servers can crash while the switcher opens and closes its popup, ending every lane on that server; Ubuntu 24.04's packaged tmux is 3.4, so build a newer release or use Homebrew there.
+
 ## [0.12.0] - 2026-09-11
 
 ### Added
