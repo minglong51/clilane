@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.14.0] - 2026-09-19
+
+### Added
+
+- Clickable session tabs at the top of each lane show running jobs and highlight the current session. Click Sessions or press `Ctrl-Q` to open the full switcher; `Ctrl-PageUp` and `Ctrl-PageDown` cycle between lanes.
+- Click a job in the switcher to open it, or scroll over the job list to change the selection. Mouse navigation preserves a message being composed.
+
+### Changed
+
+- `Left` and `Right` at an empty Claude, Codex, or Kimi prompt now switch directly to the previous or next session, wrapping at either end. Prompt drafts and copy mode retain ordinary arrow-key behavior.
+
+### Fixed
+
+- An empty first line of a multiline prompt no longer counts as an empty composer: text on subsequent lines keeps arrows in the agent.
+- Plain pipe and box characters in drafts are no longer mistaken for UI borders.
+
 ## [0.13.0] - 2026-09-11
 
 ### Changed
