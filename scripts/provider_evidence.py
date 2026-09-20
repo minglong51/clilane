@@ -13,17 +13,17 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, NoReturn, Sequence
+from typing import Any, BinaryIO, Callable, NoReturn, Sequence
 
 
-def _load_provider_capture() -> Any:
-    loaded = sys.modules.get("provider_capture")
+def _load_sibling(name: str) -> Any:
+    loaded = sys.modules.get(name)
     if loaded is not None:
         return loaded
-    path = Path(__file__).resolve(strict=True).with_name("provider_capture.py")
-    spec = importlib.util.spec_from_file_location("provider_capture", path)
+    path = Path(__file__).resolve(strict=True).with_name(f"{name}.py")
+    spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
-        raise RuntimeError("provider capture engine unavailable")
+        raise RuntimeError("provider evidence module unavailable")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     previous = sys.dont_write_bytecode
@@ -35,7 +35,7 @@ def _load_provider_capture() -> Any:
     return module
 
 
-provider_capture = _load_provider_capture()
+provider_capture = _load_sibling("provider_capture")
 
 
 SCHEMA_VERSION = 1
@@ -585,12 +585,15 @@ def _verify_capture(
     root: provider_capture.CaptureRoot,
     capture_id: str,
     receipt: dict[str, Any],
+    *,
+    observe: Callable[[str, int, bytes], None] | None = None,
+    maximum_bytes: int = provider_capture.MAX_BUDGET_BYTES,
 ) -> VerifiedCapture | None:
     if not receipt["capture_present"]:
         return None
     name = f"{capture_id}.capture"
     descriptor, metadata = _open_private_member(
-        root, name, provider_capture.MAX_BUDGET_BYTES, "capture"
+        root, name, maximum_bytes, "capture"
     )
     reader = _DigestingReader(descriptor)
     streams = {
@@ -601,11 +604,15 @@ def _verify_capture(
     frame_count = 0
     payload_bytes = 0
     try:
-        for stream, _observed_ns, payload in provider_capture.iter_capture_frames(reader):
+        for stream, observed_ns, payload in provider_capture.iter_capture_frames(reader):
+            if reader.bytes_read > maximum_bytes:
+                raise EvidenceError("capture: oversized")
             streams[stream]["bytes"] += len(payload)
             streams[stream]["sha256"].update(payload)
             payload_bytes += len(payload)
             frame_count += 1
+            if observe is not None:
+                observe(stream, observed_ns, payload)
         if not _member_unchanged(root, name, descriptor, metadata):
             raise EvidenceError("capture: changed")
     except provider_capture.CaptureError as error:
@@ -637,6 +644,72 @@ def _verify_capture(
         source_capture_sha256=receipt["source_capture_sha256"],
         executable_sha256=receipt["executable_sha256"],
     )
+
+
+def analyze_codex_capture(capture_root: Path, capture_id: str) -> dict[str, Any]:
+    if provider_capture.CAPTURE_ID_PATTERN.fullmatch(capture_id) is None:
+        raise EvidenceError("codex analysis: invalid capture identity")
+    repository_root = Path(__file__).resolve(strict=True).parents[1]
+    expected = load_executable_manifest(repository_root / EXECUTABLE_MANIFEST_PATH)
+    codex_analysis = _load_sibling("codex_analysis")
+    if provider_capture.PROVIDER_SPECS["codex"].version != "0.149.1":
+        raise EvidenceError("codex analysis: unreviewed provider version")
+    try:
+        repository = provider_capture.repository_paths(Path(__file__))
+        root = provider_capture.validate_capture_root(capture_root, repository)
+    except provider_capture.CaptureError as error:
+        raise EvidenceError("capture root: invalid") from error
+    try:
+        provider_capture._lock_root(root)
+        raw = _read_private_member(
+            root, f"{capture_id}.receipt.json",
+            provider_capture.MAX_RECEIPT_BYTES, "capture receipt",
+        )
+        try:
+            receipt_text = raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise EvidenceError("capture receipt: invalid UTF-8") from error
+        receipt = _validate_receipt(strict_json(receipt_text, "capture receipt"), capture_id)
+        canonical = (
+            json.dumps(receipt, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+        if raw != canonical:
+            raise EvidenceError("capture receipt: noncanonical")
+        if (
+            receipt["provider"] != "codex"
+            or receipt["executable_sha256"] != expected["codex"]
+            or receipt["capture_status"] != "complete"
+            or not receipt["capture_present"]
+            or receipt["termination"] != {
+                "collector_signal": None, "exit_code": 0,
+                "reason": "provider_exit", "signal": None,
+            }
+        ):
+            raise EvidenceError("codex analysis: ineligible capture")
+        analyzer = codex_analysis.CodexAnalysis()
+        capture = _verify_capture(
+            root, capture_id, receipt, observe=analyzer.feed,
+            maximum_bytes=MAX_FILE_BYTES,
+        )
+        if capture is None:
+            raise EvidenceError("codex analysis: absent capture")
+        report = analyzer.finish()
+        report.update(
+            provider=capture.provider,
+            provider_version=capture.provider_version,
+            source_interface=capture.source_interface,
+            source_capture_sha256=capture.source_capture_sha256,
+            executable_sha256=capture.executable_sha256,
+            capture_status=capture.capture_status,
+        )
+        return report
+    except codex_analysis.AnalysisError as error:
+        raise EvidenceError(f"codex analysis: {error}") from error
+    except provider_capture.CaptureError as error:
+        raise EvidenceError("capture root: unavailable") from error
+    finally:
+        root.close()
 
 
 def _verified_captures(capture_root: Path) -> set[VerifiedCapture]:
@@ -1435,10 +1508,24 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     operation.add_argument("--write-matrix", action="store_true")
     operation.add_argument("--print-summary", action="store_true")
     operation.add_argument("--write-observed", action="store_true")
+    operation.add_argument(
+        "--analyze-codex", action="store_true",
+        help="read one verified Codex capture and print unqualified analysis JSON",
+    )
     parser.add_argument("--evidence-mode", choices=sorted(FIXTURE_PATHS))
     parser.add_argument("--capture-root")
+    parser.add_argument("--capture-id")
     arguments = parser.parse_args(argv)
-    if arguments.write_observed:
+    if arguments.analyze_codex:
+        if (
+            arguments.evidence_mode is not None
+            or arguments.capture_root is None
+            or arguments.capture_id is None
+        ):
+            parser.error("--analyze-codex requires --capture-root and --capture-id")
+    elif arguments.capture_id is not None:
+        parser.error("--capture-id is only valid with --analyze-codex")
+    elif arguments.write_observed:
         if arguments.evidence_mode is not None or arguments.capture_root is None:
             parser.error("--write-observed requires only --capture-root")
     else:
@@ -1461,7 +1548,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         ) = load_executable_manifest_with_digest(
             root / EXECUTABLE_MANIFEST_PATH
         )
-        if arguments.check:
+        if arguments.analyze_codex:
+            report = analyze_codex_capture(
+                Path(arguments.capture_root), arguments.capture_id
+            )
+            print(json.dumps(report, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
+            return 0 if report["analysis_complete"] else 2
+        elif arguments.check:
             evidence_mode = declared_matrix_mode(root / MATRIX_PATH)
             fixture_path, matrix_path, source_fixture = artifact_paths(
                 root, evidence_mode
