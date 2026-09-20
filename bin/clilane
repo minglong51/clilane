@@ -33,7 +33,7 @@ from typing import BinaryIO, Callable, Iterator, Mapping, Sequence
 
 
 PROGRAM = "clilane"
-VERSION = "0.14.0"
+VERSION = "0.14.1"
 TASK_STATE_INITIALIZING = "initializing"
 TASK_STATE_RUNNING = "running"
 TASK_STATE_STOPPED = "stopped"
@@ -1443,6 +1443,12 @@ def supervise(encoded_command: str) -> int:
     if child == 0:
         for sent_signal in forwarded:
             signal.signal(sent_signal, signal.SIG_DFL)
+        tmux(
+            [
+                "set-option", "-p", "-t", os.environ["TMUX_PANE"],
+                "@agt_ready", str(launcher["id"]),
+            ]
+        )
         try:
             os.execvpe(command[0], command, child_environment)
         except OSError as error:
@@ -2950,7 +2956,7 @@ def run_task(spec: LaunchSpec) -> Task:
                     launcher,
                 )
             )
-            deadline = time.monotonic() + 0.5
+            deadline = time.monotonic() + 5.0
             started = None
             while True:
                 process = tmux(
@@ -2959,16 +2965,19 @@ def run_task(spec: LaunchSpec) -> Task:
                         "-p",
                         "-t",
                         pane,
-                        f"#{{pane_dead}}{FIELD_SEPARATOR}#{{pane_pid}}",
+                        f"#{{pane_dead}}{FIELD_SEPARATOR}#{{pane_pid}}"
+                        f"{FIELD_SEPARATOR}#{{@agt_ready}}",
                     ]
-                ).stdout.decode().strip().split(FIELD_SEPARATOR)
-                dead = len(process) != 2 or process[0] == "1"
-                pid = optional_int(process[1]) if len(process) == 2 else None
+                ).stdout.decode().rstrip("\r\n").split(FIELD_SEPARATOR)
+                if len(process) != 3:
+                    raise CliLaneError("could not inspect supervisor readiness")
+                dead = process[0] == "1"
+                pid = optional_int(process[1])
                 started = process_start_time(pid) if pid is not None and not dead else None
-                if dead or started:
+                if dead or (started and process[2] == task_id):
                     break
                 if time.monotonic() >= deadline:
-                    raise CliLaneError("could not bind supervisor process identity")
+                    raise CliLaneError("supervisor did not become ready")
                 time.sleep(0.02)
             tmux(["set-option", "-t", session, "@agt_process_started", started or ""])
             tmux(["set-option", "-t", session, "@agt_committed", "1"])
@@ -4139,6 +4148,7 @@ def switch_hub_popup(
         hub_popup_owner_condition(client, client_pid, context, popup_value),
         [
             ["set-option", "-gu", option],
+            ["display-popup", "-c", client, "-C"],
             ["switch-client", "-E", "-c", client, "-t", target],
         ],
     )
@@ -4232,8 +4242,12 @@ def hub_open(
         ],
         check=False,
     )
+    current_popup = tmux(
+        ["show-options", "-gqv", hub_client_popup_option(client)]
+    ).stdout.decode().strip()
+    released = current_popup not in (popup_value, f"{popup_value}:launch")
     finish_hub_popup(client, client_pid, context, generation)
-    if shown.returncode != 0:
+    if shown.returncode != 0 and not released:
         detail = shown.stderr.decode(errors="replace").strip()
         raise CliLaneError(detail or "could not open the session switcher")
     return 0
