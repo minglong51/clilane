@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.1] - 2026-09-20
+
+### Fixed
+
+- Task creation waits until the supervisor and child can handle stop signals, so stopping a newly created task preserves its exit hook.
+- Returning from the session picker closes its popup before switching to the job, so an immediate `Ctrl-Q` can reopen the picker.
+
 ## [0.14.0] - 2026-09-19
 
 ### Added
