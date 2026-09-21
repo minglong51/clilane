@@ -58,7 +58,7 @@ def emit(value):
     sys.stdout.flush()
 
 if sys.argv[1:] == ["--version"]:
-    sys.stdout.write("codex-cli 0.149.1\\n")
+    sys.stdout.write("codex-cli 0.155.1\\n")
     fail(0)
 if sys.argv[1:] != ["app-server", "--stdio", "--strict-config"]:
     fail(81)
@@ -358,7 +358,7 @@ import json
 import sys
 
 if sys.argv[1:] == ["--version"]:
-    sys.stdout.write("codex-cli 0.149.1\\n")
+    sys.stdout.write("codex-cli 0.155.1\\n")
     raise SystemExit(0)
 if sys.argv[1:] != ["app-server", "--stdio", "--strict-config"]:
     raise SystemExit(81)
@@ -488,7 +488,7 @@ class SuccessfulProtocolTests(ProbeDirectoryTestCase):
                 self.config("codex", executable, "capture-codex-success")
             )
         self.assertEqual(result.provider, "codex")
-        self.assertEqual(result.provider_version, "0.149.1")
+        self.assertEqual(result.provider_version, "0.155.1")
         receipt = self.receipt("capture-codex-success")
         self.assertEqual(receipt["capture_status"], "complete")
         self.assertEqual(receipt["termination"]["exit_code"], 0)

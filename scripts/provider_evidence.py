@@ -652,7 +652,7 @@ def analyze_codex_capture(capture_root: Path, capture_id: str) -> dict[str, Any]
     repository_root = Path(__file__).resolve(strict=True).parents[1]
     expected = load_executable_manifest(repository_root / EXECUTABLE_MANIFEST_PATH)
     codex_analysis = _load_sibling("codex_analysis")
-    if provider_capture.PROVIDER_SPECS["codex"].version != "0.149.1":
+    if provider_capture.PROVIDER_SPECS["codex"].version != "0.155.1":
         raise EvidenceError("codex analysis: unreviewed provider version")
     try:
         repository = provider_capture.repository_paths(Path(__file__))
