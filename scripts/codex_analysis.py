@@ -25,6 +25,7 @@ IGNORED_NOTIFICATIONS = {
     "item/reasoning/summaryPartAdded",
     "item/reasoning/textDelta",
     "thread/tokenUsage/updated",
+    "thread/settings/updated",
 }
 
 
@@ -96,6 +97,7 @@ class CodexAnalysis:
         self.duplicates = 0
         self.unhandled = 0
         self.ignored = 0
+        self.warnings = 0
         self.thread_id: str | None = None
         self.session_id: str | None = None
         self.thread_response_seen = False
@@ -318,6 +320,32 @@ class CodexAnalysis:
     def _notification(
         self, method: str, params: dict[str, Any], observed_ns: int
     ) -> None:
+        if method == "remoteControl/status/changed":
+            _identifier(params.get("installationId"))
+            _identifier(params.get("serverName"))
+            if params.get("environmentId") is not None:
+                _identifier(params["environmentId"])
+            status = params.get("status")
+            if type(status) is not str or status not in {
+                "disabled", "connecting", "connected", "errored"
+            }:
+                raise AnalysisError("invalid-remote-control-status")
+            if status != "disabled":
+                self.unhandled += 1
+                return
+            self.ignored += 1
+            return
+        if method == "account/rateLimits/updated":
+            _object(params.get("rateLimits"))
+            self.ignored += 1
+            return
+        if method == "warning":
+            if type(params.get("message")) is not str:
+                raise AnalysisError("invalid-provider-warning")
+            if params.get("threadId") is not None:
+                self._check_thread(params)
+            self.warnings += 1
+            return
         if method in IGNORED_NOTIFICATIONS:
             self._check_thread(params)
             turn_id = params.get("turnId")
@@ -428,6 +456,7 @@ class CodexAnalysis:
             "message_count": self.messages,
             "duplicate_count": self.duplicates,
             "ignored_notification_count": self.ignored,
+            "provider_warning_count": self.warnings,
             "unhandled_message_count": self.unhandled,
             "turn_count": len(self.turns),
             "unresolved_request_count": unresolved,
