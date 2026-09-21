@@ -166,8 +166,8 @@ PROVIDER_SPECS = {
     "codex": ProviderSpec(
         name="codex",
         executable="codex",
-        version="0.149.1",
-        version_outputs=(b"codex-cli 0.149.1\n", b"codex-cli 0.149.1\r\n"),
+        version="0.155.1",
+        version_outputs=(b"codex-cli 0.155.1\n", b"codex-cli 0.155.1\r\n"),
         source_interface="codex-app-server",
         mode="command",
         command=("app-server", "--stdio", "--strict-config"),
