@@ -125,6 +125,7 @@ class ExecutableIdentity:
     stage_name: str | None = None
     stage_directory_fd: int | None = None
     stage_directory_identity: tuple[int, int] | None = None
+    companion: ExecutableIdentity | None = None
 
 
 @dataclass(frozen=True)
@@ -189,6 +190,14 @@ CODEX_TARGETS = {
     ("Darwin", "x86_64"): ("codex-darwin-x64", "x86_64-apple-darwin"),
     ("Linux", "aarch64"): ("codex-linux-arm64", "aarch64-unknown-linux-musl"),
     ("Linux", "x86_64"): ("codex-linux-x64", "x86_64-unknown-linux-musl"),
+}
+
+
+CODEX_CODE_MODE_HOST_PINS = {
+    (
+        "0.155.1",
+        "8eaf1ad12fe6bf89b1710330f58900014322c7c5af677e43be116d8ac5fc0a9e",
+    ): "59a702a68f1ef79fceaca644db46b8385ceefbb66035e78b8ade7cdcc21fda55",
 }
 
 
@@ -965,6 +974,10 @@ def _identity_matches(
         or metadata.st_nlink != 1
     ):
         return False
+    if identity.companion is not None and not _identity_matches(
+        identity.companion, verify_hash=verify_hash
+    ):
+        return False
     if not verify_hash:
         return True
     try:
@@ -986,23 +999,35 @@ def _cleanup_executable(root: CaptureRoot, identity: ExecutableIdentity) -> None
     error: OSError | None = None
     try:
         os.fchmod(identity.stage_directory_fd, 0o700)
-        if identity.descriptor is not None:
-            os.close(identity.descriptor)
-            identity.descriptor = None
-        metadata = os.stat(
-            "provider",
-            dir_fd=identity.stage_directory_fd,
-            follow_symlinks=False,
-        )
-        if (metadata.st_dev, metadata.st_ino) != (
-            identity.metadata[0],
-            identity.metadata[1],
-        ):
-            raise OSError("provider stage changed")
-        os.unlink("provider", dir_fd=identity.stage_directory_fd)
+        staged = [identity]
+        if identity.companion is not None:
+            staged.append(identity.companion)
+        for executable in staged:
+            try:
+                if executable.descriptor is not None:
+                    os.close(executable.descriptor)
+                    executable.descriptor = None
+                metadata = os.stat(
+                    executable.path.name,
+                    dir_fd=identity.stage_directory_fd,
+                    follow_symlinks=False,
+                )
+                if (metadata.st_dev, metadata.st_ino) != (
+                    executable.metadata[0],
+                    executable.metadata[1],
+                ):
+                    raise OSError("provider stage changed")
+                os.unlink(executable.path.name, dir_fd=identity.stage_directory_fd)
+            except OSError as caught:
+                if error is None:
+                    error = caught
     except OSError as caught:
         error = caught
     finally:
+        for executable in (identity, identity.companion):
+            if executable is not None and executable.descriptor is not None:
+                os.close(executable.descriptor)
+                executable.descriptor = None
         os.close(identity.stage_directory_fd)
         identity.stage_directory_fd = None
     try:
@@ -1027,9 +1052,12 @@ def _cleanup_executable(root: CaptureRoot, identity: ExecutableIdentity) -> None
         raise CaptureError("provider-stage-cleanup-failed") from error
 
 
-def _stage_executable(
+def _stage_file(
     root: CaptureRoot,
+    stage_name: str,
+    stage_directory_fd: int,
     resolved: Path,
+    name: str,
     version: str,
     required_capture_bytes: int,
 ) -> ExecutableIdentity:
@@ -1037,16 +1065,19 @@ def _stage_executable(
         os.O_RDONLY
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
     )
-    stage_directory_fd: int | None = None
     stage_descriptor: int | None = None
     stage_writer: int | None = None
-    stage_name: str | None = None
+    created_metadata: tuple[int, int] | None = None
     identity: ExecutableIdentity | None = None
     try:
         source = os.open(resolved, source_flags)
         source_metadata = os.fstat(source)
-        if not stat.S_ISREG(source_metadata.st_mode):
+        if (
+            not stat.S_ISREG(source_metadata.st_mode)
+            or source_metadata.st_mode & 0o111 == 0
+        ):
             raise CaptureError("provider-executable-invalid")
         filesystem = os.fstatvfs(root.directory_fd)
         block_size = filesystem.f_frsize or filesystem.f_bsize
@@ -1055,34 +1086,6 @@ def _stage_executable(
             source_metadata.st_size + required_capture_bytes + MAX_RECEIPT_BYTES
         ):
             raise CaptureError("capture-root-insufficient-space")
-        for _attempt in range(8):
-            candidate = f".clilane-provider-stage-{secrets.token_hex(16)}"
-            try:
-                os.mkdir(candidate, 0o700, dir_fd=root.directory_fd)
-            except FileExistsError:
-                continue
-            stage_name = candidate
-            break
-        if stage_name is None:
-            raise CaptureError("provider-stage-unavailable")
-        directory_flags = (
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
-        stage_directory_fd = os.open(
-            stage_name,
-            directory_flags,
-            dir_fd=root.directory_fd,
-        )
-        directory_metadata = os.fstat(stage_directory_fd)
-        if (
-            not stat.S_ISDIR(directory_metadata.st_mode)
-            or directory_metadata.st_uid != os.getuid()
-            or stat.S_IMODE(directory_metadata.st_mode) != 0o700
-        ):
-            raise CaptureError("provider-stage-unsafe")
         write_flags = (
             os.O_RDWR
             | os.O_CREAT
@@ -1091,11 +1094,13 @@ def _stage_executable(
             | getattr(os, "O_NOFOLLOW", 0)
         )
         stage_writer = os.open(
-            "provider",
+            name,
             write_flags,
             0o600,
             dir_fd=stage_directory_fd,
         )
+        created = os.fstat(stage_writer)
+        created_metadata = (created.st_dev, created.st_ino)
         digest = hashlib.sha256()
         while True:
             chunk = os.read(source, CHUNK_BYTES)
@@ -1124,28 +1129,22 @@ def _stage_executable(
         os.close(stage_writer)
         stage_writer = None
         stage_descriptor = os.open(
-            "provider",
+            name,
             source_flags,
             dir_fd=stage_directory_fd,
         )
         stage_hash, stage_metadata = _hash_descriptor(stage_descriptor)
-        if stage_hash != digest.hexdigest():
+        if (
+            stage_hash != digest.hexdigest()
+            or stage_metadata != _metadata(written_metadata)
+        ):
             raise CaptureError("provider-stage-changed")
-        os.fchmod(stage_directory_fd, 0o500)
-        os.fsync(stage_directory_fd)
-        os.fsync(root.directory_fd)
         identity = ExecutableIdentity(
-            path=root.path / stage_name / "provider",
+            path=root.path / stage_name / name,
             version=version,
             sha256=stage_hash,
             metadata=stage_metadata,
             descriptor=stage_descriptor,
-            stage_name=stage_name,
-            stage_directory_fd=stage_directory_fd,
-            stage_directory_identity=(
-                directory_metadata.st_dev,
-                directory_metadata.st_ino,
-            ),
         )
         return identity
     except OSError as error:
@@ -1158,19 +1157,102 @@ def _stage_executable(
         if identity is None:
             if stage_descriptor is not None:
                 os.close(stage_descriptor)
-            if stage_directory_fd is not None:
+            if created_metadata is not None:
                 try:
-                    os.fchmod(stage_directory_fd, 0o700)
-                    os.unlink("provider", dir_fd=stage_directory_fd)
+                    current = os.stat(
+                        name, dir_fd=stage_directory_fd, follow_symlinks=False
+                    )
+                    if (current.st_dev, current.st_ino) == created_metadata:
+                        os.unlink(name, dir_fd=stage_directory_fd)
                 except OSError:
                     pass
-                os.close(stage_directory_fd)
-            if stage_name is not None:
-                try:
-                    os.rmdir(stage_name, dir_fd=root.directory_fd)
-                    os.fsync(root.directory_fd)
-                except OSError:
-                    pass
+
+
+def _stage_executable(
+    root: CaptureRoot,
+    resolved: Path,
+    version: str,
+    required_capture_bytes: int,
+) -> ExecutableIdentity:
+    stage_directory_fd: int | None = None
+    stage_name: str | None = None
+    identity: ExecutableIdentity | None = None
+    complete = False
+    try:
+        for _attempt in range(8):
+            candidate = f".clilane-provider-stage-{secrets.token_hex(16)}"
+            try:
+                os.mkdir(candidate, 0o700, dir_fd=root.directory_fd)
+            except FileExistsError:
+                continue
+            stage_name = candidate
+            break
+        if stage_name is None:
+            raise CaptureError("provider-stage-unavailable")
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        stage_directory_fd = os.open(
+            stage_name, directory_flags, dir_fd=root.directory_fd
+        )
+        directory_metadata = os.fstat(stage_directory_fd)
+        if (
+            not stat.S_ISDIR(directory_metadata.st_mode)
+            or directory_metadata.st_uid != os.getuid()
+            or stat.S_IMODE(directory_metadata.st_mode) != 0o700
+        ):
+            raise CaptureError("provider-stage-unsafe")
+        identity = _stage_file(
+            root,
+            stage_name,
+            stage_directory_fd,
+            resolved,
+            "provider",
+            version,
+            required_capture_bytes,
+        )
+        identity.stage_name = stage_name
+        identity.stage_directory_fd = stage_directory_fd
+        identity.stage_directory_identity = (
+            directory_metadata.st_dev,
+            directory_metadata.st_ino,
+        )
+        companion_hash = CODEX_CODE_MODE_HOST_PINS.get((version, identity.sha256))
+        if companion_hash is not None:
+            identity.companion = _stage_file(
+                root,
+                stage_name,
+                stage_directory_fd,
+                resolved.parent / "codex-code-mode-host",
+                "codex-code-mode-host",
+                version,
+                required_capture_bytes,
+            )
+            if identity.companion.sha256 != companion_hash:
+                raise CaptureError("provider-companion-hash-mismatch")
+        os.fchmod(stage_directory_fd, 0o500)
+        os.fsync(stage_directory_fd)
+        os.fsync(root.directory_fd)
+        complete = True
+        return identity
+    except OSError as error:
+        raise CaptureError("provider-stage-failed") from error
+    finally:
+        if not complete:
+            if identity is not None:
+                _cleanup_executable(root, identity)
+            else:
+                if stage_directory_fd is not None:
+                    os.close(stage_directory_fd)
+                if stage_name is not None:
+                    try:
+                        os.rmdir(stage_name, dir_fd=root.directory_fd)
+                        os.fsync(root.directory_fd)
+                    except OSError:
+                        pass
 
 
 def resolve_executable(
