@@ -98,6 +98,7 @@ class CodexAnalysis:
         self.unhandled = 0
         self.ignored = 0
         self.warnings = 0
+        self.thread_reads = 0
         self.thread_id: str | None = None
         self.session_id: str | None = None
         self.thread_response_seen = False
@@ -248,6 +249,12 @@ class CodexAnalysis:
             self._check_thread(params)
             if self.active_turn is None or params.get("turnId") != self.active_turn:
                 raise AnalysisError("turn-binding-mismatch")
+        elif method == "thread/read":
+            self._check_thread(params)
+            if set(params) - {"threadId", "includeTurns"} or (
+                "includeTurns" in params and type(params["includeTurns"]) is not bool
+            ):
+                raise AnalysisError("invalid-thread-read")
         elif method != "initialize":
             self.unhandled += 1
         self.client_messages[key] = fingerprint
@@ -271,6 +278,9 @@ class CodexAnalysis:
         if method == "thread/start":
             self._bind_thread(_object(result.get("thread")))
             self.thread_response_seen = True
+        elif method == "thread/read":
+            self._bind_thread(_object(result.get("thread")))
+            self.thread_reads += 1
         elif method == "turn/start":
             value = _object(result.get("turn"))
             turn = self._turn(_identifier(value.get("id")))
@@ -457,6 +467,7 @@ class CodexAnalysis:
             "duplicate_count": self.duplicates,
             "ignored_notification_count": self.ignored,
             "provider_warning_count": self.warnings,
+            "thread_read_count": self.thread_reads,
             "unhandled_message_count": self.unhandled,
             "turn_count": len(self.turns),
             "unresolved_request_count": unresolved,
