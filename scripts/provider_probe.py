@@ -1302,7 +1302,10 @@ def run_claude_probe(config: ProbeConfig, pinned: PinnedExecutable) -> ProbeResu
 
 
 class JsonLineTransport:
-    def __init__(self, config: ProbeConfig, pinned: PinnedExecutable) -> None:
+    def __init__(
+        self, config: ProbeConfig, pinned: PinnedExecutable,
+        *, environment: dict[str, str] | None = None,
+    ) -> None:
         collector = COLLECTORS[config.provider]
         try:
             control_read, control_write = os.pipe()
@@ -1356,7 +1359,7 @@ class JsonLineTransport:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     cwd=Path("/"),
-                    env=sanitized_environment(),
+                    env=sanitized_environment(environment),
                     start_new_session=True,
                     close_fds=True,
                     pass_fds=(control_write,),

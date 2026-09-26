@@ -99,6 +99,7 @@ class CodexAnalysis:
         self.ignored = 0
         self.warnings = 0
         self.thread_reads = 0
+        self.skills_cwd: str | None = None
         self.thread_id: str | None = None
         self.session_id: str | None = None
         self.thread_response_seen = False
@@ -255,6 +256,18 @@ class CodexAnalysis:
                 "includeTurns" in params and type(params["includeTurns"]) is not bool
             ):
                 raise AnalysisError("invalid-thread-read")
+        elif method == "skills/list":
+            cwds = params.get("cwds")
+            if (
+                self.thread_id is not None or self.skills_cwd is not None
+                or set(params) != {"cwds", "forceReload"}
+                or params["forceReload"] is not True
+                or type(cwds) is not list or len(cwds) != 1
+                or type(cwds[0]) is not str or not cwds[0].startswith("/")
+                or len(cwds[0]) > 4096 or "\0" in cwds[0]
+            ):
+                raise AnalysisError("invalid-skills-preflight")
+            self.skills_cwd = cwds[0]
         elif method != "initialize":
             self.unhandled += 1
         self.client_messages[key] = fingerprint
@@ -281,6 +294,19 @@ class CodexAnalysis:
         elif method == "thread/read":
             self._bind_thread(_object(result.get("thread")))
             self.thread_reads += 1
+        elif method == "skills/list":
+            entries = result.get("data")
+            if type(entries) is not list or len(entries) != 1:
+                raise AnalysisError("invalid-skills-preflight")
+            entry = _object(entries[0])
+            skills = entry.get("skills")
+            if (
+                entry.get("cwd") != self.skills_cwd or entry.get("errors") != []
+                or type(skills) is not list or len(skills) > MAX_IDENTITIES
+                or any(type(skill) is not dict or skill.get("enabled") is not False
+                       for skill in skills)
+            ):
+                raise AnalysisError("skills-preflight-not-isolated")
         elif method == "turn/start":
             value = _object(result.get("turn"))
             turn = self._turn(_identifier(value.get("id")))
