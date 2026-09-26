@@ -2,9 +2,9 @@
   "platform": "darwin-arm64",
   "providers": [
     {
-      "executable_sha256": "9f7c2260251765a18d0b35198669dacc1912f6e8129a3b01f6b58d93365ff1f1",
+      "executable_sha256": "d8cb1e5c79684cc12a8bfc813e3a2073406921b6245744b3009be3ab5651d21e",
       "provider": "claude",
-      "provider_version": "2.1.245",
+      "provider_version": "2.1.283",
       "source_interface": "claude-native-hook"
     },
     {

@@ -720,7 +720,7 @@ class CheckArtifactTests(unittest.TestCase):
         self.assertEqual(
             expected,
             {
-                "claude": "9f7c2260251765a18d0b35198669dacc1912f6e8129a3b01f6b58d93365ff1f1",
+                "claude": "d8cb1e5c79684cc12a8bfc813e3a2073406921b6245744b3009be3ab5651d21e",
                 "codex": "8eaf1ad12fe6bf89b1710330f58900014322c7c5af677e43be116d8ac5fc0a9e",
                 "kimi": "92bf3b4b6643e7c4cc12c82e5680cc5b54a5a6768a301de815e5e9a02d2184bb",
             },

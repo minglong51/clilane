@@ -5,7 +5,9 @@ import hashlib
 import io
 import json
 import os
+import re
 import select
+import shlex
 import signal
 import subprocess
 import sys
@@ -28,6 +30,12 @@ from provider_capture import iter_capture_frames, repository_paths, validate_cap
 CAPTURE_ID = "capture-codex-input-recovery"
 INPUT_METHOD = "item/tool/requestUserInput"
 PERMISSIONS_METHOD = "item/permissions/requestApproval"
+COMMAND_METHOD = "item/commandExecution/requestApproval"
+FILE_METHOD = "item/fileChange/requestApproval"
+SCENARIOS = {
+    "input": INPUT_METHOD, "permissions": PERMISSIONS_METHOD,
+    "command": COMMAND_METHOD, "file": FILE_METHOD,
+}
 PROMPT = (
     "This is a synthetic protocol probe. Call request_user_input exactly once, "
     "with one question asking whether to choose Alpha or Beta and those two options. "
@@ -265,10 +273,18 @@ class ObserverClient:
 class Broker:
     def __init__(
         self, transport: JsonLineTransport, binding: TaskBinding, path: Path,
-        *, scenario_name: str = "input",
+        *, scenario_name: str = "input", workspace: Path | None = None,
     ) -> None:
-        require(scenario_name in {"input", "permissions"}, "scenario-invalid")
-        self.request_method = INPUT_METHOD if scenario_name == "input" else PERMISSIONS_METHOD
+        require(scenario_name in SCENARIOS, "scenario-invalid")
+        require(scenario_name not in {"command", "file"} or workspace is not None,
+                "scenario-workspace-required")
+        self.scenario_name = scenario_name
+        self.request_method = SCENARIOS[scenario_name]
+        self.workspace = workspace
+        self.tool_item_id: str | None = None
+        self.tool_request_id: str | int | None = None
+        self.denial_sent = False
+        self.tool_declined = False
         self.transport = transport
         self.binding = binding
         self.path = path
@@ -287,6 +303,10 @@ class Broker:
         self.observer.ok("observe", stream=stream, observed_ns=observed_ns, message=message)
 
     def send(self, message: dict[str, Any]) -> None:
+        if self.tool_request_id is not None and message.get("id") == self.tool_request_id:
+            require(message == {"id": self.tool_request_id, "result": {"decision": "decline"}}
+                    and not self.denial_sent, "invalid-denial-response")
+            self.denial_sent = True
         self.transport.send(message)
         self.observe("I", message)
 
@@ -296,11 +316,27 @@ class Broker:
         require("jsonrpc" not in message and type(params) is dict, "protocol-envelope-invalid")
         if "method" in message and "id" in message:
             require(message["method"] == self.request_method, "unexpected-provider-request")
+            if self.scenario_name in {"command", "file"}:
+                require(self.tool_request_id is None, "duplicate-approval-request")
+                action_request(params, self.workspace, self.scenario_name, self.tool_item_id)
+                self.tool_request_id = message["id"]
         if message.get("method") in {"item/started", "item/completed"}:
             item = params.get("item")
-            require(type(item) is dict and item.get("type") in {
-                "userMessage", "agentMessage", "reasoning", "plan",
-            }, "provider-side-effect-attempt")
+            require(type(item) is dict, "provider-item-invalid")
+            if item.get("type") not in {"userMessage", "agentMessage", "reasoning", "plan"}:
+                require(self.scenario_name in {"command", "file"}, "provider-side-effect-attempt")
+                action_item(item, self.workspace, self.scenario_name)
+                if message["method"] == "item/started":
+                    require(self.tool_item_id is None and item.get("status") == "inProgress",
+                            "unexpected-action-start")
+                    self.tool_item_id = item["id"]
+                else:
+                    require(item["id"] == self.tool_item_id and self.denial_sent
+                            and not self.tool_declined and item.get("status") == "declined",
+                            "action-not-declined")
+                    self.tool_declined = True
+        require(message.get("method") != "item/commandExecution/outputDelta",
+                "unexpected-command-output")
         require(message.get("method") != "warning", "provider-warning")
         self.observe("O", message)
         return message
@@ -376,8 +412,9 @@ def recovery(broker: Broker, thread_id: str, request: dict[str, Any]) -> dict[st
     return {key: True for key in (
         "stale_delivery_rejected", "duplicate_delivery_noop", "freshness_expired",
         "observer_process_restarted",
-        "pending_input_recovered" if broker.request_method == INPUT_METHOD
-        else "pending_permission_approval_recovered",
+        {INPUT_METHOD: "pending_input_recovered", PERMISSIONS_METHOD: "pending_permission_approval_recovered",
+         COMMAND_METHOD: "pending_command_approval_recovered", FILE_METHOD: "pending_file_approval_recovered"}[
+            broker.request_method],
         "replay_stayed_unknown",
         "fresh_source_read_required", "provider_process_unchanged",
     )}
@@ -402,13 +439,94 @@ def permission_request(params: dict[str, Any], workspace: Path) -> None:
             )), "permission-request-invalid")
 
 
+def action_target(workspace: Path, scenario_name: str) -> Path:
+    return workspace.parent / ("denied-command" if scenario_name == "command" else "denied-file.txt")
+
+
+def command_matches(command: Any, target: Path) -> bool:
+    if type(command) is not str or len(command) > 4096:
+        return False
+    try:
+        words = shlex.split(command)
+        if len(words) == 3 and words[0] in {"/bin/sh", "/bin/bash", "/bin/zsh"} and words[1] in {"-c", "-lc"}:
+            words = shlex.split(words[2])
+    except ValueError:
+        return False
+    return words == ["/usr/bin/touch", str(target)]
+
+
+def action_item(item: dict[str, Any], workspace: Path, scenario_name: str) -> None:
+    target = action_target(workspace, scenario_name)
+    require(type(item.get("id")) is str and 0 < len(item["id"]) <= 256, "action-identity-invalid")
+    if scenario_name == "command":
+        require(item.get("type") == "commandExecution" and item.get("cwd") == str(workspace)
+                and command_matches(item.get("command"), target)
+                and all(item.get(field) is None for field in (
+                    "exitCode", "processId", "pluginId", "scriptPath",
+                )) and (item.get("durationMs") is None or type(item["durationMs"]) is int and item["durationMs"] == 0),
+                "unexpected-command-execution")
+        require(item.get("aggregatedOutput") is None or item.get("aggregatedOutput") == "",
+                "unexpected-command-output")
+    else:
+        changes = item.get("changes")
+        require(item.get("type") == "fileChange" and type(changes) is list and len(changes) == 1,
+                "unexpected-file-change")
+        change = changes[0]
+        require(type(change) is dict and set(change) == {"path", "kind", "diff"}
+                and change["path"] == str(target) and change["kind"] == {"type": "add"}
+                and type(change["diff"]) is str
+                and change["diff"] in {"CLILANE_PROBE_SENTINEL\n", "+CLILANE_PROBE_SENTINEL\n"},
+                "unexpected-file-change")
+    require(not os.path.lexists(target), "denied-action-created-target")
+
+
+def action_request(
+    params: dict[str, Any], workspace: Path, scenario_name: str, item_id: str | None,
+) -> None:
+    require(item_id is not None and params.get("itemId") == item_id
+            and type(params.get("startedAtMs")) is int and 0 < params["startedAtMs"] < 1 << 63,
+            "action-request-invalid")
+    target = action_target(workspace, scenario_name)
+    if scenario_name == "command":
+        require(set(params) <= {
+            "additionalPermissions", "approvalId", "availableDecisions", "command", "commandActions",
+            "cwd", "environmentId", "itemId", "kind", "networkApprovalContext",
+            "proposedExecpolicyAmendment", "proposedNetworkPolicyAmendments", "reason", "startedAtMs",
+            "threadId", "turnId",
+        } and params.get("cwd") == str(workspace) and command_matches(params.get("command"), target)
+                and params.get("kind", "command") == "command"
+                and (params.get("environmentId") is None or params["environmentId"] == "local")
+                and params.get("networkApprovalContext") is None,
+                "unexpected-command-request")
+    else:
+        require(set(params) <= {"grantRoot", "itemId", "reason", "startedAtMs", "threadId", "turnId"}
+                and (params.get("grantRoot") is None or params["grantRoot"] == str(target.parent)),
+                "unexpected-file-request")
+    require(not os.path.lexists(target), "denied-action-created-target")
+
+
 def scenario(broker: Broker, workspace: Path) -> dict[str, bool]:
     permissions = broker.request_method == PERMISSIONS_METHOD
+    action = broker.request_method in {COMMAND_METHOD, FILE_METHOD}
     prompt = PERMISSIONS_PROMPT if permissions else PROMPT
+    if action:
+        target = action_target(workspace, broker.scenario_name)
+        require(not os.path.lexists(target), "action-target-exists")
+        operation = (
+            f"Call exec_command exactly once with cmd={json.dumps('/usr/bin/touch ' + shlex.quote(str(target)))}, "
+            "sandbox_permissions=require_escalated and a short justification. "
+            if broker.scenario_name == "command" else
+            f"Call apply_patch exactly once to add the absolute path {target} containing exactly "
+            "CLILANE_PROBE_SENTINEL followed by one newline. "
+        )
+        prompt = "This is a synthetic approval protocol probe. " + operation + (
+            "Request approval; it will be denied. Do not use another tool, run a preliminary command, "
+            "or retry after denial. After the denial, reply exactly CLILANE_PROBE_OK and end the turn."
+        )
     policy: str | dict[str, Any] = {"granular": {
-        "mcp_elicitations": False, "rules": False, "sandbox_approval": False,
-        "skill_approval": False, "request_permissions": True,
-    }} if permissions else "never"
+        "mcp_elicitations": False, "rules": False, "sandbox_approval": action,
+        "skill_approval": False, "request_permissions": permissions,
+    }} if permissions or action else "never"
     initialize(broker)
     skills(broker, workspace, isolated=True)
     broker.send({"id": "probe-thread", "method": "thread/start", "params": {
@@ -426,7 +544,7 @@ def scenario(broker: Broker, workspace: Path) -> dict[str, bool]:
         "threadId": thread_id, "input": [{"type": "text", "text": prompt}],
         "approvalPolicy": policy, "approvalsReviewer": "user",
         "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
-        "collaborationMode": {"mode": "default" if permissions else "plan", "settings": {
+        "collaborationMode": {"mode": "default" if permissions or action else "plan", "settings": {
             "model": model, "reasoning_effort": "low", "developer_instructions": prompt,
         }},
     }})
@@ -467,12 +585,12 @@ def scenario(broker: Broker, workspace: Path) -> dict[str, bool]:
                     "unexpected-provider-request")
             if permissions:
                 permission_request(params, workspace)
-            else:
+            elif not action:
                 require(params.get("isBlocking") is True
                         and type(params.get("questions")) is list and len(params["questions"]) == 1,
                         "unexpected-input-request")
             recovered = recovery(broker, thread_id, message)
-            broker.send({"id": message["id"], "result": {
+            broker.send({"id": message["id"], "result": {"decision": "decline"} if action else {
                 "permissions": {}, "scope": "turn",
             } if permissions else {"answers": {}}})
             next_read = time.monotonic() + 1
@@ -488,26 +606,69 @@ def scenario(broker: Broker, workspace: Path) -> dict[str, bool]:
     recovered["permission_approval_resolved" if permissions else "input_request_resolved"] = True
     if permissions:
         recovered["permission_grant_empty"] = True
+    if action:
+        require(broker.tool_declined and not os.path.lexists(action_target(workspace, broker.scenario_name)),
+                "action-denial-not-proven")
+        recovered.pop("input_request_resolved")
+        recovered[f"{broker.scenario_name}_approval_resolved"] = True
+        recovered["action_declined_without_target_creation"] = True
     return recovered
 
 
-def verify_journal(root: Path, binding: TaskBinding, report: dict[str, Any]) -> None:
+def verify_diagnostics(stderr: bytes, scenario_name: str) -> None:
+    if not stderr:
+        return
+    expected = {
+        "command": b'error=exec_command failed: CreateProcess { message: "Rejected(\\"rejected by user\\")" }',
+        "file": b"error=patch rejected by user",
+    }.get(scenario_name)
+    require(expected is not None and re.fullmatch(
+        rb"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z ERROR codex_core::tools::router: "
+        + re.escape(expected) + rb"\n", stderr,
+    ) is not None, "provider-stderr-output")
+
+
+def verify_journal(
+    root: Path, binding: TaskBinding, report: dict[str, Any], *, scenario_name: str = "input",
+) -> None:
     capture = _read_private(root / "captures" / f"{CAPTURE_ID}.capture", PER_CAPTURE_BYTES)
     require(hashlib.sha256(capture).hexdigest() == report["source_capture_sha256"],
             "capture-changed")
     buffers = {"I": bytearray(), "O": bytearray()}
     source: dict[str, list[dict[str, Any]]] = {"I": [], "O": []}
-    for stream, _observed_ns, payload in iter_capture_frames(io.BytesIO(capture)):
+    observed: list[tuple[str, int, dict[str, Any]]] = []
+    stderr = bytearray()
+    stderr_times: list[int] = []
+    for stream, observed_ns, payload in iter_capture_frames(io.BytesIO(capture)):
         if stream == "E":
-            require(not payload, "provider-stderr-output")
+            stderr.extend(payload)
+            if payload:
+                stderr_times.append(observed_ns)
             continue
         buffer = buffers[stream]
         buffer.extend(payload)
         while b"\n" in buffer:
             end = buffer.index(b"\n")
-            source[stream].append(strict_message(bytes(buffer[:end])))
+            message = strict_message(bytes(buffer[:end]))
+            source[stream].append(message)
+            observed.append((stream, observed_ns, message))
             del buffer[:end + 1]
     require(not any(buffers.values()), "capture-message-truncated")
+    verify_diagnostics(bytes(stderr), scenario_name)
+    if stderr:
+        requests = [message for stream, _, message in observed
+                    if stream == "O" and message.get("method") == SCENARIOS[scenario_name]
+                    and "id" in message]
+        require(len(requests) == 1, "denial-diagnostic-unbound")
+        request_id = requests[0]["id"]
+        declines = [observed_ns for stream, observed_ns, message in observed
+                    if stream == "I" and type(message.get("id")) is type(request_id)
+                    and message == {"id": request_id, "result": {"decision": "decline"}}]
+        completed = [observed_ns for stream, observed_ns, message in observed
+                     if stream == "O" and message.get("method") == "turn/completed"]
+        require(len(declines) == len(completed) == 1
+                and all(declines[0] <= moment < completed[0] for moment in stderr_times),
+                "denial-diagnostic-outside-turn")
     rows = _read_private(root / "journal" / "source.jsonl", 256 * 1024).splitlines()
     require(strict_message(rows[0]) == {"schema_version": 1, "task_generation": binding.generation},
             "journal-binding-mismatch")
@@ -535,7 +696,7 @@ def run(
     root: Path, executable: Path, auth_file: Path, cancellation: Cancellation | None = None,
     *, scenario_name: str = "input",
 ) -> dict[str, Any]:
-    require(scenario_name in {"input", "permissions"}, "scenario-invalid")
+    require(scenario_name in SCENARIOS, "scenario-invalid")
     binding = task_binding()
     require(root.is_absolute() and root.resolve() == root, "run-root-not-canonical")
     _private_directory(root, empty=True)
@@ -550,6 +711,8 @@ def run(
     ) + CONFIG + (
         "request_permissions_tool = " + ("true" if scenario_name == "permissions" else "false") + "\n"
     )
+    if scenario_name in {"command", "file"}:
+        isolated_config = isolated_config.replace("shell_tool = false\n", "shell_tool = true\n")
     _write_private_bytes(root / "discovery-config" / "config.toml", isolated_config.encode())
     paths = preflight(root, pinned, root / "discovery-config", "capture-discovery", isolated=False)
     config = isolated_config + "".join(
@@ -585,7 +748,7 @@ def run(
         spec = ProbeConfig("codex", root / "captures", CAPTURE_ID, pinned.path, root / "workspace")
         transport = JsonLineTransport(spec, pinned, environment=environment(root / "config", root / "tmp"))
         broker = Broker(transport, binding, root / "journal" / "source.jsonl",
-                        scenario_name=scenario_name)
+                        scenario_name=scenario_name, workspace=spec.workspace)
         checks = scenario(broker, spec.workspace)
         transport.finish()
         finished = True
@@ -595,11 +758,13 @@ def run(
         require(report["analysis_complete"] and report["provider_warning_count"] == 0
                 and report["turn_count"] == 1 and report["thread_read_count"] >= 2,
                 "capture-analysis-incomplete")
-        if scenario_name == "permissions":
+        if scenario_name != "input":
             require(any(event["event"] == "thread_state" and "waitingOnApproval" in event["flags"]
                         for event in report["events"]), "approval-state-not-observed")
-        verify_journal(root, binding, report)
+        verify_journal(root, binding, report, scenario_name=scenario_name)
         checks["journal_matches_source"] = True
+        if scenario_name in {"command", "file"}:
+            checks["provider_diagnostics_match_denial"] = True
         return {
             "schema_version": 1, "scope": f"phase0-{scenario_name}-observer-restart",
             "qualification": "unqualified", "provider": "codex", "provider_version": "0.155.1",
@@ -638,9 +803,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         parser.add_argument("--run-root", required=True)
         parser.add_argument("--provider-executable", required=True)
-        parser.add_argument("--scenario", choices=("input", "permissions"), default="input",
-                            help="Input cancellation (default), or experimental permission approval "
-                            "with an empty grant; neither scenario executes provider commands.")
+        parser.add_argument("--scenario", choices=tuple(SCENARIOS), default="input",
+                            help="Input cancellation (default), empty permission grant, "
+                            "or a declined synthetic command/file approval.")
         parser.add_argument("--auth-file", required=True,
                             help="Private Codex subscription credentials valid for at least three minutes; "
                             "the probe removes its isolated copy after the run.")
