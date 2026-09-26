@@ -27,11 +27,18 @@ from provider_capture import iter_capture_frames, repository_paths, validate_cap
 
 CAPTURE_ID = "capture-codex-input-recovery"
 INPUT_METHOD = "item/tool/requestUserInput"
+PERMISSIONS_METHOD = "item/permissions/requestApproval"
 PROMPT = (
     "This is a synthetic protocol probe. Call request_user_input exactly once, "
     "with one question asking whether to choose Alpha or Beta and those two options. "
     "Do not call any other tool. After the response, reply with exactly "
     "CLILANE_PROBE_OK and end the turn."
+)
+PERMISSIONS_PROMPT = (
+    "This is a synthetic protocol probe. Call request_permissions exactly once, "
+    "asking only for network access. Do not access the network, run a command, "
+    "read or write a file, or call any other tool. The permission request will be denied. "
+    "After the response, reply with exactly CLILANE_PROBE_OK and end the turn."
 )
 DISABLED_FEATURES = (
     "hooks", "plugins", "apps", "browser_use", "browser_use_external",
@@ -256,7 +263,12 @@ class ObserverClient:
 
 
 class Broker:
-    def __init__(self, transport: JsonLineTransport, binding: TaskBinding, path: Path) -> None:
+    def __init__(
+        self, transport: JsonLineTransport, binding: TaskBinding, path: Path,
+        *, scenario_name: str = "input",
+    ) -> None:
+        require(scenario_name in {"input", "permissions"}, "scenario-invalid")
+        self.request_method = INPUT_METHOD if scenario_name == "input" else PERMISSIONS_METHOD
         self.transport = transport
         self.binding = binding
         self.path = path
@@ -283,7 +295,7 @@ class Broker:
         params = message.get("params", {})
         require("jsonrpc" not in message and type(params) is dict, "protocol-envelope-invalid")
         if "method" in message and "id" in message:
-            require(message["method"] == INPUT_METHOD, "unexpected-provider-request")
+            require(message["method"] == self.request_method, "unexpected-provider-request")
         if message.get("method") in {"item/started", "item/completed"}:
             item = params.get("item")
             require(type(item) is dict and item.get("type") in {
@@ -363,17 +375,46 @@ def recovery(broker: Broker, thread_id: str, request: dict[str, Any]) -> dict[st
             and transport.process.poll() is None, "provider-restarted")
     return {key: True for key in (
         "stale_delivery_rejected", "duplicate_delivery_noop", "freshness_expired",
-        "observer_process_restarted", "pending_input_recovered", "replay_stayed_unknown",
+        "observer_process_restarted",
+        "pending_input_recovered" if broker.request_method == INPUT_METHOD
+        else "pending_permission_approval_recovered",
+        "replay_stayed_unknown",
         "fresh_source_read_required", "provider_process_unchanged",
     )}
 
 
+def permission_request(params: dict[str, Any], workspace: Path) -> None:
+    require(set(params) <= {
+        "cwd", "environmentId", "itemId", "permissions", "reason", "startedAtMs",
+        "threadId", "turnId",
+    } and params.get("cwd") == str(workspace)
+            and (params.get("environmentId") is None or params["environmentId"] == "local"),
+            "permission-request-invalid")
+    permissions = params.get("permissions")
+    require(type(permissions) is dict and set(permissions) <= {"network", "fileSystem"}
+            and permissions.get("fileSystem") is None
+            and permissions.get("network") == {"enabled": True}
+            and type(permissions["network"]["enabled"]) is bool,
+            "unexpected-permissions")
+    require(type(params.get("startedAtMs")) is int and 0 < params["startedAtMs"] < 1 << 63
+            and (params.get("reason") is None or (
+                type(params["reason"]) is str and len(params["reason"]) <= 4096
+            )), "permission-request-invalid")
+
+
 def scenario(broker: Broker, workspace: Path) -> dict[str, bool]:
+    permissions = broker.request_method == PERMISSIONS_METHOD
+    prompt = PERMISSIONS_PROMPT if permissions else PROMPT
+    policy: str | dict[str, Any] = {"granular": {
+        "mcp_elicitations": False, "rules": False, "sandbox_approval": False,
+        "skill_approval": False, "request_permissions": True,
+    }} if permissions else "never"
     initialize(broker)
     skills(broker, workspace, isolated=True)
     broker.send({"id": "probe-thread", "method": "thread/start", "params": {
-        "approvalPolicy": "never", "cwd": str(workspace), "ephemeral": True,
-        "sandbox": "read-only", "personality": "none", "developerInstructions": PROMPT,
+        "approvalPolicy": policy, "approvalsReviewer": "user",
+        "cwd": str(workspace), "ephemeral": True,
+        "sandbox": "read-only", "personality": "none", "developerInstructions": prompt,
     }})
     started = response(broker, "probe-thread")
     thread = started.get("thread")
@@ -382,10 +423,11 @@ def scenario(broker: Broker, workspace: Path) -> dict[str, bool]:
             "thread-start-invalid")
     thread_id = thread["id"]
     broker.send({"id": "probe-turn", "method": "turn/start", "params": {
-        "threadId": thread_id, "input": [{"type": "text", "text": PROMPT}],
-        "approvalPolicy": "never", "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
-        "collaborationMode": {"mode": "plan", "settings": {
-            "model": model, "reasoning_effort": "low", "developer_instructions": PROMPT,
+        "threadId": thread_id, "input": [{"type": "text", "text": prompt}],
+        "approvalPolicy": policy, "approvalsReviewer": "user",
+        "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
+        "collaborationMode": {"mode": "default" if permissions else "plan", "settings": {
+            "model": model, "reasoning_effort": "low", "developer_instructions": prompt,
         }},
     }})
     response(broker, "probe-turn")
@@ -421,23 +463,31 @@ def scenario(broker: Broker, workspace: Path) -> dict[str, bool]:
                 read_id = None
                 next_read = time.monotonic() + 1
                 continue
-            require(method == INPUT_METHOD and recovered is None
-                    and params.get("isBlocking") is True
-                    and type(params.get("questions")) is list and len(params["questions"]) == 1,
-                    "unexpected-input-request")
+            require(method == broker.request_method and recovered is None,
+                    "unexpected-provider-request")
+            if permissions:
+                permission_request(params, workspace)
+            else:
+                require(params.get("isBlocking") is True
+                        and type(params.get("questions")) is list and len(params["questions"]) == 1,
+                        "unexpected-input-request")
             recovered = recovery(broker, thread_id, message)
-            broker.send({"id": message["id"], "result": {"answers": {}}})
+            broker.send({"id": message["id"], "result": {
+                "permissions": {}, "scope": "turn",
+            } if permissions else {"answers": {}}})
             next_read = time.monotonic() + 1
         if method == "turn/completed":
             require(params.get("turn", {}).get("status") == "completed", "turn-not-completed")
             completed = True
         if method == "thread/status/changed":
             idle = params.get("status", {}).get("type") == "idle"
-    require(recovered is not None, "input-request-not-observed")
+    require(recovered is not None, "request-not-observed")
     final = broker.observer.ok("status")
     require(final["unresolved_requests"] == [] and final["unhandled_message_count"] == 0,
             "request-not-resolved")
-    recovered["input_request_resolved"] = True
+    recovered["permission_approval_resolved" if permissions else "input_request_resolved"] = True
+    if permissions:
+        recovered["permission_grant_empty"] = True
     return recovered
 
 
@@ -483,7 +533,9 @@ def task_binding() -> TaskBinding:
 
 def run(
     root: Path, executable: Path, auth_file: Path, cancellation: Cancellation | None = None,
+    *, scenario_name: str = "input",
 ) -> dict[str, Any]:
+    require(scenario_name in {"input", "permissions"}, "scenario-invalid")
     binding = task_binding()
     require(root.is_absolute() and root.resolve() == root, "run-root-not-canonical")
     _private_directory(root, empty=True)
@@ -493,9 +545,14 @@ def run(
     for name in ("discovery-config", "config", "workspace", "tmp", "captures",
                  "preflight-captures", "journal"):
         (root / name).mkdir(mode=0o700)
-    _write_private_bytes(root / "discovery-config" / "config.toml", CONFIG.encode())
+    isolated_config = (
+        "suppress_unstable_features_warning = true\n" if scenario_name == "permissions" else ""
+    ) + CONFIG + (
+        "request_permissions_tool = " + ("true" if scenario_name == "permissions" else "false") + "\n"
+    )
+    _write_private_bytes(root / "discovery-config" / "config.toml", isolated_config.encode())
     paths = preflight(root, pinned, root / "discovery-config", "capture-discovery", isolated=False)
-    config = CONFIG + "".join(
+    config = isolated_config + "".join(
         "[[skills.config]]\npath = " + json.dumps(path, ensure_ascii=True) + "\nenabled = false\n"
         for path in paths
     )
@@ -527,7 +584,8 @@ def run(
         del auth, credentials, tokens, parts, claims
         spec = ProbeConfig("codex", root / "captures", CAPTURE_ID, pinned.path, root / "workspace")
         transport = JsonLineTransport(spec, pinned, environment=environment(root / "config", root / "tmp"))
-        broker = Broker(transport, binding, root / "journal" / "source.jsonl")
+        broker = Broker(transport, binding, root / "journal" / "source.jsonl",
+                        scenario_name=scenario_name)
         checks = scenario(broker, spec.workspace)
         transport.finish()
         finished = True
@@ -537,10 +595,13 @@ def run(
         require(report["analysis_complete"] and report["provider_warning_count"] == 0
                 and report["turn_count"] == 1 and report["thread_read_count"] >= 2,
                 "capture-analysis-incomplete")
+        if scenario_name == "permissions":
+            require(any(event["event"] == "thread_state" and "waitingOnApproval" in event["flags"]
+                        for event in report["events"]), "approval-state-not-observed")
         verify_journal(root, binding, report)
         checks["journal_matches_source"] = True
         return {
-            "schema_version": 1, "scope": "phase0-input-observer-restart",
+            "schema_version": 1, "scope": f"phase0-{scenario_name}-observer-restart",
             "qualification": "unqualified", "provider": "codex", "provider_version": "0.155.1",
             "source_capture_sha256": report["source_capture_sha256"],
             "executable_sha256": pinned.sha256, "checks": checks,
@@ -571,18 +632,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         cancellation = Cancellation()
         parser = SafeArgumentParser(
             prog="codex_qualification.py", allow_abbrev=False,
-            description="Bounded Phase0 input and observer-restart probe. Run inside an isolated "
+            description="Bounded Phase0 request and observer-restart probe. Run inside an isolated "
             "clilane task with an absolute socket, private state directories, and a fresh private "
             "run root outside the repository. Private provider captures are retained there.",
         )
         parser.add_argument("--run-root", required=True)
         parser.add_argument("--provider-executable", required=True)
+        parser.add_argument("--scenario", choices=("input", "permissions"), default="input",
+                            help="Input cancellation (default), or experimental permission approval "
+                            "with an empty grant; neither scenario executes provider commands.")
         parser.add_argument("--auth-file", required=True,
                             help="Private Codex subscription credentials valid for at least three minutes; "
                             "the probe removes its isolated copy after the run.")
         arguments = parser.parse_args(argv)
         result = run(Path(arguments.run_root), Path(arguments.provider_executable),
-                     Path(arguments.auth_file), cancellation)
+                     Path(arguments.auth_file), cancellation, scenario_name=arguments.scenario)
         print(json.dumps(result, sort_keys=True))
         return 0
     except (ProbeError, ObserverError, EvidenceError) as error:
