@@ -242,7 +242,7 @@ def run_hook(settings, event_name, value):
         fail(87)
 
 if sys.argv[1:] == ["--version"]:
-    sys.stdout.write("2.1.245 (Claude Code)\\n")
+    sys.stdout.write("2.1.283 (Claude Code)\\n")
     fail(0)
 arguments = sys.argv[1:]
 if arguments != {expected_arguments!r}:
@@ -294,7 +294,7 @@ import sys
 import time
 
 if sys.argv[1:] == ["--version"]:
-    sys.stdout.write("2.1.245 (Claude Code)\\n")
+    sys.stdout.write("2.1.283 (Claude Code)\\n")
     raise SystemExit(0)
 child = subprocess.Popen(
     [sys.executable, "-c", "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"],
@@ -455,7 +455,7 @@ class SuccessfulProtocolTests(ProbeDirectoryTestCase):
                 self.config("claude", executable, "capture-claude-success")
             )
         self.assertEqual(result.provider, "claude")
-        self.assertEqual(result.provider_version, "2.1.245")
+        self.assertEqual(result.provider_version, "2.1.283")
         self.assertEqual(result.message_count, 3)
         for suffix in provider_probe.CLAUDE_CAPTURE_SUFFIXES:
             receipt = self.receipt(f"capture-claude-success-{suffix}")

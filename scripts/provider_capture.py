@@ -155,10 +155,10 @@ PROVIDER_SPECS = {
     "claude": ProviderSpec(
         name="claude",
         executable="claude",
-        version="2.1.245",
+        version="2.1.283",
         version_outputs=(
-            b"2.1.245 (Claude Code)\n",
-            b"2.1.245 (Claude Code)\r\n",
+            b"2.1.283 (Claude Code)\n",
+            b"2.1.283 (Claude Code)\r\n",
         ),
         source_interface="claude-native-hook",
         mode="stdin",
