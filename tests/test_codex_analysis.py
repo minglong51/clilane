@@ -85,6 +85,7 @@ class CodexAnalysisTests(unittest.TestCase):
                 self.assertTrue(result["analysis_complete"])
                 opened, resolved = [event for event in result["events"] if event["request_id"]]
                 self.assertEqual(opened["request_id"], resolved["request_id"])
+                self.assertEqual((opened["request_method"], resolved["request_method"]), (method, method))
                 self.assertEqual(opened["blocking"], blocking)
                 self.assertEqual(opened["request_kind"], "input" if "requestUserInput" in method else "approval")
                 self.assertNotIn("private-", json.dumps(result))
