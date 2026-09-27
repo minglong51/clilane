@@ -124,10 +124,13 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v tests.test_provider_probe
 
       - name: Exercise Codex protocol and qualification boundaries
-        run: PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -v tests.test_codex_analysis tests.test_codex_observer tests.test_codex_qualification
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest -v tests.test_codex_analysis tests.test_codex_observer tests.test_codex_qualification tests.test_codex_replay
 
       - name: Verify provider evidence artifacts
         run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/provider_evidence.py --check
+
+      - name: Verify Codex replay evidence
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/codex_replay.py --check
 
       - name: Exercise lifecycle and local fleet
         shell: bash

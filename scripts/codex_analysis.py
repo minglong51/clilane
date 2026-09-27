@@ -85,6 +85,7 @@ class Request:
     turn_id: str
     item_id: str
     kind: str
+    method: str
     blocking: bool
     fingerprint: str
     resolved: bool = False
@@ -162,6 +163,7 @@ class CodexAnalysis:
                 "turn_id": turn.alias if turn else None,
                 "request_id": request.alias if request else None,
                 "request_kind": request.kind if request else None,
+                "request_method": request.method if request else None,
                 "blocking": request.blocking if request else None,
                 "state": state,
                 "flags": list(flags),
@@ -346,7 +348,7 @@ class CodexAnalysis:
             raise AnalysisError("identity-limit")
         request = Request(
             f"synthetic-codex-request-{len(self.requests) + 1}",
-            turn_id, item_id, kind, blocking, fingerprint,
+            turn_id, item_id, kind, method, blocking, fingerprint,
         )
         self.requests[key] = request
         self._emit(
