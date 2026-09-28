@@ -87,6 +87,24 @@ class ObserverFixture(unittest.TestCase):
 
 
 class ObserverFreshnessTests(ObserverFixture):
+    def test_account_update_cannot_establish_or_renew_source_freshness(self) -> None:
+        message = {"method": "account/updated", "params": {"authMode": "chatgpt", "planType": "pro"}}
+        self.bind_thread()
+        report = self.observe("O", message)
+        self.assertEqual(report["health"], "unknown")
+        with self.assertRaisesRegex(codex_observer.ObserverError, "^fresh-source-proof-required$"):
+            self.observer.handle(self.command("ready", recovered_count=0))
+        self.read_thread()
+        ready = self.observer.handle(self.command("ready", recovered_count=0))
+        self.now += 1_000_000_000
+        self.assertEqual(self.observe("O", message)["fresh_until_monotonic_ns"], ready["fresh_until_monotonic_ns"])
+        self.now = ready["fresh_until_monotonic_ns"]
+        with self.assertRaisesRegex(codex_observer.ObserverError, "^observer-expired$"):
+            self.observe("O", message)
+        expired = self.observer.report()
+        self.assertEqual((expired["health"], expired["state"]), ("unknown", "expired"))
+        self.assertIsNone(expired["fresh_until_monotonic_ns"])
+
     def test_bound_live_thread_read_is_required_before_ready(self) -> None:
         self.bind_thread()
         with self.assertRaisesRegex(codex_observer.ObserverError, "^fresh-source-proof-required$"):

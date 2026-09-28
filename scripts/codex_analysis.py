@@ -17,6 +17,15 @@ REQUEST_METHODS = {
     "item/permissions/requestApproval": "approval",
     "item/tool/requestUserInput": "input",
 }
+ACCOUNT_AUTH_MODES = {
+    "apikey", "chatgpt", "chatgptAuthTokens", "headers", "agentIdentity",
+    "personalAccessToken", "bedrockApiKey", "bedrockAccessKeys",
+}
+ACCOUNT_PLAN_TYPES = {
+    "free", "go", "plus", "pro", "prolite", "team", "self_serve_business_prolite",
+    "self_serve_business_usage_based", "business", "ent26", "enterprise_cbp_automation",
+    "enterprise_cbp_usage_based", "enterprise", "edu", "edu_plus", "edu_pro", "unknown",
+}
 IGNORED_NOTIFICATIONS = {
     "item/agentMessage/delta",
     "item/started",
@@ -31,6 +40,14 @@ IGNORED_NOTIFICATIONS = {
 
 class AnalysisError(Exception):
     pass
+
+
+def valid_account_update(params: dict[str, Any]) -> bool:
+    return not (set(params) - {"authMode", "planType"}) and all(
+        params.get(key) is None
+        or (type(params[key]) is str and params[key] in choices)
+        for key, choices in (("authMode", ACCOUNT_AUTH_MODES), ("planType", ACCOUNT_PLAN_TYPES))
+    )
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -358,6 +375,11 @@ class CodexAnalysis:
     def _notification(
         self, method: str, params: dict[str, Any], observed_ns: int
     ) -> None:
+        if method == "account/updated":
+            if not valid_account_update(params):
+                raise AnalysisError("invalid-account-update")
+            self.ignored += 1
+            return
         if method == "remoteControl/status/changed":
             _identifier(params.get("installationId"))
             _identifier(params.get("serverName"))

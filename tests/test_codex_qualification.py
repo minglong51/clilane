@@ -165,6 +165,24 @@ class ActionValidationTests(QualificationFixture):
 
 
 class BrokerDenialTests(QualificationFixture):
+    def test_account_update_is_allowed_while_awaiting_correlated_response(self) -> None:
+        transport = SyntheticTransport([
+            {"method": "account/updated", "params": {"authMode": "chatgpt", "planType": "pro"}},
+            {"id": "synthetic-read", "result": {"synthetic": True}},
+        ])
+        self.assertEqual(qualification.response(transport, "synthetic-read"), {"synthetic": True})
+
+    def test_account_update_rejects_invalid_metadata_before_response(self) -> None:
+        for params in ({"account": "private-sentinel"}, {"authMode": True}, {"planType": []}, {"planType": "private-sentinel"}):
+            with self.subTest(params=params):
+                transport = SyntheticTransport([
+                    {"method": "account/updated", "params": params},
+                    {"id": "synthetic-read", "result": {}},
+                ])
+                with self.assertRaisesRegex(qualification.ProbeError, "^invalid-account-update$"):
+                    qualification.response(transport, "synthetic-read")
+                self.assertEqual(len(transport.messages), 1)
+
     def test_command_prompt_quotes_target_in_root_with_spaces_and_shell_metacharacters(self) -> None:
         self.root = self.root / "private run;literal"
         self.root.mkdir(mode=0o700)
