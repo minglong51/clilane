@@ -35,7 +35,7 @@ METHODS = (
     "item/fileChange/requestApproval",
     "item/permissions/requestApproval",
 )
-PINNED_EXECUTABLE = "8eaf1ad12fe6bf89b1710330f58900014322c7c5af677e43be116d8ac5fc0a9e"
+PINNED_EXECUTABLE = "27ceb5f9b957b43a519efe4eaa3816a0bffb0a531a2c89af18840c0a3c016a7d"
 
 
 def synthetic_report(method: str = METHODS[0], *, idle_before_completion: bool = False, blocking: bool = True, waiting_flag: bool = True) -> dict[str, Any]:
@@ -71,7 +71,7 @@ def synthetic_report(method: str = METHODS[0], *, idle_before_completion: bool =
     report = analysis.finish()
     report.update(
         provider="codex",
-        provider_version="0.155.1",
+        provider_version="0.157.1",
         source_interface="codex-app-server",
         source_capture_sha256=hashlib.sha256(("synthetic-test-source:" + method).encode()).hexdigest(),
         executable_sha256=PINNED_EXECUTABLE,
@@ -237,7 +237,7 @@ class CodexReplayTests(unittest.TestCase):
         self.assert_rejected(report)
 
     def test_qualification_binding_and_capture_constants_cannot_be_promoted(self) -> None:
-        mutations = {"schema_version": [2, True, 1.0], "analyzer": ["codex-app-server-v2"], "analysis_complete": [False, 1, "true"], "qualification": ["qualified", "authoritative"], "task_binding": ["exact"], "source_health": ["fresh"], "session_binding": ["unknown"], "provider": ["claude"], "provider_version": ["0.155.2"], "source_interface": ["native_hook"], "capture_status": ["partial", "synthetic"]}
+        mutations = {"schema_version": [2, True, 1.0], "analyzer": ["codex-app-server-v2"], "analysis_complete": [False, 1, "true"], "qualification": ["qualified", "authoritative"], "task_binding": ["exact"], "source_health": ["fresh"], "session_binding": ["unknown"], "provider": ["claude"], "provider_version": ["0.155.1", "0.157.2"], "source_interface": ["native_hook"], "capture_status": ["partial", "synthetic"]}
         for key, values in mutations.items():
             for value in values:
                 with self.subTest(field=key, value=value):
@@ -252,9 +252,11 @@ class CodexReplayTests(unittest.TestCase):
                     report = copy.deepcopy(self.report)
                     report[key] = value
                     self.assert_rejected(report)
-        report = copy.deepcopy(self.report)
-        report["executable_sha256"] = "a" * 64
-        self.assert_rejected(report)
+        for executable_sha256 in ("a" * 64, "8eaf1ad12fe6bf89b1710330f58900014322c7c5af677e43be116d8ac5fc0a9e"):
+            with self.subTest(executable_sha256=executable_sha256):
+                report = copy.deepcopy(self.report)
+                report["executable_sha256"] = executable_sha256
+                self.assert_rejected(report)
 
     def test_manifest_drift_invalidates_previously_pinned_records(self) -> None:
         evidence = codex_replay.provider_evidence

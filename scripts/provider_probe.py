@@ -13,6 +13,7 @@ import re
 import selectors
 import secrets
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -29,7 +30,7 @@ COLLECTORS = {
     "codex": ROOT / "scripts/collect_codex_evidence.py",
     "kimi": ROOT / "scripts/collect_kimi_evidence.py",
 }
-PROVIDER_VERSIONS = {"claude": "2.1.283", "codex": "0.155.1", "kimi": "0.38.0"}
+PROVIDER_VERSIONS = {"claude": "2.1.283", "codex": "0.157.1", "kimi": "0.38.0"}
 PROBE_PROMPT = (
     "Reply with exactly CLILANE_PROBE_OK and no other text. Do not call tools."
 )
@@ -75,7 +76,7 @@ READ_CHUNK_BYTES = 16 * 1024
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 SOURCE_INTERFACES = {
     "claude": ("2.1.283", "claude-native-hook"),
-    "codex": ("0.155.1", "codex-app-server"),
+    "codex": ("0.157.1", "codex-app-server"),
     "kimi": ("0.38.0", "kimi-acp"),
 }
 CODEX_TARGETS = {
@@ -125,6 +126,7 @@ class ProbeConfig:
     provider_executable: Path
     workspace: Path
     config_dir: Path | None = None
+    oauth_fd: int | None = None
 
 
 @dataclass(frozen=True)
@@ -667,8 +669,12 @@ def sanitized_environment(source: dict[str, str] | None = None) -> dict[str, str
 
 
 def claude_environment(
-    config_dir: Path, workspace: Path, temporary_directory: Path
+    config_dir: Path,
+    workspace: Path,
+    temporary_directory: Path,
+    oauth_fd: int | None = None,
 ) -> dict[str, str]:
+    _validate_oauth_fd("claude", oauth_fd)
     environment = sanitized_environment()
     for name in (
         "CODEX_HOME",
@@ -701,7 +707,45 @@ def claude_environment(
             "TMPDIR": str(temporary_directory),
         }
     )
+    if oauth_fd is not None:
+        environment["CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"] = str(oauth_fd)
     return environment
+
+
+def _validate_oauth_fd(provider: str, oauth_fd: int | None) -> None:
+    if oauth_fd is None:
+        return
+    if provider != "claude":
+        raise ProbeError("oauth-fd-not-applicable")
+    if type(oauth_fd) is not int or oauth_fd < 3:
+        raise ProbeError("oauth-fd-invalid")
+
+
+def _duplicate_oauth_socket(
+    provider: str, oauth_fd: int | None
+) -> socket.socket | None:
+    _validate_oauth_fd(provider, oauth_fd)
+    if oauth_fd is None:
+        return None
+    descriptor: int | None = None
+    owned: socket.socket | None = None
+    valid = False
+    try:
+        descriptor = os.dup(oauth_fd)
+        owned = socket.socket(fileno=descriptor)
+        if owned.family != socket.AF_UNIX or owned.type != socket.SOCK_STREAM:
+            raise ProbeError("oauth-fd-invalid")
+        owned.getpeername()
+        valid = True
+        return owned
+    except (OSError, OverflowError) as error:
+        raise ProbeError("oauth-fd-invalid") from error
+    finally:
+        if not valid:
+            if owned is not None:
+                owned.close()
+            elif descriptor is not None:
+                os.close(descriptor)
 
 
 class ExactText:
@@ -953,13 +997,17 @@ def _verify_claude_receipts(
         if (
             event.get("session_id") != CLAUDE_SESSION_ID
             or event.get("cwd") != str(config.workspace)
-            or event.get("permission_mode") != "dontAsk"
             or event.get("hook_event_name") != expected_events[suffix]
         ):
             raise ProbeError("capture-event-invalid")
-        if suffix == "session-start" and (
-            event.get("source") != "startup" or event.get("model") != CLAUDE_MODEL
-        ):
+        if suffix == "session-start":
+            if (
+                event.get("source") != "startup"
+                or ("model" in event and event["model"] != CLAUDE_MODEL)
+                or ("permission_mode" in event and event["permission_mode"] != "default")
+            ):
+                raise ProbeError("capture-event-invalid")
+        elif event.get("permission_mode") != "default":
             raise ProbeError("capture-event-invalid")
         if suffix == "prompt-submit" and event.get("prompt") != PROBE_PROMPT:
             raise ProbeError("capture-event-invalid")
@@ -1129,6 +1177,7 @@ def _run_claude_process(
     stdout_path: Path,
     stderr_path: Path,
     temporary_directory: Path,
+    oauth_socket: socket.socket | None,
 ) -> tuple[int, int]:
     if config.config_dir is None:
         raise ProbeError("config-directory-required")
@@ -1152,7 +1201,7 @@ def _run_claude_process(
         "--tools",
         "",
         "--permission-mode",
-        "dontAsk",
+        "default",
         "--model",
         CLAUDE_MODEL,
         "--max-budget-usd",
@@ -1182,13 +1231,20 @@ def _run_claude_process(
                 stderr=subprocess.PIPE,
                 cwd=config.workspace,
                 env=claude_environment(
-                    config.config_dir, config.workspace, temporary_directory
+                    config.config_dir,
+                    config.workspace,
+                    temporary_directory,
+                    oauth_socket.fileno() if oauth_socket is not None else None,
                 ),
                 start_new_session=True,
                 close_fds=True,
+                pass_fds=(oauth_socket.fileno(),) if oauth_socket is not None else (),
             )
         except OSError as error:
             raise ProbeError("provider-spawn-failed") from error
+        finally:
+            if oauth_socket is not None:
+                oauth_socket.close()
         if process.stdin is None or process.stdout is None or process.stderr is None:
             raise ProbeError("provider-spawn-failed")
         selector.register(process.stdout, selectors.EVENT_READ, "stdout")
@@ -1252,7 +1308,11 @@ def _run_claude_process(
         _sync_and_close_descriptors((stdout_descriptor, stderr_descriptor))
 
 
-def run_claude_probe(config: ProbeConfig, pinned: PinnedExecutable) -> ProbeResult:
+def run_claude_probe(
+    config: ProbeConfig,
+    pinned: PinnedExecutable,
+    oauth_socket: socket.socket | None,
+) -> ProbeResult:
     if config.config_dir is None:
         raise ProbeError("config-directory-required")
     capture_ids = _claude_capture_ids(config.capture_id)
@@ -1291,6 +1351,7 @@ def run_claude_probe(config: ProbeConfig, pinned: PinnedExecutable) -> ProbeResu
         stdout_path,
         stderr_path,
         temporary_directory,
+        oauth_socket,
     )
     _verify_claude_receipts(config, pinned, capture_ids)
     return ProbeResult(
@@ -2073,6 +2134,7 @@ class KimiProtocol:
 def validate_config(config: ProbeConfig) -> ProbeConfig:
     if config.provider not in COLLECTORS:
         raise ProbeError("provider-invalid")
+    _validate_oauth_fd(config.provider, config.oauth_fd)
     if CAPTURE_ID_PATTERN.fullmatch(config.capture_id) is None:
         raise ProbeError("capture-id-invalid")
     if not config.provider_executable.is_absolute():
@@ -2116,19 +2178,22 @@ def validate_config(config: ProbeConfig) -> ProbeConfig:
         provider_executable=config.provider_executable,
         workspace=workspace,
         config_dir=config_dir,
+        oauth_fd=config.oauth_fd,
     )
 
 
 def run_probe(config: ProbeConfig) -> ProbeResult:
-    validated = validate_config(config)
-    expected_sha256 = load_executable_manifest(EXECUTABLE_MANIFEST_PATH)
-    pinned = pin_executable(
-        validated.provider,
-        validated.provider_executable,
-        expected_sha256,
-        validated.config_dir if validated.provider == "claude" else None,
-    )
+    oauth_socket = _duplicate_oauth_socket(config.provider, config.oauth_fd)
+    pinned: PinnedExecutable | None = None
     try:
+        validated = validate_config(config)
+        expected_sha256 = load_executable_manifest(EXECUTABLE_MANIFEST_PATH)
+        pinned = pin_executable(
+            validated.provider,
+            validated.provider_executable,
+            expected_sha256,
+            validated.config_dir if validated.provider == "claude" else None,
+        )
         validated = ProbeConfig(
             provider=validated.provider,
             capture_root=validated.capture_root,
@@ -2136,9 +2201,10 @@ def run_probe(config: ProbeConfig) -> ProbeResult:
             provider_executable=pinned.path,
             workspace=validated.workspace,
             config_dir=validated.config_dir,
+            oauth_fd=validated.oauth_fd,
         )
         if validated.provider == "claude":
-            return run_claude_probe(validated, pinned)
+            return run_claude_probe(validated, pinned, oauth_socket)
         transport = JsonLineTransport(validated, pinned)
         try:
             protocol: CodexProtocol | KimiProtocol
@@ -2160,10 +2226,21 @@ def run_probe(config: ProbeConfig) -> ProbeResult:
         finally:
             transport.close()
     finally:
-        _cleanup_pinned(pinned)
+        if oauth_socket is not None:
+            oauth_socket.close()
+        if pinned is not None:
+            _cleanup_pinned(pinned)
 
 
-def parse_args(argv: Sequence[str]) -> ProbeConfig:
+def _oauth_fd_argument(value: str) -> int:
+    if re.fullmatch(r"[0-9]{1,10}", value) is None:
+        raise argparse.ArgumentTypeError("invalid descriptor")
+    return int(value)
+
+
+def parse_args(
+    argv: Sequence[str], *, namespace: argparse.Namespace | None = None
+) -> ProbeConfig:
     parser = SafeArgumentParser(prog="provider_probe.py", allow_abbrev=False)
     parser.add_argument("--provider", required=True, choices=("claude", "codex", "kimi"))
     parser.add_argument("--capture-root", required=True)
@@ -2171,7 +2248,15 @@ def parse_args(argv: Sequence[str]) -> ProbeConfig:
     parser.add_argument("--provider-executable", required=True)
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--config-dir")
-    arguments = parser.parse_args(argv)
+    parser.add_argument(
+        "--oauth-fd",
+        type=_oauth_fd_argument,
+        help=(
+            "Consume an inherited connected Unix stream socket descriptor and close "
+            "it on exit. Pass a descriptor number, never a token."
+        ),
+    )
+    arguments = parser.parse_args(argv, namespace=namespace)
     return ProbeConfig(
         provider=arguments.provider,
         capture_root=Path(arguments.capture_root),
@@ -2179,18 +2264,35 @@ def parse_args(argv: Sequence[str]) -> ProbeConfig:
         provider_executable=Path(arguments.provider_executable),
         workspace=Path(arguments.workspace),
         config_dir=Path(arguments.config_dir) if arguments.config_dir else None,
+        oauth_fd=arguments.oauth_fd,
     )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    config: ProbeConfig | None = None
+    arguments = argparse.Namespace()
     try:
-        run_probe(parse_args(sys.argv[1:] if argv is None else argv))
+        config = parse_args(
+            sys.argv[1:] if argv is None else argv, namespace=arguments
+        )
+        run_probe(config)
     except ProbeError as error:
         print(f"provider_probe.py: {error}", file=sys.stderr)
         return 1
     except Exception:
         print("provider_probe.py: internal-error", file=sys.stderr)
         return 1
+    finally:
+        oauth_fd = (
+            config.oauth_fd
+            if config is not None
+            else getattr(arguments, "oauth_fd", None)
+        )
+        if type(oauth_fd) is int and oauth_fd >= 3:
+            try:
+                os.close(oauth_fd)
+            except (OSError, OverflowError):
+                pass
     return 0
 
 

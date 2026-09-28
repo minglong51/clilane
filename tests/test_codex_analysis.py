@@ -256,6 +256,29 @@ class CodexAnalysisTests(unittest.TestCase):
         self.assertFalse(self.analysis.finish()["analysis_complete"])
         self.assertEqual(self.analysis.finish()["unhandled_message_count"], 1)
 
+    def test_account_updates_are_validated_and_omitted_from_replay(self) -> None:
+        self.bind_thread()
+        self.start_turn()
+        for params in ({}, {"authMode": None, "planType": None}, {"authMode": "chatgpt", "planType": "pro"}, {"authMode": "apikey"}):
+            self.feed("O", {"method": "account/updated", "params": params})
+        self.complete_turn()
+        report = self.analysis.finish()
+        self.assertTrue(report["analysis_complete"])
+        self.assertEqual(report["ignored_notification_count"], 4)
+        self.assertEqual(report["unhandled_message_count"], 0)
+        self.assertEqual(report["source_health"], "unknown")
+        self.assertEqual([event["event"] for event in report["events"]], ["turn_started", "turn_completed"])
+        self.assertNotIn("authMode", json.dumps(report))
+        self.assertNotIn("planType", json.dumps(report))
+
+    def test_malformed_account_update_fails_without_disclosing_payload(self) -> None:
+        for params in ({"authMode": True}, {"authMode": []}, {"authMode": "private-mode-sentinel"}, {"planType": 1}, {"planType": {}}, {"planType": "private-plan-sentinel"}, {"account": "private-account-sentinel"}):
+            with self.subTest(params=params):
+                with self.assertRaisesRegex(codex_analysis.AnalysisError, "^invalid-account-update$"):
+                    self.feed("O", {"method": "account/updated", "params": params})
+                self.assertEqual(self.analysis.ignored, 0)
+                self.assertEqual(self.analysis.events, [])
+
     def test_protocol_limits_reject_excess_before_unbounded_growth(self) -> None:
         with self.assertRaisesRegex(codex_analysis.AnalysisError, "^line-limit$"):
             self.analysis.feed("O", 0, b"x" * (codex_analysis.MAX_LINE_BYTES + 1))

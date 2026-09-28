@@ -167,8 +167,8 @@ PROVIDER_SPECS = {
     "codex": ProviderSpec(
         name="codex",
         executable="codex",
-        version="0.155.1",
-        version_outputs=(b"codex-cli 0.155.1\n", b"codex-cli 0.155.1\r\n"),
+        version="0.157.1",
+        version_outputs=(b"codex-cli 0.157.1\n", b"codex-cli 0.157.1\r\n"),
         source_interface="codex-app-server",
         mode="command",
         command=("app-server", "--stdio", "--strict-config"),
@@ -195,9 +195,9 @@ CODEX_TARGETS = {
 
 CODEX_CODE_MODE_HOST_PINS = {
     (
-        "0.155.1",
-        "8eaf1ad12fe6bf89b1710330f58900014322c7c5af677e43be116d8ac5fc0a9e",
-    ): "59a702a68f1ef79fceaca644db46b8385ceefbb66035e78b8ade7cdcc21fda55",
+        "0.157.1",
+        "27ceb5f9b957b43a519efe4eaa3816a0bffb0a531a2c89af18840c0a3c016a7d",
+    ): "80fdf166c3da068282d5692f67a852715a327ae7dc1913abb93b8c3d3030103f",
 }
 
 

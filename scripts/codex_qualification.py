@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+from codex_analysis import valid_account_update
 from codex_observer import (
     FRESHNESS_NS, Journal, ObserverError, TaskBinding, _encode, _read_private,
 )
@@ -131,11 +132,13 @@ def response(transport: Any, identity: str) -> dict[str, Any]:
             params = message.get("params")
             require(type(params) is dict, "protocol-params-invalid")
             require(method in {
-                "remoteControl/status/changed", "account/rateLimits/updated",
+                "remoteControl/status/changed", "account/rateLimits/updated", "account/updated",
                 "thread/started", "thread/status/changed", "thread/settings/updated", "turn/started",
             }, "unexpected-provider-notification")
             if method == "remoteControl/status/changed":
                 require(params.get("status") == "disabled", "remote-control-enabled")
+            if method == "account/updated":
+                require(valid_account_update(params), "invalid-account-update")
             continue
         require(message.get("id") == identity and "error" not in message,
                 "protocol-response-mismatch")
@@ -767,7 +770,7 @@ def run(
             checks["provider_diagnostics_match_denial"] = True
         return {
             "schema_version": 1, "scope": f"phase0-{scenario_name}-observer-restart",
-            "qualification": "unqualified", "provider": "codex", "provider_version": "0.155.1",
+            "qualification": "unqualified", "provider": "codex", "provider_version": "0.157.1",
             "source_capture_sha256": report["source_capture_sha256"],
             "executable_sha256": pinned.sha256, "checks": checks,
             "message_count": report["message_count"], "thread_read_count": report["thread_read_count"],

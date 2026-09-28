@@ -6,12 +6,14 @@ import importlib.util
 import io
 import json
 import os
+import socket
 import stat
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from dataclasses import replace
 from unittest import mock
 
 
@@ -58,7 +60,7 @@ def emit(value):
     sys.stdout.flush()
 
 if sys.argv[1:] == ["--version"]:
-    sys.stdout.write("codex-cli 0.155.1\\n")
+    sys.stdout.write("codex-cli 0.157.1\\n")
     fail(0)
 if sys.argv[1:] != ["app-server", "--stdio", "--strict-config"]:
     fail(81)
@@ -167,7 +169,17 @@ if sys.stdin.buffer.readline() != b"":
     return write_executable(path, source)
 
 
-def fake_claude(path: Path, workspace: Path, config_dir: Path) -> Path:
+def fake_claude(
+    path: Path,
+    workspace: Path,
+    config_dir: Path,
+    *,
+    oauth_payload_sha256: str | None = None,
+    unrelated_descriptor: int | None = None,
+    outcome: str = "complete",
+    hook_permission_mode: str = "default",
+    session_start_fields: dict[str, object] | None = None,
+) -> Path:
     workspace = workspace.resolve()
     config_dir = config_dir.resolve()
     expected_arguments = [
@@ -189,7 +201,7 @@ def fake_claude(path: Path, workspace: Path, config_dir: Path) -> Path:
         "--tools",
         "",
         "--permission-mode",
-        "dontAsk",
+        "default",
         "--model",
         provider_probe.CLAUDE_MODEL,
         "--max-budget-usd",
@@ -200,10 +212,12 @@ def fake_claude(path: Path, workspace: Path, config_dir: Path) -> Path:
         provider_probe.CLAUDE_SESSION_ID,
     ]
     source = f'''#!/usr/bin/env python3
+import hashlib
 import json
 import os
 import subprocess
 import sys
+import time
 
 def fail(code):
     raise SystemExit(code)
@@ -244,11 +258,48 @@ def run_hook(settings, event_name, value):
 if sys.argv[1:] == ["--version"]:
     sys.stdout.write("2.1.283 (Claude Code)\\n")
     fail(0)
+oauth_fd = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR")
+expected_oauth_sha256 = {oauth_payload_sha256!r}
+if expected_oauth_sha256 is None:
+    if oauth_fd is not None:
+        fail(96)
+else:
+    if oauth_fd is None or not oauth_fd.isascii() or not oauth_fd.isdecimal() or int(oauth_fd) < 3:
+        fail(96)
+    payload = bytearray()
+    while True:
+        chunk = os.read(int(oauth_fd), 4096)
+        if not chunk:
+            break
+        payload.extend(chunk)
+        if len(payload) > 4096:
+            fail(97)
+    os.close(int(oauth_fd))
+    if hashlib.sha256(payload).hexdigest() != expected_oauth_sha256:
+        fail(97)
+    if any(payload.decode("ascii") in value for value in (*sys.argv, *os.environ.values())):
+        fail(97)
+unrelated_descriptor = {unrelated_descriptor!r}
+if unrelated_descriptor is not None:
+    try:
+        os.fstat(unrelated_descriptor)
+    except OSError:
+        pass
+    else:
+        fail(98)
+if {outcome!r} == "fail":
+    sys.stdin.buffer.read()
+    fail(99)
+if {outcome!r} == "timeout":
+    sys.stdin.buffer.read()
+    time.sleep(60)
 arguments = sys.argv[1:]
 if arguments != {expected_arguments!r}:
     fail(88)
 if os.environ.get("CLAUDE_CONFIG_DIR") != {str(config_dir)!r}:
     fail(93)
+if os.environ.get("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB") != "1":
+    fail(94)
 for name in (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
@@ -258,6 +309,13 @@ for name in (
     "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY",
     "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_REMOTE",
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+    "CLAUDE_CODE_IS_COWORK",
+    "CLAUDE_AGENT_SDK_VERSION",
+    "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD",
+    "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING",
+    "CLAUDE_CODE_BACKGROUND_SESSION_ID",
     "CLILANE_PRIVACY_CANARY",
 ):
     if name in os.environ:
@@ -272,9 +330,9 @@ common = {{
     "session_id": {provider_probe.CLAUDE_SESSION_ID!r},
     "transcript_path": {str(config_dir / 'transcript.jsonl')!r},
     "cwd": {str(workspace)!r},
-    "permission_mode": "dontAsk",
 }}
-run_hook(settings, "SessionStart", {{**common, "hook_event_name":"SessionStart", "source":"startup", "model":{provider_probe.CLAUDE_MODEL!r}}})
+run_hook(settings, "SessionStart", {{**common, "hook_event_name":"SessionStart", "source":"startup", **{(session_start_fields or {})!r}}})
+common["permission_mode"] = {hook_permission_mode!r}
 prompt = sys.stdin.buffer.read()
 if prompt != {provider_probe.PROBE_PROMPT!r}.encode("ascii"):
     fail(95)
@@ -358,7 +416,7 @@ import json
 import sys
 
 if sys.argv[1:] == ["--version"]:
-    sys.stdout.write("codex-cli 0.155.1\\n")
+    sys.stdout.write("codex-cli 0.157.1\\n")
     raise SystemExit(0)
 if sys.argv[1:] != ["app-server", "--stdio", "--strict-config"]:
     raise SystemExit(81)
@@ -488,7 +546,7 @@ class SuccessfulProtocolTests(ProbeDirectoryTestCase):
                 self.config("codex", executable, "capture-codex-success")
             )
         self.assertEqual(result.provider, "codex")
-        self.assertEqual(result.provider_version, "0.155.1")
+        self.assertEqual(result.provider_version, "0.157.1")
         receipt = self.receipt("capture-codex-success")
         self.assertEqual(receipt["capture_status"], "complete")
         self.assertEqual(receipt["termination"]["exit_code"], 0)
@@ -510,6 +568,440 @@ class SuccessfulProtocolTests(ProbeDirectoryTestCase):
         receipt = self.receipt("capture-kimi-success")
         self.assertEqual(receipt["capture_status"], "complete")
         self.assertEqual(receipt["termination"]["exit_code"], 0)
+
+
+class ClaudeHookValidationTests(ProbeDirectoryTestCase):
+    def test_probe_rejects_hook_permission_mode_drift(self) -> None:
+        executable = fake_claude(
+            self.base / "fake-claude", self.workspace, self.config_dir,
+            hook_permission_mode="dontAsk",
+        )
+        with self.pinned_manifest("claude", executable):
+            with self.assertRaisesRegex(provider_probe.ProbeError, "^capture-event-invalid$"):
+                provider_probe.run_probe(
+                    self.config("claude", executable, "capture-claude-mode-drift")
+                )
+
+    def test_accepts_matching_optional_start_metadata(self) -> None:
+        executable = fake_claude(
+            self.base / "fake-claude", self.workspace, self.config_dir,
+            session_start_fields={"model": provider_probe.CLAUDE_MODEL, "permission_mode": "default"},
+        )
+        with self.pinned_manifest("claude", executable):
+            result = provider_probe.run_probe(
+                self.config("claude", executable, "capture-claude-start-metadata")
+            )
+        self.assertEqual(result.message_count, 3)
+
+    def assert_start_metadata_rejected(self, fields: dict[str, object]) -> None:
+        executable = fake_claude(
+            self.base / "fake-claude", self.workspace, self.config_dir,
+            session_start_fields=fields,
+        )
+        with self.pinned_manifest("claude", executable):
+            with self.assertRaisesRegex(provider_probe.ProbeError, "^capture-event-invalid$"):
+                provider_probe.run_probe(
+                    self.config("claude", executable, "capture-claude-start-invalid")
+                )
+
+    def test_rejects_conflicting_start_model(self) -> None:
+        self.assert_start_metadata_rejected({"model": "unexpected-model"})
+
+    def test_rejects_explicit_null_start_model(self) -> None:
+        self.assert_start_metadata_rejected({"model": None})
+
+    def test_rejects_conflicting_start_permission_mode(self) -> None:
+        self.assert_start_metadata_rejected({"permission_mode": "dontAsk"})
+
+
+class OAuthDescriptorTests(ProbeDirectoryTestCase):
+    payload = b"synthetic-socket-only-oauth-sentinel"
+
+    def oauth_config(self, executable: Path, descriptor: int) -> object:
+        return replace(
+            self.config("claude", executable, "capture-claude-oauth"),
+            oauth_fd=descriptor,
+        )
+
+    def arguments(self, descriptor: str) -> tuple[str, ...]:
+        return (
+            "--provider", "claude",
+            "--capture-root", str(self.capture_root),
+            "--capture-id", "capture-claude-oauth",
+            "--provider-executable", str(self.base / "fake-claude"),
+            "--workspace", str(self.workspace),
+            "--config-dir", str(self.config_dir),
+            "--oauth-fd", descriptor,
+        )
+
+    def assert_closed(self, descriptor: int) -> None:
+        with self.assertRaises(OSError):
+            os.fstat(descriptor)
+
+    def assert_no_persisted_payload(self) -> None:
+        for path in self.base.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(self.payload, path.read_bytes(), str(path))
+
+    def open_descriptors(self) -> set[int]:
+        result = set()
+        for name in os.listdir("/dev/fd"):
+            if name.isdecimal():
+                descriptor = int(name)
+                try:
+                    os.fstat(descriptor)
+                except OSError:
+                    continue
+                result.add(descriptor)
+        return result
+
+    def test_child_reads_only_owned_socket_without_persisting_payload(self) -> None:
+        with contextlib.ExitStack() as stack:
+            source, destination = socket.socketpair()
+            unrelated, unrelated_peer = socket.socketpair()
+            for connection in (source, destination, unrelated, unrelated_peer):
+                stack.enter_context(connection)
+            source.sendall(self.payload)
+            source.shutdown(socket.SHUT_WR)
+            os.set_inheritable(unrelated.fileno(), True)
+            executable = fake_claude(
+                self.base / "fake-claude", self.workspace, self.config_dir,
+                oauth_payload_sha256=hashlib.sha256(self.payload).hexdigest(),
+                unrelated_descriptor=unrelated.fileno(),
+            )
+            inherited = []
+            popen = provider_probe.subprocess.Popen
+            matches = provider_probe._executable_matches
+            prompt_closure_checks = []
+
+            def spawn(*args, **kwargs):
+                passed = kwargs.get("pass_fds", ())
+                self.assertEqual(len(passed), 1)
+                self.assertIs(kwargs["close_fds"], True)
+                self.assertNotEqual(passed[0], destination.fileno())
+                self.assertEqual(
+                    kwargs["env"]["CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"],
+                    str(passed[0]),
+                )
+                self.assertNotIn(self.payload.decode("ascii"), repr(args))
+                self.assertNotIn(self.payload.decode("ascii"), repr(kwargs["env"]))
+                os.fstat(passed[0])
+                inherited.append(passed[0])
+                return popen(*args, **kwargs)
+
+            def verify_closed_after_spawn(pinned):
+                if inherited:
+                    self.assert_closed(inherited[0])
+                    prompt_closure_checks.append(True)
+                return matches(pinned)
+
+            forbidden = {
+                "ANTHROPIC_API_KEY": "host-value",
+                "ANTHROPIC_AUTH_TOKEN": "host-value",
+                "CLAUDE_CODE_OAUTH_TOKEN": "host-value",
+                "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR": "999999",
+                "CLAUDE_CODE_REMOTE": "host-value",
+                "CLAUDE_SECURESTORAGE_CONFIG_DIR": "host-value",
+                "CLAUDE_CODE_IS_COWORK": "host-value",
+                "CLAUDE_AGENT_SDK_VERSION": "host-value",
+                "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD": "host-value",
+                "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING": "host-value",
+                "CLAUDE_CODE_BACKGROUND_SESSION_ID": "host-value",
+            }
+            with self.pinned_manifest("claude", executable), mock.patch.dict(
+                os.environ, forbidden
+            ), mock.patch.object(
+                provider_probe.subprocess, "Popen", side_effect=spawn
+            ), mock.patch.object(
+                provider_probe, "_executable_matches", side_effect=verify_closed_after_spawn
+            ):
+                result = provider_probe.run_probe(
+                    self.oauth_config(executable, destination.fileno())
+                )
+                self.assertEqual(
+                    os.environ["CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"], "999999"
+                )
+            self.assertEqual(result.message_count, 3)
+            self.assertEqual(len(inherited), 1)
+            self.assertTrue(prompt_closure_checks)
+            self.assert_closed(inherited[0])
+            os.fstat(destination.fileno())
+            for suffix in provider_probe.CLAUDE_CAPTURE_SUFFIXES:
+                receipt = self.receipt(f"capture-claude-oauth-{suffix}")
+                self.assertEqual(receipt["capture_status"], "complete")
+            self.assert_no_persisted_payload()
+
+    def test_default_does_not_inherit_host_oauth_descriptor_or_open_socket(self) -> None:
+        unrelated, unrelated_peer = socket.socketpair()
+        with unrelated, unrelated_peer:
+            os.set_inheritable(unrelated.fileno(), True)
+            executable = fake_claude(
+                self.base / "fake-claude", self.workspace, self.config_dir,
+                unrelated_descriptor=unrelated.fileno(),
+            )
+            popen = provider_probe.subprocess.Popen
+
+            def spawn(*args, **kwargs):
+                self.assertEqual(kwargs.get("pass_fds", ()), ())
+                self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", kwargs["env"])
+                self.assertIs(kwargs["close_fds"], True)
+                return popen(*args, **kwargs)
+
+            with self.pinned_manifest("claude", executable), mock.patch.dict(
+                os.environ,
+                {"CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR": str(unrelated.fileno())},
+            ), mock.patch.object(provider_probe.subprocess, "Popen", side_effect=spawn):
+                result = provider_probe.run_probe(
+                    self.config("claude", executable, "capture-claude-no-oauth")
+                )
+            self.assertEqual(result.message_count, 3)
+            os.fstat(unrelated.fileno())
+
+    def test_api_rejects_non_integer_and_stdio_descriptors_before_spawn(self) -> None:
+        for value in (True, False, -1, 0, 1, 2, 3.0, "3", [], {}):
+            with self.subTest(value=value), mock.patch.object(
+                provider_probe.subprocess, "Popen"
+            ) as popen:
+                with self.assertRaisesRegex(provider_probe.ProbeError, "^oauth-fd-invalid$"):
+                    provider_probe.run_probe(
+                        self.oauth_config(self.base / "unused", value)
+                    )
+                popen.assert_not_called()
+
+    def test_api_rejects_other_providers_without_closing_caller_socket(self) -> None:
+        source, destination = socket.socketpair()
+        with source, destination:
+            for provider in ("codex", "kimi"):
+                with self.subTest(provider=provider), mock.patch.object(
+                    provider_probe.subprocess, "Popen"
+                ) as popen:
+                    config = replace(
+                        self.config(provider, self.base / "unused", "capture-other-oauth"),
+                        oauth_fd=destination.fileno(),
+                    )
+                    with self.assertRaisesRegex(
+                        provider_probe.ProbeError, "^oauth-fd-not-applicable$"
+                    ):
+                        provider_probe.run_probe(config)
+                    popen.assert_not_called()
+                    os.fstat(destination.fileno())
+
+    def test_api_rejects_regular_file_and_pipe_without_consuming_them(self) -> None:
+        with tempfile.TemporaryFile(dir=self.base) as regular:
+            regular.write(self.payload)
+            regular.seek(0)
+            read_fd, write_fd = os.pipe()
+            try:
+                os.write(write_fd, self.payload)
+                for descriptor in (regular.fileno(), read_fd, write_fd):
+                    with self.subTest(descriptor=descriptor), mock.patch.object(
+                        provider_probe.subprocess, "Popen"
+                    ) as popen:
+                        with self.assertRaisesRegex(
+                            provider_probe.ProbeError, "^oauth-fd-invalid$"
+                        ):
+                            provider_probe.run_probe(
+                                self.oauth_config(self.base / "unused", descriptor)
+                            )
+                        popen.assert_not_called()
+                        os.fstat(descriptor)
+                self.assertEqual(regular.read(), self.payload)
+                self.assertEqual(os.read(read_fd, len(self.payload)), self.payload)
+            finally:
+                os.close(read_fd)
+                os.close(write_fd)
+
+    def test_api_rejects_closed_descriptor(self) -> None:
+        source, destination = socket.socketpair()
+        with source:
+            descriptor = destination.fileno()
+            destination.close()
+            with mock.patch.object(provider_probe.subprocess, "Popen") as popen:
+                with self.assertRaisesRegex(provider_probe.ProbeError, "^oauth-fd-invalid$"):
+                    provider_probe.run_probe(self.oauth_config(self.base / "unused", descriptor))
+                popen.assert_not_called()
+            self.assert_closed(descriptor)
+
+    def test_api_rejects_unconnected_and_listening_unix_sockets(self) -> None:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            for listening in (False, True):
+                if listening:
+                    connection.bind(str(self.base / "listener"))
+                    connection.listen(1)
+                with self.subTest(listening=listening), mock.patch.object(
+                    provider_probe.subprocess, "Popen"
+                ) as popen:
+                    with self.assertRaisesRegex(provider_probe.ProbeError, "^oauth-fd-invalid$"):
+                        provider_probe.run_probe(
+                            self.oauth_config(self.base / "unused", connection.fileno())
+                        )
+                    popen.assert_not_called()
+                    os.fstat(connection.fileno())
+
+    def test_api_rejects_connected_unix_datagram_socket(self) -> None:
+        source, destination = socket.socketpair(type=socket.SOCK_DGRAM)
+        with source, destination, mock.patch.object(provider_probe.subprocess, "Popen") as popen:
+            with self.assertRaisesRegex(provider_probe.ProbeError, "^oauth-fd-invalid$"):
+                provider_probe.run_probe(
+                    self.oauth_config(self.base / "unused", destination.fileno())
+                )
+            popen.assert_not_called()
+            os.fstat(destination.fileno())
+
+    def test_api_rejects_connected_inet_socket(self) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            with socket.create_connection(listener.getsockname(), timeout=1) as source:
+                destination, _address = listener.accept()
+                with destination, mock.patch.object(provider_probe.subprocess, "Popen") as popen:
+                    with self.assertRaisesRegex(provider_probe.ProbeError, "^oauth-fd-invalid$"):
+                        provider_probe.run_probe(
+                            self.oauth_config(self.base / "unused", destination.fileno())
+                        )
+                    popen.assert_not_called()
+                    os.fstat(destination.fileno())
+
+    def assert_failed_provider_closes_duplicate(self, outcome: str, reason: str) -> None:
+        source, destination = socket.socketpair()
+        with source, destination:
+            source.sendall(self.payload)
+            source.shutdown(socket.SHUT_WR)
+            executable = fake_claude(
+                self.base / "fake-claude", self.workspace, self.config_dir,
+                oauth_payload_sha256=hashlib.sha256(self.payload).hexdigest(),
+                outcome=outcome,
+            )
+            inherited = []
+            popen = provider_probe.subprocess.Popen
+
+            def spawn(*args, **kwargs):
+                inherited.extend(kwargs["pass_fds"])
+                return popen(*args, **kwargs)
+
+            with self.pinned_manifest("claude", executable), mock.patch.object(
+                provider_probe, "TURN_TIMEOUT_SECONDS", 0.5
+            ), mock.patch.object(provider_probe.subprocess, "Popen", side_effect=spawn):
+                with self.assertRaisesRegex(provider_probe.ProbeError, f"^{reason}$"):
+                    provider_probe.run_probe(self.oauth_config(executable, destination.fileno()))
+            self.assertEqual(len(inherited), 1)
+            self.assert_closed(inherited[0])
+            os.fstat(destination.fileno())
+            self.assert_no_persisted_payload()
+
+    def test_provider_failure_closes_owned_duplicate_and_preserves_caller_socket(self) -> None:
+        self.assert_failed_provider_closes_duplicate("fail", "provider-failed")
+
+    def test_provider_timeout_closes_owned_duplicate_and_preserves_caller_socket(self) -> None:
+        self.assert_failed_provider_closes_duplicate("timeout", "provider-timeout")
+
+    def test_spawn_failure_closes_owned_duplicate_and_preserves_caller_socket(self) -> None:
+        source, destination = socket.socketpair()
+        with source, destination:
+            executable = fake_claude(self.base / "fake-claude", self.workspace, self.config_dir)
+            inherited = []
+
+            def fail_spawn(*_args, **kwargs):
+                inherited.extend(kwargs["pass_fds"])
+                os.fstat(inherited[0])
+                raise OSError("synthetic private spawn detail")
+
+            with self.pinned_manifest("claude", executable), mock.patch.object(
+                provider_probe.subprocess, "Popen", side_effect=fail_spawn
+            ):
+                with self.assertRaisesRegex(provider_probe.ProbeError, "^provider-spawn-failed$"):
+                    provider_probe.run_probe(self.oauth_config(executable, destination.fileno()))
+            self.assertEqual(len(inherited), 1)
+            self.assert_closed(inherited[0])
+            os.fstat(destination.fileno())
+
+    def test_pre_spawn_failure_does_not_leak_duplicate_or_consume_payload(self) -> None:
+        source, destination = socket.socketpair()
+        with source, destination:
+            source.sendall(self.payload)
+            before = self.open_descriptors()
+            with mock.patch.object(
+                provider_probe, "load_executable_manifest",
+                side_effect=provider_probe.ProbeError("executable-manifest-invalid"),
+            ), mock.patch.object(provider_probe.subprocess, "Popen") as popen:
+                with self.assertRaisesRegex(provider_probe.ProbeError, "^executable-manifest-invalid$"):
+                    provider_probe.run_probe(self.oauth_config(self.base / "unused", destination.fileno()))
+            popen.assert_not_called()
+            self.assertEqual(self.open_descriptors(), before)
+            self.assertEqual(destination.recv(len(self.payload)), self.payload)
+
+    def test_cli_closes_inherited_descriptor_on_success(self) -> None:
+        source, destination = socket.socketpair()
+        with source, destination:
+            descriptor = destination.detach()
+            try:
+                with mock.patch.object(provider_probe, "run_probe") as run_probe:
+                    self.assertEqual(provider_probe.main(self.arguments(str(descriptor))), 0)
+                self.assertEqual(run_probe.call_args.args[0].oauth_fd, descriptor)
+                self.assert_closed(descriptor)
+            finally:
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
+
+    def test_cli_closes_inherited_descriptor_and_redacts_failures(self) -> None:
+        for error, expected in (
+            (provider_probe.ProbeError("provider-failed"), "provider-failed"),
+            (RuntimeError(self.payload.decode("ascii")), "internal-error"),
+        ):
+            source, destination = socket.socketpair()
+            with self.subTest(error=type(error).__name__), source, destination:
+                descriptor = destination.detach()
+                try:
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with mock.patch.object(provider_probe, "run_probe", side_effect=error):
+                        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                            self.assertEqual(provider_probe.main(self.arguments(str(descriptor))), 1)
+                    self.assert_closed(descriptor)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertEqual(stderr.getvalue(), f"provider_probe.py: {expected}\n")
+                    self.assertNotIn(self.payload.decode("ascii"), stderr.getvalue())
+                finally:
+                    with contextlib.suppress(OSError):
+                        os.close(descriptor)
+
+    def test_cli_rejects_non_decimal_descriptor_without_echoing_argument(self) -> None:
+        for value in ("synthetic-private-token", "3.0", "+3", " 3", "٣", "-1"):
+            with self.subTest(value=value), mock.patch.object(provider_probe, "run_probe") as run_probe:
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+                    provider_probe.main(self.arguments(value))
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn("error: invalid arguments", stderr.getvalue())
+                self.assertNotIn(value, stderr.getvalue())
+                run_probe.assert_not_called()
+
+    def test_cli_parse_failure_closes_already_recognized_inherited_descriptor(self) -> None:
+        source, destination = socket.socketpair()
+        with source, destination:
+            descriptor = destination.detach()
+            try:
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+                    provider_probe.main((*self.arguments(str(descriptor)), "--synthetic-private-argument"))
+                self.assertEqual(raised.exception.code, 2)
+                self.assertNotIn("synthetic-private-argument", stderr.getvalue())
+                self.assert_closed(descriptor)
+            finally:
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
+
+    def test_cli_never_closes_stdio(self) -> None:
+        for descriptor in (0, 1, 2):
+            with self.subTest(descriptor=descriptor):
+                before = os.fstat(descriptor)
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    try:
+                        code = provider_probe.main(self.arguments(str(descriptor)))
+                    except SystemExit as error:
+                        code = error.code
+                self.assertIn(code, (1, 2))
+                self.assertEqual(os.fstat(descriptor), before)
 
 
 class AbortProtocolTests(ProbeDirectoryTestCase):
