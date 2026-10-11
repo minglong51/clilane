@@ -8,9 +8,9 @@
       "source_interface": "claude-native-hook"
     },
     {
-      "executable_sha256": "27ceb5f9b957b43a519efe4eaa3816a0bffb0a531a2c89af18840c0a3c016a7d",
+      "executable_sha256": "74c6a6d263f40d65f99c27a815275f5b4ed0bcc2baecc396b4cf3255498bdfc0",
       "provider": "codex",
-      "provider_version": "0.157.1",
+      "provider_version": "0.162.1",
       "source_interface": "codex-app-server"
     },
     {

@@ -62,7 +62,7 @@ def emit(value):
     sys.stdout.flush()
 
 if sys.argv[1:] == ["--version"]:
-    sys.stdout.write("codex-cli 0.157.1\\n")
+    sys.stdout.write("codex-cli 0.162.1\\n")
     fail(0)
 if sys.argv[1:] != ["app-server", "--stdio", "--strict-config"]:
     fail(81)
@@ -395,7 +395,7 @@ def cancel(_number, _frame):
         publish({str(cleanup_path)!r}, "cleanup")
 
 if sys.argv[1:] == ["--version"]:
-    sys.stdout.write({('2.1.283 (Claude Code)' if provider == 'claude' else 'codex-cli 0.157.1')!r} + "\\n")
+    sys.stdout.write({('2.1.283 (Claude Code)' if provider == 'claude' else 'codex-cli 0.162.1')!r} + "\\n")
     raise SystemExit(0)
 publish({str(process_group_path)!r}, str(os.getpgrp()))
 signal.signal(signal.SIGTERM, cancel)
@@ -476,7 +476,7 @@ import json
 import sys
 
 if sys.argv[1:] == ["--version"]:
-    sys.stdout.write("codex-cli 0.157.1\\n")
+    sys.stdout.write("codex-cli 0.162.1\\n")
     raise SystemExit(0)
 if sys.argv[1:] != ["app-server", "--stdio", "--strict-config"]:
     raise SystemExit(81)
@@ -606,7 +606,7 @@ class SuccessfulProtocolTests(ProbeDirectoryTestCase):
                 self.config("codex", executable, "capture-codex-success")
             )
         self.assertEqual(result.provider, "codex")
-        self.assertEqual(result.provider_version, "0.157.1")
+        self.assertEqual(result.provider_version, "0.162.1")
         receipt = self.receipt("capture-codex-success")
         self.assertEqual(receipt["capture_status"], "complete")
         self.assertEqual(receipt["termination"]["exit_code"], 0)
