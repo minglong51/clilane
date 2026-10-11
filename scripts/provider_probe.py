@@ -85,10 +85,21 @@ CODEX_TARGETS = {
     ("Linux", "aarch64"): ("codex-linux-arm64", "aarch64-unknown-linux-musl"),
     ("Linux", "x86_64"): ("codex-linux-x64", "x86_64-unknown-linux-musl"),
 }
+_cli_cancellation_requested = False
 
 
 class ProbeError(Exception):
     pass
+
+
+def _request_cli_cancellation(_number: int, _frame: Any) -> None:
+    global _cli_cancellation_requested
+    _cli_cancellation_requested = True
+
+
+def _check_cli_cancellation() -> None:
+    if _cli_cancellation_requested:
+        raise ProbeError("probe-cancelled")
 
 
 class SafeArgumentParser(argparse.ArgumentParser):
@@ -1224,6 +1235,7 @@ def _run_claude_process(
     try:
         selector = selectors.DefaultSelector()
         try:
+            _check_cli_cancellation()
             process = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE,
@@ -1245,6 +1257,7 @@ def _run_claude_process(
         finally:
             if oauth_socket is not None:
                 oauth_socket.close()
+        _check_cli_cancellation()
         if process.stdin is None or process.stdout is None or process.stderr is None:
             raise ProbeError("provider-spawn-failed")
         selector.register(process.stdout, selectors.EVENT_READ, "stdout")
@@ -1262,6 +1275,7 @@ def _run_claude_process(
             raise ProbeError("provider-input-failed") from error
         deadline = time.monotonic() + TURN_TIMEOUT_SECONDS
         while selector.get_map() or process.poll() is None:
+            _check_cli_cancellation()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise ProbeError("provider-timeout")
@@ -1567,6 +1581,7 @@ class JsonLineTransport:
         return remaining
 
     def send(self, message: dict[str, Any]) -> None:
+        _check_cli_cancellation()
         if self.stdin_closed or self.process.poll() is not None:
             raise ProbeError("collector-not-running")
         try:
@@ -1605,6 +1620,7 @@ class JsonLineTransport:
         return raw
 
     def _read_ready(self, deadline: float) -> None:
+        _check_cli_cancellation()
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise ProbeError("protocol-timeout")
@@ -1645,6 +1661,7 @@ class JsonLineTransport:
 
     def receive(self, deadline: float) -> dict[str, Any]:
         while True:
+            _check_cli_cancellation()
             raw = self._line()
             if raw is not None:
                 self.message_count += 1
@@ -2183,6 +2200,7 @@ def validate_config(config: ProbeConfig) -> ProbeConfig:
 
 
 def run_probe(config: ProbeConfig) -> ProbeResult:
+    _check_cli_cancellation()
     oauth_socket = _duplicate_oauth_socket(config.provider, config.oauth_fd)
     pinned: PinnedExecutable | None = None
     try:
@@ -2203,10 +2221,12 @@ def run_probe(config: ProbeConfig) -> ProbeResult:
             config_dir=validated.config_dir,
             oauth_fd=validated.oauth_fd,
         )
+        _check_cli_cancellation()
         if validated.provider == "claude":
             return run_claude_probe(validated, pinned, oauth_socket)
         transport = JsonLineTransport(validated, pinned)
         try:
+            _check_cli_cancellation()
             protocol: CodexProtocol | KimiProtocol
             if validated.provider == "codex":
                 protocol = CodexProtocol(transport, validated.workspace)
@@ -2269,13 +2289,23 @@ def parse_args(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    global _cli_cancellation_requested
     config: ProbeConfig | None = None
     arguments = argparse.Namespace()
+    previous_cancellation = _cli_cancellation_requested
+    previous_handlers: dict[int, Any] = {}
+    _cli_cancellation_requested = False
     try:
+        for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            previous_handlers[number] = signal.signal(
+                number, _request_cli_cancellation
+            )
         config = parse_args(
             sys.argv[1:] if argv is None else argv, namespace=arguments
         )
+        _check_cli_cancellation()
         run_probe(config)
+        _check_cli_cancellation()
     except ProbeError as error:
         print(f"provider_probe.py: {error}", file=sys.stderr)
         return 1
@@ -2293,6 +2323,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 os.close(oauth_fd)
             except (OSError, OverflowError):
                 pass
+        for number, handler in previous_handlers.items():
+            signal.signal(number, handler)
+        _cli_cancellation_requested = previous_cancellation
     return 0
 
 

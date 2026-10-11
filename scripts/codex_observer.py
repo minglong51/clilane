@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import json
 import os
 import re
 import select
+import shutil
 import stat
+import subprocess
 import sys
 import time
 import uuid
@@ -24,6 +27,9 @@ MAX_COMMANDS = 512
 MAX_INPUT_BYTES = 1024 * 1024
 FRESHNESS_NS = 3_000_000_000
 LIFETIME_SECONDS = 90
+TASK_PROOF_SECONDS = 3.0
+MAX_TASK_ANCESTORS = 32
+MAX_TASK_QUERY_BYTES = 128 * 1024
 
 
 class ObserverError(Exception):
@@ -76,6 +82,170 @@ def _read_private(path: Path, limit: int) -> bytes:
         os.close(descriptor)
 
 
+def _task_query(arguments: Sequence[str], deadline: float, limit: int) -> bytes:
+    if time.monotonic() >= deadline:
+        raise ObserverError("task-proof-time-limit")
+    try:
+        process = subprocess.Popen(
+            arguments, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, close_fds=True,
+            env={"PATH": os.defpath, "LC_ALL": "C"},
+        )
+    except OSError as error:
+        raise ObserverError("task-proof-unavailable") from error
+    try:
+        result = bytearray()
+        descriptor = process.stdout.fileno()
+        os.set_blocking(descriptor, False)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([descriptor], [], [], remaining)[0]:
+                raise ObserverError("task-proof-time-limit")
+            chunk = os.read(descriptor, min(65536, limit + 1 - len(result)))
+            if not chunk:
+                break
+            result.extend(chunk)
+            if len(result) > limit:
+                raise ObserverError("task-proof-output-limit")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ObserverError("task-proof-time-limit")
+        if process.wait(timeout=remaining) != 0:
+            raise ObserverError("task-proof-unavailable")
+        return bytes(result)
+    except subprocess.TimeoutExpired as error:
+        raise ObserverError("task-proof-time-limit") from error
+    except OSError as error:
+        raise ObserverError("task-proof-unavailable") from error
+    finally:
+        process.stdout.close()
+        try:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=1)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ObserverError("task-proof-unavailable") from error
+
+
+@dataclass(frozen=True)
+class _ProcessIdentity:
+    pid: int
+    parent: int
+    uid: int
+    started: str
+
+
+def _process_identity(pid: int, deadline: float) -> _ProcessIdentity:
+    if type(pid) is not int or not 1 < pid < 1 << 31:
+        raise ObserverError("task-process-invalid")
+    if time.monotonic() >= deadline:
+        raise ObserverError("task-proof-time-limit")
+    try:
+        if sys.platform == "linux":
+            descriptor = os.open(f"/proc/{pid}/stat", os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                uid = os.fstat(descriptor).st_uid
+                raw = os.read(descriptor, 8193)
+            finally:
+                os.close(descriptor)
+            if len(raw) > 8192:
+                raise ObserverError("task-process-invalid")
+            prefix, separator, rest = raw.rpartition(b") ")
+            fields = rest.split()
+            if not separator or prefix.split(b" (", 1)[0] != str(pid).encode() or len(fields) < 20:
+                raise ObserverError("task-process-invalid")
+            parent_text, started = fields[1].decode("ascii"), fields[19].decode("ascii")
+            state = fields[0].decode("ascii")
+            if re.fullmatch(r"[1-9][0-9]{0,19}", started) is None:
+                raise ObserverError("task-process-invalid")
+        elif sys.platform == "darwin":
+            raw = _task_query(
+                ["/bin/ps", "-p", str(pid), "-o", "pid=", "-o", "ppid=", "-o", "uid=", "-o", "stat=", "-o", "lstart="],
+                deadline, 1024,
+            )
+            fields = raw.decode("ascii").strip().split(None, 4)
+            if len(raw.splitlines()) != 1 or len(fields) != 5 or fields[0] != str(pid) or not fields[2].isdigit():
+                raise ObserverError("task-process-invalid")
+            parent_text, uid, state = fields[1], int(fields[2]), fields[3]
+            started = " ".join(fields[4].split())
+            if re.fullmatch(r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [0-9]{1,2} [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}", started) is None:
+                raise ObserverError("task-process-invalid")
+        else:
+            raise ObserverError("task-proof-unavailable")
+        if (
+            uid != os.getuid() or not state or state[0] not in "RSDITUVW"
+            or re.fullmatch(r"[0-9]{1,10}", parent_text) is None
+            or not 0 <= int(parent_text) < 1 << 31
+        ):
+            raise ObserverError("task-process-invalid")
+        return _ProcessIdentity(pid, int(parent_text), uid, started)
+    except (OSError, UnicodeError, ValueError) as error:
+        raise ObserverError("task-proof-unavailable") from error
+
+
+def _task_ancestry(leader: int, started: str, deadline: float) -> tuple[_ProcessIdentity, ...]:
+    pid = os.getpid()
+    chain: list[_ProcessIdentity] = []
+    seen: set[int] = set()
+    for _ in range(MAX_TASK_ANCESTORS):
+        if pid in seen or pid <= 1:
+            raise ObserverError("task-process-not-owned")
+        seen.add(pid)
+        identity = _process_identity(pid, deadline)
+        chain.append(identity)
+        if pid == leader:
+            if identity.started != started:
+                raise ObserverError("task-process-replaced")
+            return tuple(chain)
+        pid = identity.parent
+    raise ObserverError("task-ancestry-limit")
+
+
+def _socket_identity(socket: str) -> tuple[int, int]:
+    try:
+        metadata = Path(socket).lstat()
+    except OSError as error:
+        raise ObserverError("task-proof-unavailable") from error
+    if not stat.S_ISSOCK(metadata.st_mode) or metadata.st_uid != os.getuid():
+        raise ObserverError("task-socket-invalid")
+    return metadata.st_dev, metadata.st_ino
+
+
+def _live_task(binary: str, record: Mapping[str, Any], deadline: float) -> tuple[bytes, int, str]:
+    fields = (
+        "session_name", "session_id", "session_created", "pane_id", "pane_dead", "pane_pid",
+        "@agt_meta", "@agt_committed", "@agt_process_started", "@agt_ready", "@agt_stop_requested", "@agt_result",
+    )
+    raw = _task_query(
+        [binary, "-N", "-S", record["socket"], "-f", "/dev/null", "list-panes", "-s", "-t", "=" + record["session"], "-F", "|".join("#{" + field + "}" for field in fields)],
+        deadline, MAX_TASK_QUERY_BYTES,
+    )
+    try:
+        if len(raw.splitlines()) != 1 or not raw.endswith(b"\n"):
+            raise ObserverError("task-live-proof-invalid")
+        values = raw[:-1].decode("ascii").split("|")
+        if len(values) != len(fields):
+            raise ObserverError("task-live-proof-invalid")
+        session, session_id, created, pane, dead, pid, encoded, committed, started, ready, stopped, result = values
+        if (
+            session != record["session"] or re.fullmatch(r"\$[0-9]{1,10}", session_id) is None
+            or re.fullmatch(r"[1-9][0-9]{0,19}", created) is None
+            or re.fullmatch(r"%[0-9]{1,10}", pane) is None or dead != "0"
+            or re.fullmatch(r"[1-9][0-9]{0,9}", pid) is None or not 1 < int(pid) < 1 << 31
+            or committed != "1" or not started or ready != record["id"] or stopped != "0" or result
+        ):
+            raise ObserverError("task-live-proof-invalid")
+        decoded = base64.b64decode(encoded, altchars=b"-_", validate=True)
+        if len(decoded) > 65536 or base64.urlsafe_b64encode(decoded).decode() != encoded:
+            raise ObserverError("task-live-proof-invalid")
+        metadata = strict_message(decoded)
+        if any(metadata.get(key) != record[key] for key in ("id", "created", "name", "command", "cwd", "log") if key in record):
+            raise ObserverError("task-live-metadata-mismatch")
+        return raw, int(pid), started
+    except (UnicodeError, ValueError, ProbeError) as error:
+        raise ObserverError("task-live-proof-invalid") from error
+
+
 @dataclass(frozen=True)
 class TaskBinding:
     generation: str
@@ -85,15 +255,18 @@ class TaskBinding:
         root = Path(environment.get("CLILANE_STATE_HOME", ""))
         socket = environment.get("CLILANE_TMUX_SOCKET", "")
         task = environment.get("CLILANE_TASK_ID", "")
-        if not Path(socket).is_absolute() or re.fullmatch(
+        if "\0" in socket or not Path(socket).is_absolute() or re.fullmatch(
             r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", task
         ) is None:
             raise ObserverError("task-environment-invalid")
         _private_directory(root)
         digest = hashlib.sha256(socket.encode()).hexdigest()[:16]
         _private_directory(root / "registry")
+        record_path = root / "registry" / digest / f"{task}.json"
         try:
-            record = strict_message(_read_private(root / "registry" / digest / f"{task}.json", 65536))
+            record_identity = record_path.lstat()
+            record_bytes = _read_private(record_path, 65536)
+            record = strict_message(record_bytes)
         except FileNotFoundError as error:
             raise ObserverError("task-record-not-found-for-absolute-socket") from error
         if (
@@ -108,6 +281,28 @@ class TaskBinding:
             or "\0" in record["created"]
         ):
             raise ObserverError("task-record-mismatch")
+        deadline = time.monotonic() + TASK_PROOF_SECONDS
+        binary = shutil.which("tmux")
+        if binary is None:
+            raise ObserverError("task-proof-unavailable")
+        socket_identity = _socket_identity(socket)
+        live = _live_task(binary, record, deadline)
+        ancestry = _task_ancestry(live[1], live[2], deadline)
+        if (
+            _live_task(binary, record, deadline) != live
+            or _task_ancestry(live[1], live[2], deadline) != ancestry
+            or _socket_identity(socket) != socket_identity
+            or _read_private(record_path, 65536) != record_bytes
+        ):
+            raise ObserverError("task-live-identity-changed")
+        current_record = record_path.lstat()
+        if any(
+            getattr(record_identity, field) != getattr(current_record, field)
+            for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        ):
+            raise ObserverError("task-live-identity-changed")
+        if time.monotonic() >= deadline:
+            raise ObserverError("task-proof-time-limit")
         material = "\0".join(record[key] for key in ("socket", "id", "created", "session"))
         return cls(hashlib.sha256(material.encode()).hexdigest())
 

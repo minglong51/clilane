@@ -6,8 +6,10 @@ import importlib.util
 import io
 import json
 import os
+import signal
 import socket
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -362,6 +364,64 @@ with open({str(process_group_path)!r}, "w", encoding="ascii") as destination:
     destination.write(str(os.getpgrp()))
 os.chmod({str(process_group_path)!r}, 0o600)
 sys.stdout.write({provider_probe.EXPECTED_RESPONSE!r} + "\\n")
+'''
+    return write_executable(path, source)
+
+
+def fake_cancellable_provider(
+    path: Path,
+    process_group_path: Path,
+    ready_path: Path,
+    cleanup_path: Path,
+    *,
+    provider: str,
+    oauth_payload_sha256: str | None,
+) -> Path:
+    source = f'''#!/usr/bin/env python3
+import hashlib
+import os
+import signal
+import subprocess
+import sys
+import time
+
+def publish(path, value):
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="ascii") as destination:
+        destination.write(value)
+
+def cancel(_number, _frame):
+    if not os.path.exists({str(cleanup_path)!r}):
+        publish({str(cleanup_path)!r}, "cleanup")
+
+if sys.argv[1:] == ["--version"]:
+    sys.stdout.write({('2.1.283 (Claude Code)' if provider == 'claude' else 'codex-cli 0.157.1')!r} + "\\n")
+    raise SystemExit(0)
+publish({str(process_group_path)!r}, str(os.getpgrp()))
+signal.signal(signal.SIGTERM, cancel)
+if {oauth_payload_sha256!r} is not None:
+    descriptor = int(os.environ["CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"])
+    payload = bytearray()
+    while not payload.endswith(b"\\n"):
+        chunk = os.read(descriptor, 4096)
+        if not chunk or len(payload) + len(chunk) > 4096:
+            raise SystemExit(81)
+        payload.extend(chunk)
+    os.close(descriptor)
+    if hashlib.sha256(payload[:-1]).hexdigest() != {oauth_payload_sha256!r}:
+        raise SystemExit(82)
+elif "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR" in os.environ:
+    raise SystemExit(83)
+child = subprocess.Popen(
+    [sys.executable, "-B", "-c", "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready', flush=True); time.sleep(60)"],
+    stdout=subprocess.PIPE,
+    close_fds=True,
+)
+if child.stdout.readline() != b"ready\\n":
+    raise SystemExit(84)
+publish({str(ready_path)!r}, str(child.pid))
+while True:
+    time.sleep(60)
 '''
     return write_executable(path, source)
 
@@ -1002,6 +1062,185 @@ class OAuthDescriptorTests(ProbeDirectoryTestCase):
                         code = error.code
                 self.assertIn(code, (1, 2))
                 self.assertEqual(os.fstat(descriptor), before)
+
+
+class CliCancellationTests(ProbeDirectoryTestCase):
+    def assert_cli_cancellation(
+        self,
+        number: int,
+        *,
+        repeated: bool = False,
+        during_spawn: bool = False,
+        provider: str = "claude",
+    ) -> None:
+        payload = b"synthetic-cancellation-socket-only-sentinel"
+        process_group_path = self.base / "provider-group"
+        ready_path = self.base / "provider-ready"
+        cleanup_path = self.base / "provider-cleanup"
+        result_path = self.base / "cli-result.json"
+        executable = fake_cancellable_provider(
+            self.base / "fake-provider",
+            process_group_path,
+            ready_path,
+            cleanup_path,
+            provider=provider,
+            oauth_payload_sha256=(
+                hashlib.sha256(payload).hexdigest() if provider == "claude" else None
+            ),
+        )
+        source, destination = socket.socketpair()
+        descriptor = destination.fileno()
+        arguments = [
+            "--provider", provider,
+            "--capture-root", str(self.capture_root),
+            "--capture-id", "capture-cancellation",
+            "--provider-executable", str(executable),
+            "--workspace", str(self.workspace),
+        ]
+        if provider == "claude":
+            arguments.extend((
+                "--config-dir", str(self.config_dir),
+                "--oauth-fd", str(descriptor),
+            ))
+        process = None
+        try:
+            with self.pinned_manifest(provider, executable):
+                manifest_path = provider_probe.EXECUTABLE_MANIFEST_PATH
+                driver = self.base / "run-cli.py"
+                driver.write_text(f'''
+import importlib.util
+import json
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("provider_probe", {str(SCRIPT_PATH)!r})
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+module.EXECUTABLE_MANIFEST_PATH = Path({str(manifest_path)!r})
+module.COLLECTOR_SIGNAL_TIMEOUT_SECONDS = 0.4
+module.COLLECTOR_TIMEOUT_SECONDS = 1
+module.ABORT_TIMEOUT_SECONDS = 0.05
+handled = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+def previous(_number, _frame):
+    return None
+for signum in handled:
+    signal.signal(signum, previous)
+original_popen = module.subprocess.Popen
+def spawning(*args, **kwargs):
+    child = original_popen(*args, **kwargs)
+    deadline = time.monotonic() + 4.0
+    while not Path({str(ready_path)!r}).exists() and child.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    os.kill(os.getpid(), {int(number)!r})
+    return child
+if {during_spawn!r}:
+    module.subprocess.Popen = spawning
+code = module.main({arguments!r})
+closed = True
+if {provider!r} == "claude":
+    try:
+        os.fstat({descriptor!r})
+        closed = False
+    except OSError:
+        pass
+result = {{"code": code, "descriptor_closed": closed,
+          "handlers_restored": all(signal.getsignal(signum) is previous for signum in handled)}}
+output = os.open({str(result_path)!r}, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(output, "w", encoding="ascii") as destination:
+    json.dump(result, destination)
+raise SystemExit(code)
+''', encoding="utf-8")
+                driver.chmod(0o600)
+                source.sendall(payload + b"\n")
+                source.shutdown(socket.SHUT_WR)
+                process = subprocess.Popen(
+                    [sys.executable, "-B", str(driver)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    close_fds=True,
+                    pass_fds=(descriptor,) if provider == "claude" else (),
+                    start_new_session=True,
+                    env={
+                        "HOME": str(self.base),
+                        "PATH": os.environ.get("PATH", os.defpath),
+                        "PYTHONDONTWRITEBYTECODE": "1",
+                    },
+                )
+                destination.close()
+                deadline = time.monotonic() + 5.0
+                while not ready_path.exists() and process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                if not ready_path.exists() and process.poll() is not None:
+                    _stdout, failure = process.communicate(timeout=1.0)
+                    self.fail(f"fake provider did not become ready: {failure!r}")
+                self.assertTrue(ready_path.exists(), "fake provider did not become ready")
+                if not during_spawn:
+                    os.kill(process.pid, number)
+                if repeated:
+                    deadline = time.monotonic() + 2.0
+                    while not cleanup_path.exists() and process.poll() is None and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(cleanup_path.exists(), "provider cleanup did not start")
+                    for repeated_number in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM) * 3:
+                        if process.poll() is not None:
+                            break
+                        os.kill(process.pid, repeated_number)
+                        time.sleep(0.01)
+                stdout, stderr = process.communicate(timeout=8.0)
+            self.assertEqual(process.returncode, 1)
+            self.assertEqual(stdout, b"")
+            self.assertEqual(stderr, b"provider_probe.py: probe-cancelled\n")
+            self.assertEqual(
+                json.loads(result_path.read_text(encoding="ascii")),
+                {"code": 1, "descriptor_closed": True, "handlers_restored": True},
+            )
+            process_group_id = int(process_group_path.read_text(encoding="ascii"))
+            with self.assertRaises(ProcessLookupError):
+                os.killpg(process_group_id, 0)
+            self.assertEqual(list(self.config_dir.glob(".clilane-provider-stage-*")), [])
+            source.settimeout(0.5)
+            if provider == "claude":
+                self.assertEqual(source.recv(1), b"")
+            for directory in (self.config_dir, self.capture_root):
+                for path in directory.rglob("*"):
+                    if path.is_file():
+                        self.assertNotIn(payload, path.read_bytes())
+        finally:
+            destination.close()
+            source.close()
+            if process_group_path.exists():
+                process_group_id = int(process_group_path.read_text(encoding="ascii"))
+                try:
+                    os.killpg(process_group_id, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if process is not None:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate(timeout=3.0)
+
+    def test_sigterm_cleans_provider_descendant_socket_and_staged_executable(self) -> None:
+        self.assert_cli_cancellation(signal.SIGTERM)
+
+    def test_sighup_cleans_provider_descendant_socket_and_staged_executable(self) -> None:
+        self.assert_cli_cancellation(signal.SIGHUP)
+
+    def test_sigint_cleans_provider_descendant_socket_and_staged_executable(self) -> None:
+        self.assert_cli_cancellation(signal.SIGINT)
+
+    def test_repeated_signals_do_not_interrupt_process_group_cleanup(self) -> None:
+        self.assert_cli_cancellation(signal.SIGTERM, repeated=True)
+
+    def test_signal_before_spawn_returns_preserves_child_ownership(self) -> None:
+        self.assert_cli_cancellation(signal.SIGHUP, during_spawn=True)
+
+    def test_auth_free_codex_cancellation_cleans_collector_and_provider(self) -> None:
+        self.assert_cli_cancellation(signal.SIGTERM, provider="codex")
 
 
 class AbortProtocolTests(ProbeDirectoryTestCase):
