@@ -259,12 +259,12 @@ class CodexAnalysisTests(unittest.TestCase):
     def test_account_updates_are_validated_and_omitted_from_replay(self) -> None:
         self.bind_thread()
         self.start_turn()
-        for params in ({}, {"authMode": None, "planType": None}, {"authMode": "chatgpt", "planType": "pro"}, {"authMode": "apikey"}):
+        for params in ({}, {"authMode": None, "planType": None}, {"authMode": "chatgpt", "planType": "pro"}, {"authMode": "apikey"}, {"planType": "promax"}):
             self.feed("O", {"method": "account/updated", "params": params})
         self.complete_turn()
         report = self.analysis.finish()
         self.assertTrue(report["analysis_complete"])
-        self.assertEqual(report["ignored_notification_count"], 4)
+        self.assertEqual(report["ignored_notification_count"], 5)
         self.assertEqual(report["unhandled_message_count"], 0)
         self.assertEqual(report["source_health"], "unknown")
         self.assertEqual([event["event"] for event in report["events"]], ["turn_started", "turn_completed"])

@@ -30,7 +30,7 @@ COLLECTORS = {
     "codex": ROOT / "scripts/collect_codex_evidence.py",
     "kimi": ROOT / "scripts/collect_kimi_evidence.py",
 }
-PROVIDER_VERSIONS = {"claude": "2.1.283", "codex": "0.157.1", "kimi": "0.38.0"}
+PROVIDER_VERSIONS = {"claude": "2.1.283", "codex": "0.162.1", "kimi": "0.38.0"}
 PROBE_PROMPT = (
     "Reply with exactly CLILANE_PROBE_OK and no other text. Do not call tools."
 )
@@ -76,7 +76,7 @@ READ_CHUNK_BYTES = 16 * 1024
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 SOURCE_INTERFACES = {
     "claude": ("2.1.283", "claude-native-hook"),
-    "codex": ("0.157.1", "codex-app-server"),
+    "codex": ("0.162.1", "codex-app-server"),
     "kimi": ("0.38.0", "kimi-acp"),
 }
 CODEX_TARGETS = {

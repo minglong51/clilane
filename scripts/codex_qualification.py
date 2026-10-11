@@ -770,7 +770,7 @@ def run(
             checks["provider_diagnostics_match_denial"] = True
         return {
             "schema_version": 1, "scope": f"phase0-{scenario_name}-observer-restart",
-            "qualification": "unqualified", "provider": "codex", "provider_version": "0.157.1",
+            "qualification": "unqualified", "provider": "codex", "provider_version": "0.162.1",
             "source_capture_sha256": report["source_capture_sha256"],
             "executable_sha256": pinned.sha256, "checks": checks,
             "message_count": report["message_count"], "thread_read_count": report["thread_read_count"],

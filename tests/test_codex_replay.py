@@ -35,7 +35,7 @@ METHODS = (
     "item/fileChange/requestApproval",
     "item/permissions/requestApproval",
 )
-PINNED_EXECUTABLE = "27ceb5f9b957b43a519efe4eaa3816a0bffb0a531a2c89af18840c0a3c016a7d"
+PINNED_EXECUTABLE = "74c6a6d263f40d65f99c27a815275f5b4ed0bcc2baecc396b4cf3255498bdfc0"
 
 
 def synthetic_report(method: str = METHODS[0], *, idle_before_completion: bool = False, blocking: bool = True, waiting_flag: bool = True) -> dict[str, Any]:
@@ -71,7 +71,7 @@ def synthetic_report(method: str = METHODS[0], *, idle_before_completion: bool =
     report = analysis.finish()
     report.update(
         provider="codex",
-        provider_version="0.157.1",
+        provider_version="0.162.1",
         source_interface="codex-app-server",
         source_capture_sha256=hashlib.sha256(("synthetic-test-source:" + method).encode()).hexdigest(),
         executable_sha256=PINNED_EXECUTABLE,
@@ -237,7 +237,7 @@ class CodexReplayTests(unittest.TestCase):
         self.assert_rejected(report)
 
     def test_qualification_binding_and_capture_constants_cannot_be_promoted(self) -> None:
-        mutations = {"schema_version": [2, True, 1.0], "analyzer": ["codex-app-server-v2"], "analysis_complete": [False, 1, "true"], "qualification": ["qualified", "authoritative"], "task_binding": ["exact"], "source_health": ["fresh"], "session_binding": ["unknown"], "provider": ["claude"], "provider_version": ["0.155.1", "0.157.2"], "source_interface": ["native_hook"], "capture_status": ["partial", "synthetic"]}
+        mutations = {"schema_version": [2, True, 1.0], "analyzer": ["codex-app-server-v2"], "analysis_complete": [False, 1, "true"], "qualification": ["qualified", "authoritative"], "task_binding": ["exact"], "source_health": ["fresh"], "session_binding": ["unknown"], "provider": ["claude"], "provider_version": ["0.155.1", "0.157.1", "0.162.2"], "source_interface": ["native_hook"], "capture_status": ["partial", "synthetic"]}
         for key, values in mutations.items():
             for value in values:
                 with self.subTest(field=key, value=value):
