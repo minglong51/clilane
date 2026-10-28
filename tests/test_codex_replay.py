@@ -35,7 +35,7 @@ METHODS = (
     "item/fileChange/requestApproval",
     "item/permissions/requestApproval",
 )
-PINNED_EXECUTABLE = "74c6a6d263f40d65f99c27a815275f5b4ed0bcc2baecc396b4cf3255498bdfc0"
+PINNED_EXECUTABLE = "d8990e3ee7acfbc26f91265b12a1a83f0fee40d0e0f8f1f40a37d4ec21f499cf"
 
 
 def synthetic_report(method: str = METHODS[0], *, idle_before_completion: bool = False, blocking: bool = True, waiting_flag: bool = True) -> dict[str, Any]:
@@ -71,7 +71,7 @@ def synthetic_report(method: str = METHODS[0], *, idle_before_completion: bool =
     report = analysis.finish()
     report.update(
         provider="codex",
-        provider_version="0.162.1",
+        provider_version="0.164.0",
         source_interface="codex-app-server",
         source_capture_sha256=hashlib.sha256(("synthetic-test-source:" + method).encode()).hexdigest(),
         executable_sha256=PINNED_EXECUTABLE,

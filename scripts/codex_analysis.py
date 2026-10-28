@@ -35,6 +35,7 @@ IGNORED_NOTIFICATIONS = {
     "item/reasoning/textDelta",
     "thread/tokenUsage/updated",
     "thread/settings/updated",
+    "turn/moderationMetadata",
 }
 
 
