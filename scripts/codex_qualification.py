@@ -37,6 +37,19 @@ SCENARIOS = {
     "input": INPUT_METHOD, "permissions": PERMISSIONS_METHOD,
     "command": COMMAND_METHOD, "file": FILE_METHOD,
 }
+
+
+def evidence_source_sha256() -> str:
+    digest = hashlib.sha256()
+    for name in (
+        "codex_analysis.py", "codex_observer.py", "codex_qualification.py",
+        "provider_capture.py", "provider_evidence.py", "provider_probe.py",
+    ):
+        digest.update(name.encode() + b"\0")
+        digest.update(Path(__file__).with_name(name).read_bytes())
+    return digest.hexdigest()
+
+
 PROMPT = (
     "This is a synthetic protocol probe. Call request_user_input exactly once, "
     "with one question asking whether to choose Alpha or Beta and those two options. "
@@ -293,6 +306,8 @@ class Broker:
         self.binding = binding
         self.path = path
         self.started_ns = time.monotonic_ns()
+        self.delivery_latency_ms: list[int] = []
+        self.heartbeat_latency_ms: list[int] = []
         self.journal = Journal(path, binding)
         self.observer: ObserverClient | None = None
         try:
@@ -302,9 +317,12 @@ class Broker:
             raise
 
     def observe(self, stream: str, message: dict[str, Any]) -> None:
-        observed_ns = time.monotonic_ns() - self.started_ns
+        started_ns = time.monotonic_ns()
+        observed_ns = started_ns - self.started_ns
         self.journal.append(stream, observed_ns, message)
         self.observer.ok("observe", stream=stream, observed_ns=observed_ns, message=message)
+        if stream == "O":
+            self.delivery_latency_ms.append((time.monotonic_ns() - started_ns + 999_999) // 1_000_000)
 
     def send(self, message: dict[str, Any]) -> None:
         if self.tool_request_id is not None and message.get("id") == self.tool_request_id:
@@ -376,12 +394,36 @@ def recovery(broker: Broker, thread_id: str, request: dict[str, Any]) -> dict[st
         rejected = observer.command("status", **fields)
         require(rejected == {"ok": False, "error": expected}, "stale-delivery-accepted")
         require(observer.ok("status") == ready, "stale-delivery-mutated-state")
+    for field, expected in (
+        ("threadId", "thread-binding-mismatch"),
+        ("turnId", "turn-binding-mismatch"),
+    ):
+        stale = {**request, "id": f"probe-stale-{field}",
+                 "params": {**request["params"], field: f"probe-stale-{field}"}}
+        rejected = observer.command(
+            "observe", stream="O", observed_ns=time.monotonic_ns() - broker.started_ns,
+            message=stale,
+        )
+        require(rejected == {"ok": False, "error": expected}, "stale-source-accepted")
+        require(observer.ok("status") == ready, "stale-source-mutated-state")
     duplicate = observer.ok("observe", stream="O",
                             observed_ns=time.monotonic_ns() - broker.started_ns, message=request)
     require(duplicate["unresolved_requests"] == ready["unresolved_requests"]
             and duplicate["duplicate_count"] == ready["duplicate_count"] + 1
             and duplicate["fresh_until_monotonic_ns"] == ready["fresh_until_monotonic_ns"],
             "duplicate-delivery-mutated-state")
+    for index in range(2):
+        time.sleep(FRESHNESS_NS / 3_000_000_000)
+        started_ns = time.monotonic_ns()
+        broker.read_thread(thread_id, f"probe-heartbeat-{index}")
+        renewed = observer.ok("status")
+        require(renewed["health"] == "healthy"
+                and renewed["thread_read_count"] == ready["thread_read_count"] + 1
+                and renewed["fresh_until_monotonic_ns"] > ready["fresh_until_monotonic_ns"]
+                and renewed["unresolved_requests"] == ready["unresolved_requests"],
+                "heartbeat-did-not-renew")
+        broker.heartbeat_latency_ms.append((time.monotonic_ns() - started_ns + 999_999) // 1_000_000)
+        ready = renewed
     delay = (ready["fresh_until_monotonic_ns"] - time.monotonic_ns()) / 1_000_000_000
     if delay > 0:
         time.sleep(delay + 0.02)
@@ -403,12 +445,16 @@ def recovery(broker: Broker, thread_id: str, request: dict[str, Any]) -> dict[st
             and initial["unresolved_requests"] == ready["unresolved_requests"]
             and initial["replayed_message_count"] == broker.journal.count,
             "request-not-recovered")
+    require(replacement.command("status", instance=old_instance) == {
+        "ok": False, "error": "stale-observer-instance",
+    } and replacement.ok("status") == initial, "old-observer-instance-accepted")
     require(replacement.command("ready", recovered_count=1) == {
         "ok": False, "error": "fresh-source-proof-required",
     }, "replay-renewed-freshness")
     broker.read_thread(thread_id, "probe-read-after")
     renewed = replacement.ok("ready", recovered_count=1)
-    require(renewed["health"] == "healthy" and renewed["thread_read_count"] == 2,
+    require(renewed["health"] == "healthy"
+            and renewed["thread_read_count"] == ready["thread_read_count"] + 1,
             "recovered-observer-not-ready")
     transport._read_control_available(fail_closed=True)
     require(transport.active_provider_pgid == provider and transport.control_event_count == 3
@@ -421,6 +467,8 @@ def recovery(broker: Broker, thread_id: str, request: dict[str, Any]) -> dict[st
             broker.request_method],
         "replay_stayed_unknown",
         "fresh_source_read_required", "provider_process_unchanged",
+        "stale_source_session_rejected", "stale_source_turn_rejected",
+        "recurring_heartbeat_renewed", "old_observer_instance_rejected",
     )}
 
 
@@ -754,6 +802,9 @@ def run(
         broker = Broker(transport, binding, root / "journal" / "source.jsonl",
                         scenario_name=scenario_name, workspace=spec.workspace)
         checks = scenario(broker, spec.workspace)
+        delivery_latency_ms = sorted(broker.delivery_latency_ms)
+        heartbeat_latency_ms = sorted(broker.heartbeat_latency_ms)
+        journal_sha256 = broker.journal.digest.hexdigest()
         transport.finish()
         finished = True
         broker.close()
@@ -767,16 +818,24 @@ def run(
                         for event in report["events"]), "approval-state-not-observed")
         verify_journal(root, binding, report, scenario_name=scenario_name)
         checks["journal_matches_source"] = True
+        checks["live_task_binding_verified"] = True
         if scenario_name in {"command", "file"}:
             checks["provider_diagnostics_match_denial"] = True
-        return {
-            "schema_version": 1, "scope": f"phase0-{scenario_name}-observer-restart",
+        result = {
+            "schema_version": 2, "scope": f"phase0-{scenario_name}-observer-restart",
             "qualification": "unqualified", "provider": "codex", "provider_version": "0.164.0",
             "source_capture_sha256": report["source_capture_sha256"],
             "executable_sha256": pinned.sha256, "checks": checks,
             "message_count": report["message_count"], "thread_read_count": report["thread_read_count"],
             "freshness_seconds": FRESHNESS_NS // 1_000_000_000,
+            "harness_sha256": evidence_source_sha256(), "observer_journal_sha256": journal_sha256,
+            "measurements": {
+                "source_to_observer_ms": delivery_latency_ms,
+                "heartbeat_round_trip_ms": heartbeat_latency_ms,
+            },
         }
+        _write_private_bytes(root / "qualification.json", _encode(result))
+        return result
     finally:
         try:
             remove_credentials(auth_copy, identity)
