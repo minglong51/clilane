@@ -1186,6 +1186,9 @@ def main() -> int:
         (tool_bin / "tmux").symlink_to(tmux_executable)
         (tool_bin / "sleep").symlink_to(sleep_executable)
         (tool_bin / "python3").symlink_to(sys.executable)
+        cat_executable = tool_bin / "cat"
+        cat_executable.write_text("#!/bin/sh\nexec /bin/cat\n")
+        cat_executable.chmod(0o700)
 
         launch_project = root / "launch-project"
         source_project = root / "source-project"
@@ -1196,7 +1199,7 @@ def main() -> int:
             agent_bin = project / "agent-bin"
             agent_bin.mkdir(parents=True, mode=0o700)
             for agent in agents:
-                (agent_bin / agent).symlink_to("/bin/cat")
+                (agent_bin / agent).symlink_to(cat_executable)
 
         discovery_environment = dict(environment)
         discovery_environment["PATH"] = os.pathsep.join(
