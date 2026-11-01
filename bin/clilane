@@ -234,6 +234,36 @@ class CliLaneError(Exception):
     pass
 
 
+class HubLaunchCancelled(CliLaneError):
+    pass
+
+
+HUB_LAUNCH_STATE = threading.local()
+
+
+def hub_launch_checkpoint() -> None:
+    cancelled = getattr(HUB_LAUNCH_STATE, "cancelled", None)
+    if cancelled is not None and cancelled.is_set():
+        raise HubLaunchCancelled("Launch cancelled · draft kept")
+
+
+def hub_launch_created(task: Task) -> None:
+    if hasattr(HUB_LAUNCH_STATE, "cancelled"):
+        HUB_LAUNCH_STATE.task = task
+    hub_launch_checkpoint()
+
+
+def hub_launch_submit(send: Callable[[], object]) -> None:
+    lock = getattr(HUB_LAUNCH_STATE, "lock", None)
+    if lock is None:
+        send()
+        return
+    with lock:
+        hub_launch_checkpoint()
+        send()
+        HUB_LAUNCH_STATE.submitted.set()
+
+
 class FleetSignal(Exception):
     def __init__(self, signum: int) -> None:
         self.signum = signum
@@ -1630,6 +1660,8 @@ def list_tasks(timeout: float | None = None) -> list[Task]:
         "#{pane_pid}",
         "#{session_attached}",
         "#{?#{OPENCLAW_SESSION},bot,local}",
+        "#{@agt_pane}",
+        "#{@agt_ready}",
     ]
     completed = tmux(
         ["list-panes", "-a", "-F", FIELD_SEPARATOR.join(fields)],
@@ -1641,7 +1673,7 @@ def list_tasks(timeout: float | None = None) -> list[Task]:
         if tmux_server_absent(completed):
             return []
         raise CliLaneError(detail.strip() or f"tmux exited {completed.returncode}")
-    tasks: list[Task] = []
+    candidates: dict[str, list[tuple[Task, str, str]]] = {}
     for line in completed.stdout.decode(errors="replace").splitlines():
         values = line.split(FIELD_SEPARATOR)
         if len(values) != len(fields):
@@ -1660,6 +1692,8 @@ def list_tasks(timeout: float | None = None) -> list[Task]:
             pid,
             attached,
             origin,
+            canonical_pane,
+            ready,
         ) = values
         if not session.startswith(SESSION_PREFIX) or not encoded:
             continue
@@ -1674,29 +1708,40 @@ def list_tasks(timeout: float | None = None) -> list[Task]:
             recorded_code = optional_int(code_text)
             if recorded_code is not None:
                 recorded_signal = signal_text or None
-        tasks.append(
-            Task(
-                session=session,
-                pane=pane,
-                id=str(meta.get("id", "")),
-                name=str(meta.get("name", "")),
-                command=command,
-                cwd=str(meta.get("cwd", "")),
-                created=str(meta.get("created", "")),
-                log=str(meta.get("log", "")),
-                committed=committed == "1",
-                process_started=process_started or None,
-                stop_requested=stopped == "1",
-                dead=dead == "1",
-                exit_code=recorded_code if recorded_code is not None else optional_int(status),
-                signal_name=recorded_signal
-                if recorded_code is not None
-                else normalized_signal(dead_signal),
-                pid=optional_int(pid),
-                attached=(optional_int(attached) or 0) > 0,
-                origin=origin if origin in {"bot", "local"} else "local",
-            )
+        task = Task(
+            session=session,
+            pane=pane,
+            id=str(meta.get("id", "")),
+            name=str(meta.get("name", "")),
+            command=command,
+            cwd=str(meta.get("cwd", "")),
+            created=str(meta.get("created", "")),
+            log=str(meta.get("log", "")),
+            committed=committed == "1",
+            process_started=process_started or None,
+            stop_requested=stopped == "1",
+            dead=dead == "1",
+            exit_code=recorded_code if recorded_code is not None else optional_int(status),
+            signal_name=recorded_signal
+            if recorded_code is not None
+            else normalized_signal(dead_signal),
+            pid=optional_int(pid),
+            attached=(optional_int(attached) or 0) > 0,
+            origin=origin if origin in {"bot", "local"} else "local",
         )
+        candidates.setdefault(session, []).append((task, canonical_pane, ready))
+    tasks: list[Task] = []
+    for panes in candidates.values():
+        canonical = {pane for _, pane, _ in panes if pane}
+        if canonical:
+            selected = [task for task, _, _ in panes if task.pane in canonical]
+        else:
+            selected = [task for task, _, ready in panes if ready and ready == task.id]
+            if not selected and len(panes) == 1:
+                selected = [panes[0][0]]
+        if len(selected) != 1:
+            raise CliLaneError(f"cannot identify the managed pane for task: {panes[0][0].name}")
+        tasks.extend(selected)
     return sorted(tasks, key=lambda task: task.created)
 
 
@@ -2798,6 +2843,13 @@ def initial_task_queue(session: str, cwd: str, meta: Mapping[str, object]) -> li
         session,
         "@agt_stop_requested",
         "0",
+        ";",
+        "set-option",
+        "-F",
+        "-t",
+        session,
+        "@agt_pane",
+        "#{pane_id}",
     ]
 
 
@@ -2839,6 +2891,7 @@ def run_task(spec: LaunchSpec) -> Task:
         profile=spec.profile,
         provider=spec.provider,
     )
+    hub_launch_checkpoint()
     preflight_launch(spec, inspect_tmux=False)
     with registry_lock():
         existing_environment = preflight_launch(spec)
@@ -2923,6 +2976,7 @@ def run_task(spec: LaunchSpec) -> Task:
                 ]
             )
             pane = replacement.stdout.decode().strip()
+            tmux(["set-option", "-t", session, "@agt_pane", pane])
             tmux(["set-option", "-w", "-t", pane, "remain-on-exit", "on"])
             tmux(["kill-window", "-t", placeholder_pane])
             tmux(
@@ -2959,6 +3013,7 @@ def run_task(spec: LaunchSpec) -> Task:
             deadline = time.monotonic() + 5.0
             started = None
             while True:
+                hub_launch_checkpoint()
                 process = tmux(
                     [
                         "display-message",
@@ -3244,7 +3299,48 @@ def print_status(task: Task, as_json: bool) -> None:
     print(f"command: {shlex.join(task.command)}")
 
 
+def require_attach_terminal() -> None:
+    if hub_command_is_recursive():
+        raise CliLaneError(
+            "already inside CLI Lane; click Sessions or press Ctrl-b w to open the list"
+        )
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise CliLaneError("attaching needs an interactive terminal")
+
+
+def discard_unattached_hub_context(context: str) -> None:
+    option = hub_context_option(context)
+    listed = tmux(["show-options", "-g"], check=False)
+    if listed.returncode != 0:
+        return
+    registrations: list[tuple[str, str, str]] = []
+    for line in listed.stdout.decode(errors="replace").splitlines():
+        key, _, value = line.partition(" ")
+        if not key.startswith(HUB_CLIENT_CONTEXT_OPTION_PREFIX):
+            continue
+        entry = parse_hub_client_context(value.strip('"'))
+        if entry is not None and entry[1] == context:
+            registrations.append((key, entry[0], value.strip('"')))
+    clients = tmux(["list-clients", "-F", "#{client_name}|#{client_pid}"], check=False)
+    if clients.returncode != 0:
+        return
+    for line in clients.stdout.decode(errors="replace").splitlines():
+        client, _, pid = line.rpartition("|")
+        if any(
+            key == hub_client_context_option(client) and registered_pid == pid
+            for key, registered_pid, _ in registrations
+        ):
+            return
+    for key, _, value in registrations:
+        run_tmux_commands_if(
+            tmux_option_equals(key, value), [["set-option", "-gu", key]]
+        )
+    tmux(["set-hook", "-gu", hub_detach_hook(context)], check=False)
+    tmux(["set-option", "-gu", option], check=False)
+
+
 def attach_client(arguments: Sequence[str]) -> int:
+    require_attach_terminal()
     environment = os.environ.copy()
     environment.pop("TMUX", None)
     environment.pop("TMUX_PANE", None)
@@ -3271,20 +3367,24 @@ def attach_client(arguments: Sequence[str]) -> int:
 
 
 def attach_task(task: Task) -> int:
+    require_attach_terminal()
     configure_task_status(task.session, task.command)
     context = create_hub_context(None)
-    bind_hub_keys()
-    return attach_client(
-        [
-            "attach-session",
-            "-E",
-            "-t",
-            task.session,
-            ";",
-            "run-shell",
-            hub_register_command(context),
-        ]
-    )
+    try:
+        bind_hub_keys()
+        return attach_client(
+            [
+                "attach-session",
+                "-E",
+                "-t",
+                task.session,
+                ";",
+                "run-shell",
+                hub_register_command(context),
+            ]
+        )
+    finally:
+        discard_unattached_hub_context(context)
 
 
 def tmux_literal(text: str, expansions: int) -> str:
@@ -3760,6 +3860,11 @@ def hub_left_check_command() -> str:
 def bind_hub_keys() -> None:
     open_command = hub_open_command()
     configure_hub_navigation()
+    for key in ("c", "%", '"'):
+        tmux([
+            "bind-key", "-T", "prefix", key, "display-message",
+            "CLI Lane uses one pane per session; press Ctrl-Q to open Sessions and start another lane",
+        ])
     tmux(
         [
             "bind-key",
@@ -4181,8 +4286,18 @@ def finish_hub_popup(
 
 
 def hub_register(client: str, client_pid: str, context: str) -> int:
-    register_hub_client(client, client_pid, context)
-    return 0
+    try:
+        if not hub_client_exists(client, client_pid):
+            return 0
+        register_hub_client(client, client_pid, context)
+        return 0
+    except CliLaneError:
+        if hub_client_exists(client, client_pid):
+            raise
+        return 0
+    finally:
+        if not hub_client_exists(client, client_pid) and HUB_CONTEXT_PATTERN.fullmatch(context):
+            discard_unattached_hub_context(context)
 
 
 def hub_forget(
@@ -4197,60 +4312,75 @@ def hub_forget(
 def hub_open(
     client: str, source: str, client_pid: str, supplied_context: str
 ) -> int:
-    if not hub_client_exists(client, client_pid):
-        raise CliLaneError("the clilane client is no longer attached")
-    if supplied_context:
-        register_hub_client(client, client_pid, supplied_context)
-    context = hub_client_context(client, client_pid)
-    data = hub_context_data(context)
-    environment = data["environment"]
-    load_hub_presets(
-        str(data["config"]),
-        allow_missing=not bool(data["config_required"]),
-        launch_environment=environment if isinstance(environment, dict) else {},
-        profiles_file=str(data["profiles"]),
-    )
-    ensure_hub_session()
-    for task in list_tasks():
-        configure_task_status(task.session, task.command)
-    tmux(["switch-client", "-E", "-c", client, "-t", HUB_SESSION])
-    generation = uuid.uuid4().hex
-    popup_value = f"{client_pid}:{context}:{generation}"
-    tmux(["set-option", "-g", hub_client_popup_option(client), popup_value])
-    tmux(["display-popup", "-c", client, "-C"], check=False)
-    command = (
-        f"{hub_helper_prefix('__hub-ui')}"
-        f"{shlex.quote(client)} {shlex.quote(client_pid)} "
-        f"{shlex.quote(source)} {shlex.quote(context)} {shlex.quote(generation)}"
-    )
-    shown = tmux(
-        [
-            "display-popup",
-            "-c",
-            client,
-            "-E",
-            "-B",
-            "-w",
-            "100%",
-            "-h",
-            "100%",
-            "-x",
-            "0",
-            "-y",
-            "0",
-            command,
-        ],
-        check=False,
-    )
-    current_popup = tmux(
-        ["show-options", "-gqv", hub_client_popup_option(client)]
-    ).stdout.decode().strip()
-    released = current_popup not in (popup_value, f"{popup_value}:launch")
-    finish_hub_popup(client, client_pid, context, generation)
-    if shown.returncode != 0 and not released:
-        detail = shown.stderr.decode(errors="replace").strip()
-        raise CliLaneError(detail or "could not open the session switcher")
-    return 0
+    context = supplied_context
+    generation = ""
+    try:
+        if not hub_client_exists(client, client_pid):
+            return 0
+        if supplied_context:
+            register_hub_client(client, client_pid, supplied_context)
+        context = hub_client_context(client, client_pid)
+        data = hub_context_data(context)
+        environment = data["environment"]
+        load_hub_presets(
+            str(data["config"]),
+            allow_missing=not bool(data["config_required"]),
+            launch_environment=environment if isinstance(environment, dict) else {},
+            profiles_file=str(data["profiles"]),
+        )
+        ensure_hub_session()
+        for task in list_tasks():
+            configure_task_status(task.session, task.command)
+        tmux(["switch-client", "-E", "-c", client, "-t", HUB_SESSION])
+        generation = uuid.uuid4().hex
+        popup_value = f"{client_pid}:{context}:{generation}"
+        tmux(["set-option", "-g", hub_client_popup_option(client), popup_value])
+        tmux(["display-popup", "-c", client, "-C"], check=False)
+        command = (
+            f"{hub_helper_prefix('__hub-ui')}"
+            f"{shlex.quote(client)} {shlex.quote(client_pid)} "
+            f"{shlex.quote(source)} {shlex.quote(context)} {shlex.quote(generation)}"
+        )
+        shown = tmux(
+            [
+                "display-popup",
+                "-c",
+                client,
+                "-E",
+                "-B",
+                "-w",
+                "100%",
+                "-h",
+                "100%",
+                "-x",
+                "0",
+                "-y",
+                "0",
+                command,
+            ],
+            check=False,
+        )
+        current_popup = tmux(
+            ["show-options", "-gqv", hub_client_popup_option(client)]
+        ).stdout.decode().strip()
+        released = current_popup not in (popup_value, f"{popup_value}:launch")
+        finish_hub_popup(client, client_pid, context, generation)
+        if shown.returncode != 0 and not released:
+            detail = shown.stderr.decode(errors="replace").strip()
+            raise CliLaneError(detail or "could not open the session switcher")
+        return 0
+    except CliLaneError:
+        if hub_client_exists(client, client_pid):
+            raise
+        return 0
+    finally:
+        if not hub_client_exists(client, client_pid):
+            if generation:
+                popup_value = f"{client_pid}:{context}:{generation}"
+                clear_hub_popup(client, popup_value)
+                clear_hub_popup(client, f"{popup_value}:launch")
+            if context and HUB_CONTEXT_PATTERN.fullmatch(context):
+                discard_unattached_hub_context(context)
 
 
 def next_hub_task_name(base: str, tasks: Sequence[Task]) -> str:
@@ -4450,36 +4580,111 @@ def revalidate_hub_preset(
     return selected
 
 
+def hub_prompt_agent_kind(preset: dict[str, object]) -> str | None:
+    kind = hub_preset_kind(preset)
+    command = list(preset["command"])
+    executable = Path(str(command[0]))
+    if executable.resolve().name == "cat":
+        return None
+    if executable.name.lower() == kind or preset.get("provider") == kind:
+        return kind
+    return None
+
+
+def hub_prompt_capture(task: Task) -> str:
+    captured = tmux(
+        ["capture-pane", "-p", "-J", "-t", task.pane], check=False
+    )
+    if captured.returncode != 0:
+        raise CliLaneError(f"could not inspect {task.name}; open it to finish startup")
+    return captured.stdout.decode(errors="replace")
+
+
+def hub_agent_composer_ready(task: Task, kind: str) -> bool:
+    position = tmux(
+        ["display-message", "-p", "-t", task.pane, "#{cursor_x}|#{cursor_y}"],
+        check=False,
+    )
+    parts = position.stdout.decode(errors="replace").strip().split("|")
+    if position.returncode != 0 or len(parts) != 2 or not all(part.isdigit() for part in parts):
+        return False
+    column, row = (int(part) for part in parts)
+    captured = tmux(["capture-pane", "-e", "-p", "-t", task.pane], check=False)
+    rows = captured.stdout.decode(errors="replace").splitlines()
+    if captured.returncode != 0 or row >= len(rows):
+        return False
+    faint = False
+    visible: list[str] = []
+    for token in re.findall(r"\x1b\[[0-?]*[ -/]*[@-~]|[^\x1b]", rows[row]):
+        if not token.startswith("\x1b"):
+            if not faint:
+                visible.append(token)
+            continue
+        if not token.endswith("m"):
+            continue
+        parameters = (token[2:-1] or "0").split(";")
+        index = 0
+        while index < len(parameters):
+            parameter = parameters[index].split(":")[0] or "0"
+            if parameter in {"0", "22"}:
+                faint = False
+            elif parameter == "2":
+                faint = True
+            if parameter in {"38", "48", "58"} and ":" not in parameters[index]:
+                mode = parameters[index + 1] if index + 1 < len(parameters) else ""
+                index += 3 if mode == "5" else 5 if mode == "2" else 1
+            else:
+                index += 1
+    prompt = "".join(visible)
+    patterns = {
+        "codex": r"^(\s*›\s)\s*$",
+        "claude": r"^(\s*❯\s)\s*$",
+        "kimi": r"^(\s*[│┃|]\s*>\s)\s*[│┃|]\s*$",
+    }
+    matched = re.fullmatch(patterns[kind], prompt)
+    return matched is not None and column == display_width(matched.group(1))
+
+
 def wait_for_hub_agent_ready(preset: dict[str, object], task: Task) -> None:
-    if hub_preset_kind(preset) != "omp":
+    kind = hub_prompt_agent_kind(preset)
+    if kind is None:
         return
     tty_result = tmux(
         ["display-message", "-p", "-t", task.pane, "#{pane_tty}"], check=False
     )
-    if tty_result.returncode != 0:
-        return
     tty_path = tty_result.stdout.decode(errors="replace").strip()
-    if not tty_path:
-        return
+    if tty_result.returncode != 0 or not tty_path:
+        raise CliLaneError(f"could not inspect {task.name}; open it to finish startup")
     try:
         descriptor = os.open(
             tty_path,
             os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOCTTY", 0),
         )
-    except OSError:
-        return
+    except OSError as error:
+        raise CliLaneError(
+            f"could not inspect {task.name}; open it to finish startup"
+        ) from error
     try:
         deadline = time.monotonic() + HUB_AGENT_READY_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
+            hub_launch_checkpoint()
             try:
                 attributes = termios.tcgetattr(descriptor)
-            except termios.error:
-                return
+            except termios.error as error:
+                raise CliLaneError(
+                    f"could not inspect {task.name}; open it to finish startup"
+                ) from error
             if not attributes[3] & termios.ICANON:
-                return
+                if kind == "omp":
+                    return
+                if hub_agent_composer_ready(task, kind):
+                    return
             time.sleep(HUB_AGENT_READY_POLL_SECONDS)
     finally:
         os.close(descriptor)
+    raise CliLaneError(
+        f"{task.name} is not ready; open it to finish startup. Message was not sent"
+    )
 
 
 def wait_for_hub_prompt_visible(task: Task, prompt: str) -> None:
@@ -4488,26 +4693,44 @@ def wait_for_hub_prompt_visible(task: Task, prompt: str) -> None:
         return
     probe = normalized[-16:]
     deadline = time.monotonic() + HUB_AGENT_READY_TIMEOUT_SECONDS
+    visible_since: float | None = None
     while time.monotonic() < deadline:
-        captured = tmux(
-            ["capture-pane", "-p", "-J", "-t", task.pane], check=False
-        )
-        if captured.returncode != 0:
-            return
-        visible = " ".join(captured.stdout.decode(errors="replace").split())
-        if probe in visible:
-            return
+        hub_launch_checkpoint()
+        visible = " ".join(hub_prompt_capture(task).split())
+        pasted = bool(re.search(r"\[Pasted (?:text|content)[^\]]*\]", visible, re.I))
+        if probe in visible or pasted:
+            if visible_since is None:
+                visible_since = time.monotonic()
+            if time.monotonic() - visible_since >= 0.2:
+                return
+        else:
+            visible_since = None
         time.sleep(HUB_AGENT_READY_POLL_SECONDS)
+    raise CliLaneError(
+        f"message was not confirmed in {task.name}; open it before sending again"
+    )
 
 
 def send_hub_prompt(preset: dict[str, object], task: Task, prompt: str) -> None:
-    if hub_preset_kind(preset) != "omp":
-        send_task(task.id, prompt, True)
+    hub_launch_checkpoint()
+    if hub_prompt_agent_kind(preset) is None:
+        hub_launch_submit(lambda: send_task(task.id, prompt, True))
         return
     wait_for_hub_agent_ready(preset, task)
-    send_task(task.id, prompt, False)
+    hub_launch_checkpoint()
+    validate_message_text(prompt)
+    with registry_lock():
+        current = live_task(task.id)
+        buffer_name = f"agt_{uuid.uuid4().hex}"
+        tmux(["load-buffer", "-b", buffer_name, "-"], input_data=prompt.encode())
+        try:
+            hub_launch_checkpoint()
+            tmux(["paste-buffer", "-p", "-b", buffer_name, "-d", "-t", current.pane])
+        finally:
+            tmux(["delete-buffer", "-b", buffer_name], check=False)
     wait_for_hub_prompt_visible(task, prompt)
-    key_task(task.id, ["Enter"])
+    hub_launch_checkpoint()
+    hub_launch_submit(lambda: key_task(task.id, ["Enter"]))
 
 
 def launch_hub_preset(
@@ -4530,6 +4753,7 @@ def launch_hub_preset(
         provider=provider,
     )
     task = run_task(spec)
+    hub_launch_created(task)
     if prompt:
         send_hub_prompt(selected, task, prompt)
     return task
@@ -4664,6 +4888,7 @@ def resume_hub_task(
     if carried is not None:
         new_log = validated_log_path(resumed)
         os.replace(carried, new_log.with_suffix(new_log.suffix + ".previous"))
+    hub_launch_created(resumed)
     return resumed
 
 
@@ -4694,6 +4919,16 @@ def hub_resume_kind(task: Task, presets: Sequence[dict[str, object]]) -> str | N
     return kind
 
 
+def hub_resume_action(task: Task, presets: Sequence[dict[str, object]]) -> str:
+    kind = hub_resume_kind(task, presets)
+    if kind is None:
+        return "rerun"
+    command = hub_resume_command(task.command, kind, task.name)
+    if any(value in command[1:] for value in ("--last", "--continue", "-c")):
+        return "resume latest in project"
+    return "resume"
+
+
 def hub_claimed_launch(
     client: str,
     client_pid: str,
@@ -4704,12 +4939,90 @@ def hub_claimed_launch(
     claim_value = f"{popup_value}:launch"
     if not replace_hub_popup(client, client_pid, context, popup_value, claim_value):
         return False, None
+    cancelled = threading.Event()
+    submitted = threading.Event()
+    submission_lock = threading.Lock()
+    pending_keys: list[str] = []
+    leave = False
+
+    def run_launch() -> Task:
+        HUB_LAUNCH_STATE.cancelled = cancelled
+        HUB_LAUNCH_STATE.task = None
+        HUB_LAUNCH_STATE.lock = submission_lock
+        HUB_LAUNCH_STATE.submitted = submitted
+        try:
+            hub_launch_checkpoint()
+            task = launch()
+            hub_launch_checkpoint()
+            return task
+        except CliLaneError:
+            if cancelled.is_set():
+                task = HUB_LAUNCH_STATE.task
+                if task is not None:
+                    stop_task(task.id, 0.5)
+                raise HubLaunchCancelled("Launch cancelled · draft kept")
+            raise
+        finally:
+            del HUB_LAUNCH_STATE.cancelled
+            del HUB_LAUNCH_STATE.task
+            del HUB_LAUNCH_STATE.lock
+            del HUB_LAUNCH_STATE.submitted
+
     try:
-        task = launch()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(run_launch)
+            try:
+                while not future.done():
+                    if sys.stdin.isatty():
+                        ready, _, _ = select.select([sys.stdin.fileno()], [], [], 0.05)
+                        if ready:
+                            event = hub_key(sys.stdin.fileno())
+                            if event is not None and event[0] in {
+                                "interrupt", "eof", "escape", "quit",
+                            }:
+                                with submission_lock:
+                                    if submitted.is_set():
+                                        key = {
+                                            "interrupt": "C-c", "eof": "C-d",
+                                            "escape": "Escape",
+                                        }.get(event[0])
+                                        if key is not None:
+                                            pending_keys.append(key)
+                                    else:
+                                        cancelled.set()
+                                leave = leave or event[0] == "quit"
+                    else:
+                        time.sleep(0.05)
+                    if not hub_client_exists(client, client_pid):
+                        with submission_lock:
+                            if not submitted.is_set():
+                                cancelled.set()
+                        leave = True
+                task = future.result()
+                if cancelled.is_set():
+                    stop_task(task.id, 0.5)
+                    raise HubLaunchCancelled("Launch cancelled · draft kept")
+            finally:
+                if not future.done():
+                    cancelled.set()
     except CliLaneError as error:
+        if leave:
+            detach_hub_popup(client, client_pid, context, claim_value)
+            return False, None
         if not replace_hub_popup(client, client_pid, context, claim_value, popup_value):
             return False, None
+        with suppress(termios.error):
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
         return True, str(error)
+    if pending_keys:
+        try:
+            key_task(task.id, pending_keys)
+        except CliLaneError:
+            if any(item.id == task.id and not item.dead for item in list_tasks()):
+                raise
+    if leave:
+        detach_hub_popup(client, client_pid, context, claim_value)
+        return False, None
     switch_hub_popup(client, client_pid, context, claim_value, task.session)
     return True, None
 
@@ -4894,7 +5207,7 @@ def hub_draw(
         ]
     elif peek is not None:
         if peek[2]:
-            first = f"{peek[0].name} finished · Enter/Ctrl-R resume · → open pane · Ctrl-X remove"
+            first = f"Enter/Ctrl-R {hub_resume_action(peek[0], presets)} · → pane · Ctrl-X remove"
         else:
             first = f"{peek[0].name} finished · Enter/→ open pane · Ctrl-R rerun · Ctrl-X remove"
         hints = [
@@ -4902,9 +5215,15 @@ def hub_draw(
             f"type message · Enter start new ({agents}) · Space/Esc close · Ctrl-Q leave",
         ]
     else:
+        action_hint = "empty: →/Enter view · click open · Space peek · Esc back · Ctrl-X stop"
+        if selected < len(tasks) and tasks[selected].dead and hub_resume_kind(tasks[selected], presets):
+            action_hint = (
+                f"empty: Enter/Ctrl-R {hub_resume_action(tasks[selected], presets)}"
+                " · → pane · Space peek · Ctrl-X remove"
+            )
         hints = [
             f"type message · Tab agent ({agents}) · Enter start · ↑↓ jobs",
-            "empty: →/Enter view · click open · Space peek · Esc back · Ctrl-X stop",
+            action_hint,
         ]
     lines.extend(
         [
@@ -5243,7 +5562,8 @@ def hub_ui(
                 if prompt:
                     notice = "Clear the composer first (Esc), then Ctrl-R"
                     continue
-                redraw(f"Resuming {target.name}…")
+                action = hub_resume_action(target, presets)
+                redraw(f"{action.capitalize()} · {target.name}… · Ctrl-C cancel")
                 alive, error = hub_claimed_launch(
                     client,
                     client_pid,
@@ -5334,7 +5654,7 @@ def hub_ui(
                 )
                 continue
             name = hub_task_name(preset, all_tasks)
-            redraw(f"Starting {name}…")
+            redraw(f"Starting {name}… · Ctrl-C cancel")
             launch_preset = preset
             launch_prompt = prompt
             alive, error = hub_claimed_launch(
@@ -5447,27 +5767,27 @@ def ensure_hub_session() -> None:
 
 
 def hub_command(configured: str | None) -> int:
-    if hub_command_is_recursive():
-        raise CliLaneError(
-            "already inside CLI Lane; click Sessions or press Ctrl-b w to open the list"
-        )
+    require_attach_terminal()
     load_hub_presets(configured)
     ensure_server_available()
     ensure_hub_session()
     context = create_hub_context(configured)
-    bind_hub_keys()
-    return attach_client(
-        [
-            "attach-session",
-            "-E",
-            "-t",
-            HUB_SESSION,
-            ";",
-            "run-shell",
-            "-b",
-            hub_open_command(context),
-        ]
-    )
+    try:
+        bind_hub_keys()
+        return attach_client(
+            [
+                "attach-session",
+                "-E",
+                "-t",
+                HUB_SESSION,
+                ";",
+                "run-shell",
+                "-b",
+                hub_open_command(context),
+            ]
+        )
+    finally:
+        discard_unattached_hub_context(context)
 
 
 def read_task(task: Task, all_history: bool) -> int:
