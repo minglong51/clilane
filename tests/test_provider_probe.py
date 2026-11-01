@@ -1121,7 +1121,7 @@ module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 module.EXECUTABLE_MANIFEST_PATH = Path({str(manifest_path)!r})
-module.COLLECTOR_SIGNAL_TIMEOUT_SECONDS = 0.4
+module.COLLECTOR_SIGNAL_TIMEOUT_SECONDS = 2.0
 module.COLLECTOR_TIMEOUT_SECONDS = 1
 module.ABORT_TIMEOUT_SECONDS = 0.05
 handled = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)

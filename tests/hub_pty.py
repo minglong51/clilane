@@ -662,6 +662,23 @@ def _wait_for_client_session(
         terminal.settle(quiet=0.1, timeout=0.5)
 
 
+def _wait_for_attached_task(
+    environment: dict[str, str], terminal: _Terminal, name: str
+) -> None:
+    deadline = time.monotonic() + 10.0
+    while True:
+        tasks = _tasks(environment)
+        matching = [task for task in tasks if task["name"] == name]
+        if (
+            len(matching) == 1
+            and matching[0]["state"] == "running"
+            and matching[0]["attached"]
+        ):
+            return
+        assert time.monotonic() < deadline, tasks
+        terminal.settle(quiet=0.1, timeout=0.5)
+
+
 def _exercise_switcher_keys(environment: dict[str, str]) -> None:
     terminal: _Terminal | None = None
     try:
@@ -1218,7 +1235,10 @@ def main() -> int:
             discovery_terminal.send(launch_prompt.encode() + b"\r")
             discovery_terminal.expect("Starting codex-launch-project", mark)
             discovery_terminal.expect(launch_prompt, mark)
-            discovery_terminal.settle()
+            _wait_for_attached_task(
+                discovery_environment, discovery_terminal, "codex-launch-project"
+            )
+            discovery_terminal.expect("LOCAL · codex-launch-project", mark)
             mark = discovery_terminal.mark()
             discovery_terminal.send(b"\x11")
             discovery_terminal.expect("This clilane server", mark)
@@ -1270,7 +1290,10 @@ def main() -> int:
             discovery_terminal.send(source_prompt.encode() + b"\r")
             discovery_terminal.expect("Starting kimi-source-project", mark)
             discovery_terminal.expect(source_prompt, mark)
-            discovery_terminal.settle()
+            _wait_for_attached_task(
+                discovery_environment, discovery_terminal, "kimi-source-project"
+            )
+            discovery_terminal.expect("LOCAL · kimi-source-project", mark)
             mark = discovery_terminal.mark()
             discovery_terminal.send(b"\x11")
             discovery_terminal.expect("This clilane server", mark)
