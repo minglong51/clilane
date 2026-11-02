@@ -33,7 +33,7 @@ from typing import BinaryIO, Callable, Iterator, Mapping, Sequence
 
 
 PROGRAM = "clilane"
-VERSION = "0.14.2"
+VERSION = "0.14.3"
 TASK_STATE_INITIALIZING = "initializing"
 TASK_STATE_RUNNING = "running"
 TASK_STATE_STOPPED = "stopped"
@@ -4319,6 +4319,19 @@ def hub_open(
             return 0
         if supplied_context:
             register_hub_client(client, client_pid, supplied_context)
+        dimensions = tmux(
+            ["display-message", "-p", "-c", client, "#{client_width} #{client_height}"],
+            check=False,
+        )
+        if dimensions.returncode != 0:
+            return 0
+        columns, rows = map(int, dimensions.stdout.decode().split())
+        if columns < 24 or rows < 8:
+            tmux(
+                ["display-message", "-c", client, "Resize to 24x8, then press Ctrl-Q"],
+                check=False,
+            )
+            return 0
         context = hub_client_context(client, client_pid)
         data = hub_context_data(context)
         environment = data["environment"]
@@ -4763,6 +4776,59 @@ def hub_command_kind(command: Sequence[str]) -> str | None:
     return hub_preset_kind({"name": "", "command": list(command)})
 
 
+def hub_provider_subcommand(command: Sequence[str], kind: str) -> str | None:
+    value_options = {
+        "codex": {
+            "-c", "--config", "--enable", "--disable", "--remote",
+            "--remote-auth-token-env", "-i", "--image", "-m", "--model",
+            "--local-provider", "-p", "--profile", "-s", "--sandbox",
+            "-C", "--cd", "--add-dir", "-a", "--ask-for-approval",
+        },
+        "kimi": {
+            "-m", "--model", "-p", "--prompt", "--output-format",
+            "--skills-dir", "--agent", "--agent-file", "--add-dir",
+        },
+    }[kind]
+    flags = {
+        "codex": {
+            "--strict-config", "--oss", "--approve-for-me", "--worktree",
+            "--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust",
+            "--search", "--no-alt-screen", "--no-daemon", "-h", "--help", "-V", "--version",
+        },
+        "kimi": {"-c", "--continue", "-y", "--yolo", "--auto", "--plan", "-h", "--help", "-V", "--version"},
+    }[kind]
+    index = 1
+    while index < len(command):
+        argument = command[index]
+        if argument == "--":
+            return None
+        if not argument.startswith("-"):
+            return argument
+        option, equals, _ = argument.partition("=")
+        if kind == "kimi" and option in {"-S", "--session"}:
+            index += 1
+            if not equals and index < len(command) and not command[index].startswith("-"):
+                index += 1
+        elif option in value_options:
+            index += 1
+            if not equals:
+                if index >= len(command) or command[index].startswith("-"):
+                    return None
+                index += 1
+                if kind == "codex" and option in {"-i", "--image"}:
+                    while index < len(command) and not command[index].startswith("-"):
+                        index += 1
+        elif argument[:2] in value_options and len(argument) > 2 and not argument.startswith("--"):
+            index += 1
+        elif kind == "kimi" and argument.startswith("-S") and len(argument) > 2:
+            index += 1
+        elif argument in flags:
+            index += 1
+        else:
+            return None
+    return None
+
+
 def hub_resume_command(command: Sequence[str], kind: str | None, name: str) -> list[str]:
     if kind is None:
         return list(command)
@@ -4770,15 +4836,30 @@ def hub_resume_command(command: Sequence[str], kind: str | None, name: str) -> l
     if entry is None:
         raise CliLaneError(f"resume is not supported for {kind}: {name}")
     extra, markers, conflicts = entry
-    clashing = sorted(item for item in command[1:] if item in conflicts)
+    option_end = command.index("--") if "--" in command else len(command)
+    options = [
+        item.split("=", 1)[0] if item.startswith("--") else item
+        for item in command[1:option_end]
+    ]
+    if kind == "claude" and "--fork-session" in options:
+        raise CliLaneError(
+            f"cannot resume {name}: forked conversation ID was not recorded; "
+            "use Claude's session picker"
+        )
+    if kind in {"codex", "kimi"} and hub_provider_subcommand(command, kind) == "fork":
+        raise CliLaneError(
+            f"cannot resume {name}: forked conversation ID was not recorded; "
+            f"use {kind.title()}'s session picker"
+        )
+    clashing = sorted(item for item in options if item in conflicts)
     if clashing:
         raise CliLaneError(
             f"cannot resume {name}: {', '.join(clashing)} cannot combine with "
             f"{' '.join(extra)}"
         )
-    if any(item in markers for item in command[1:]):
+    if any(item in markers for item in options):
         return list(command)
-    return [*command, *extra]
+    return [*command[:option_end], *extra, *command[option_end:]]
 
 
 def hub_base_command(command: Sequence[str], kind: str | None) -> list[str]:
@@ -4786,8 +4867,9 @@ def hub_base_command(command: Sequence[str], kind: str | None) -> list[str]:
     if entry is None:
         return list(command)
     extra = entry[0]
-    if len(command) > len(extra) and list(command[-len(extra) :]) == extra:
-        return list(command[: -len(extra)])
+    option_end = command.index("--") if "--" in command else len(command)
+    if option_end > len(extra) and list(command[option_end - len(extra) : option_end]) == extra:
+        return [*command[: option_end - len(extra)], *command[option_end:]]
     return list(command)
 
 
@@ -4924,7 +5006,11 @@ def hub_resume_action(task: Task, presets: Sequence[dict[str, object]]) -> str:
     if kind is None:
         return "rerun"
     command = hub_resume_command(task.command, kind, task.name)
-    if any(value in command[1:] for value in ("--last", "--continue", "-c")):
+    latest = {"--last"} if kind == "codex" else {"--continue", "-c"}
+    option_end = command.index("--") if "--" in command else len(command)
+    if any(value in latest for value in command[1:option_end]):
+        if kind == "codex" and "--all" in command[1:option_end]:
+            return "resume latest across projects"
         return "resume latest in project"
     return "resume"
 
@@ -5054,7 +5140,7 @@ def hub_peek_title(task: Task) -> str:
     return f"{task.name} · {task.state} · latest output"
 
 
-def hub_task_line(task: Task) -> str:
+def hub_task_line(task: Task, width: int = 80) -> str:
     markers = {
         TASK_STATE_INITIALIZING: "○",
         TASK_STATE_RUNNING: "●",
@@ -5067,6 +5153,8 @@ def hub_task_line(task: Task) -> str:
     project = Path(task.cwd).name or task.cwd
     source = "BOT" if task.origin == "bot" else "LOCAL"
     attached = " open" if task.attached else ""
+    if width < 80:
+        return f"{marker} {task.state:<9} {task.name} · {agent}"
     return (
         f"{marker}  {task.name:<22.22} {agent:<12.12} "
         f"{task.state:<12.12} {age(task.created):>4}  {source:<5} {project}{attached}"
@@ -5080,25 +5168,36 @@ def hub_composer_line(
     width: int,
     reply_to: Task | None = None,
 ) -> str:
+    label_width = max(1, min(width - 8, width // 2))
     if reply_to is not None:
-        agent = fleet_display_cell(f"reply · {reply_to.name}", max(1, width - 10))
+        agent = fleet_display_cell(f"reply · {reply_to.name}", label_width)
     elif preset:
         project = Path(str(preset["dir"])).name or str(preset["dir"])
         agent = fleet_display_cell(
-            f"{preset['name']} · {project}", max(1, width - 10)
+            f"{preset['name']} · {project}", label_width
         )
     else:
         agent = "no-agent"
     prefix = f"[{agent}] > "
-    room = max(1, width - len(prefix) - 2)
+    room = max(1, width - display_width(prefix))
     before = fleet_display_cell(prompt[:cursor])
     after = fleet_display_cell(prompt[cursor:])
-    left_room = min(len(before), max(room // 2, room - len(after) - 1))
-    visible_before = before[-left_room:] if left_room else ""
-    if len(before) > len(visible_before) and room > 1:
-        visible_before = "…" + visible_before[1:]
-    after_room = max(0, room - len(visible_before) - 1)
-    visible_after = after[:after_room]
+    left_room = min(
+        display_width(before), max((room - 1) // 2, room - display_width(after) - 1)
+    )
+    clipped = display_width(before) > left_room
+    tail_room = max(0, left_room - int(clipped))
+    tail: list[str] = []
+    used = 0
+    for character in reversed(before):
+        cells = character_width(character)
+        if used + cells > tail_room:
+            break
+        tail.append(character)
+        used += cells
+    visible_before = ("…" if clipped and left_room else "") + "".join(reversed(tail))
+    after_room = max(0, room - display_width(visible_before) - 1)
+    visible_after = fleet_display_cell(after, after_room) if after_room else ""
     return f"\033[1m[{agent}]\033[0m > {visible_before}▏{visible_after}"
 
 
@@ -5112,6 +5211,13 @@ def hub_no_presets_notice(
     return f"Install Codex, Kimi, or Claude · Or install OMP · Add agent presets to {config}"
 
 
+def hub_terminal_size() -> os.terminal_size:
+    try:
+        return os.get_terminal_size(sys.stdout.fileno())
+    except (OSError, ValueError):
+        return os.terminal_size((80, 24))
+
+
 def hub_draw(
     tasks: Sequence[Task],
     selected: int,
@@ -5123,9 +5229,20 @@ def hub_draw(
     peek: tuple[Task, Sequence[str], bool] | None = None,
     hidden_history: int = 0,
 ) -> dict[int, int]:
-    width, height = shutil.get_terminal_size((80, 24))
-    width = max(24, width)
-    height = max(12, height)
+    columns, height = hub_terminal_size()
+    width = max(1, columns - 1)
+    height = max(1, height)
+    if columns < 24 or height < 8:
+        lines = ["Ctrl-Q leave", "Resize to at least 24×8", "Draft kept"]
+        if notice:
+            lines.insert(1, notice)
+        sys.stdout.write(
+            "\033[H\033[2J"
+            + "\r\n".join(fleet_display_cell(line, width) for line in lines[:height])
+        )
+        sys.stdout.flush()
+        return {}
+    compact = width < 80 or height < 16
     preset = presets[agent_index] if presets else None
     agents = " / ".join(str(item["name"]) for item in presets) or "no presets"
     ongoing_total = sum(1 for task in tasks if not task.dead)
@@ -5142,7 +5259,7 @@ def hub_draw(
                 else f"HISTORY ({history_total})"
             )
             rows.append((label, None, "1"))
-        rows.append((hub_task_line(task), index, ""))
+        rows.append((hub_task_line(task, width), index, ""))
     if hidden_history:
         if shown_history == 0:
             rows.append((f"HISTORY (showing 0 of {history_total})", None, "1"))
@@ -5153,14 +5270,19 @@ def hub_draw(
         (position for position, (_, index, _) in enumerate(rows) if index == selected),
         len(rows) - 1,
     )
-    body_height = max(1, height - 9)
+    body_height = max(1, height - (6 if compact else 9))
     peek_lines: list[str] = []
     if peek is not None:
         peek_task, captured, _ = peek
-        peek_height = max(2, min(body_height - 3, body_height // 2 + 2))
+        peek_height = min(
+            body_height - 1, max(2, min(body_height - 3, body_height // 2 + 2))
+        )
         body_height = max(1, body_height - peek_height)
         title = fleet_display_cell(f"── {hub_peek_title(peek_task)} ", width - 4)
-        peek_lines.append(f"\033[2m{title}{'─' * max(0, width - len(title) - 1)}\033[0m")
+        if peek_height:
+            peek_lines.append(
+                f"\033[2m{title}{'─' * max(0, width - display_width(title) - 1)}\033[0m"
+            )
         tail = list(captured[-(peek_height - 1) :]) if peek_height > 1 else []
         peek_lines.extend(
             f" {fleet_display_cell(line, max(1, width - 2))}" for line in tail
@@ -5172,7 +5294,8 @@ def hub_draw(
     lines = [
         "\033[1mCLI LANE\033[0m",
         fleet_display_cell(
-            "This clilane server · LOCAL terminal · BOT OpenClaw/automation", width
+            "This clilane server · LOCAL terminal · BOT OpenClaw/automation · Ctrl-Q leave",
+            width,
         ),
         fleet_display_cell(
             f"   {'JOB':<22} {'AGENT':<12} {'STATE':<12} "
@@ -5180,6 +5303,8 @@ def hub_draw(
             width,
         ),
     ]
+    if compact:
+        lines = ["\033[1mCLI LANE\033[0m", "  STATE     SESSION"]
     mouse_rows: dict[int, int] = {}
     for text, index, style in visible:
         cleaned = fleet_display_cell(text, max(1, width - 2))
@@ -5209,7 +5334,12 @@ def hub_draw(
         if peek[2]:
             first = f"Enter/Ctrl-R {hub_resume_action(peek[0], presets)} · → pane · Ctrl-X remove"
         else:
-            first = f"{peek[0].name} finished · Enter/→ open pane · Ctrl-R rerun · Ctrl-X remove"
+            repeat = (
+                "Ctrl-R rerun"
+                if hub_command_kind(peek[0].command) is None
+                else "resume unavailable"
+            )
+            first = f"{peek[0].name} finished · Enter/→ open pane · {repeat} · Ctrl-X remove"
         hints = [
             first,
             f"type message · Enter start new ({agents}) · Space/Esc close · Ctrl-Q leave",
@@ -5221,10 +5351,42 @@ def hub_draw(
                 f"empty: Enter/Ctrl-R {hub_resume_action(tasks[selected], presets)}"
                 " · → pane · Space peek · Ctrl-X remove"
             )
+        elif selected < len(tasks) and tasks[selected].dead:
+            repeat = (
+                "Ctrl-R rerun"
+                if hub_command_kind(tasks[selected].command) is None
+                else "resume unavailable"
+            )
+            action_hint = f"empty: Enter/→ view · {repeat} · Space peek · Ctrl-X remove"
         hints = [
             f"type message · Tab agent ({agents}) · Enter start · ↑↓ jobs",
             action_hint,
         ]
+    if compact:
+        target = tasks[selected] if selected < len(tasks) else None
+        if prompt:
+            action = "send" if reply_to is not None else "start"
+        elif target is None:
+            action = "start"
+        elif target.dead and hub_resume_kind(target, presets):
+            action = hub_resume_action(target, presets)
+        else:
+            action = "view"
+        lines[1] = "↑↓ jobs · Space peek"
+        if action == "resume latest in project":
+            hints = ["Enter latest in project", "Ctrl-Q leave"]
+        elif action == "resume latest across projects":
+            hints = ["Enter latest (all dirs)", "Ctrl-Q leave"]
+        elif reply_to is not None:
+            hints = [f"Enter {action} · Esc close", "Ctrl-Q leave"]
+        else:
+            hints = [f"Enter {action} · Tab agent", "Ctrl-Q leave"]
+        if target is not None:
+            if target.dead:
+                lines[1] = "↑↓ jobs · Ctrl-X remove"
+                hints[1] = "Ctrl-Q leave Space peek"
+            else:
+                hints[1] = "Ctrl-Q exit Ctrl-X stop"
     lines.extend(
         [
             hub_composer_line(preset, prompt, cursor, width, reply_to),
@@ -5423,6 +5585,12 @@ def hub_ui(
                 continue
             notice = ""
             key, text_value = event
+            size = hub_terminal_size()
+            too_small = size.columns < 24 or size.lines < 8
+            if too_small and key not in {
+                "quit", "interrupt", "eof",
+            }:
+                continue
             if key not in {"interrupt", "eof", "stop"}:
                 exit_deadline = 0.0
                 exit_key = ""
@@ -5480,7 +5648,7 @@ def hub_ui(
                 detach_hub_popup(client, client_pid, context, popup_value)
                 return 0
             if key in {"interrupt", "eof"}:
-                if prompt:
+                if prompt and not too_small:
                     prompt = ""
                     cursor = 0
                     exit_deadline = 0.0
@@ -5704,7 +5872,7 @@ def hub_standby() -> int:
     try:
         tty.setraw(descriptor)
         while True:
-            size = shutil.get_terminal_size((80, 24))
+            size = hub_terminal_size()
             if size != previous_size:
                 message = (
                     "CLI LANE · Switcher inactive · "
@@ -5768,6 +5936,9 @@ def ensure_hub_session() -> None:
 
 def hub_command(configured: str | None) -> int:
     require_attach_terminal()
+    size = hub_terminal_size()
+    if size.columns < 24 or size.lines < 8:
+        raise CliLaneError("resize the terminal to at least 24x8, then run clilane again")
     load_hub_presets(configured)
     ensure_server_available()
     ensure_hub_session()
