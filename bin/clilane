@@ -33,7 +33,7 @@ from typing import BinaryIO, Callable, Iterator, Mapping, Sequence
 
 
 PROGRAM = "clilane"
-VERSION = "0.14.3"
+VERSION = "0.14.4"
 TASK_STATE_INITIALIZING = "initializing"
 TASK_STATE_RUNNING = "running"
 TASK_STATE_STOPPED = "stopped"
@@ -4829,12 +4829,32 @@ def hub_provider_subcommand(command: Sequence[str], kind: str) -> str | None:
     return None
 
 
+def hub_claude_session_id(command: Sequence[str], option: str) -> str | None:
+    if len(command) == 3 and command[1] == option:
+        value = command[2]
+    elif (
+        len(command) == 2
+        and option.startswith("--")
+        and command[1].startswith(f"{option}=")
+    ):
+        value = command[1][len(option) + 1 :]
+    else:
+        return None
+    if re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", value):
+        return value
+    return None
+
+
 def hub_resume_command(command: Sequence[str], kind: str | None, name: str) -> list[str]:
     if kind is None:
         return list(command)
     entry = HUB_RESUME_ARGUMENTS.get(kind)
     if entry is None:
         raise CliLaneError(f"resume is not supported for {kind}: {name}")
+    if kind == "claude":
+        session_id = hub_claude_session_id(command, "--session-id")
+        if session_id is not None:
+            return [command[0], "--resume", session_id]
     extra, markers, conflicts = entry
     option_end = command.index("--") if "--" in command else len(command)
     options = [
@@ -4863,6 +4883,11 @@ def hub_resume_command(command: Sequence[str], kind: str | None, name: str) -> l
 
 
 def hub_base_command(command: Sequence[str], kind: str | None) -> list[str]:
+    if kind == "claude":
+        for option in ("--session-id", "--resume", "-r"):
+            session_id = hub_claude_session_id(command, option)
+            if session_id is not None:
+                return [command[0], "--resume", session_id]
     entry = HUB_RESUME_ARGUMENTS.get(kind or "")
     if entry is None:
         return list(command)
@@ -4876,12 +4901,12 @@ def hub_base_command(command: Sequence[str], kind: str | None) -> list[str]:
 def hub_matching_preset(
     task: Task, presets: Sequence[dict[str, object]]
 ) -> dict[str, object] | None:
-    base = hub_base_command(task.command, hub_command_kind(task.command))
     task_dir = Path(task.cwd).resolve()
     candidates = [
         preset
         for preset in presets
-        if hub_base_command(list(preset["command"]), hub_preset_kind(preset)) == base
+        if hub_base_command(list(preset["command"]), hub_preset_kind(preset))
+        == hub_base_command(task.command, hub_preset_kind(preset))
         and Path(str(preset["dir"])).resolve() == task_dir
     ]
     named = [
@@ -4892,6 +4917,19 @@ def hub_matching_preset(
     ]
     if named:
         return max(named, key=lambda preset: len(str(preset["name"])))
+    if hub_claude_session_id(hub_base_command(task.command, "claude"), "--resume") is not None:
+        literal = [
+            preset
+            for preset in candidates
+            if hub_preset_kind(preset) != "claude"
+            or list(preset["command"]) == task.command
+        ]
+        if len(candidates) != len(literal):
+            raise CliLaneError(
+                f"cannot resume {task.name}: specified session ID matches a differently "
+                "named preset; use native resume with the original profile"
+            )
+        candidates = literal
     return candidates[0] if candidates else None
 
 
@@ -4990,11 +5028,11 @@ def hub_history_batch(environment: Mapping[str, object]) -> int:
 
 
 def hub_resume_kind(task: Task, presets: Sequence[dict[str, object]]) -> str | None:
-    preset = hub_matching_preset(task, presets)
-    kind = hub_preset_kind(preset) if preset is not None else hub_command_kind(task.command)
-    if kind not in HUB_RESUME_ARGUMENTS:
-        return None
     try:
+        preset = hub_matching_preset(task, presets)
+        kind = hub_preset_kind(preset) if preset is not None else hub_command_kind(task.command)
+        if kind not in HUB_RESUME_ARGUMENTS:
+            return None
         hub_resume_command(task.command, kind, task.name)
     except CliLaneError:
         return None
@@ -5006,6 +5044,11 @@ def hub_resume_action(task: Task, presets: Sequence[dict[str, object]]) -> str:
     if kind is None:
         return "rerun"
     command = hub_resume_command(task.command, kind, task.name)
+    if kind == "claude" and any(
+        hub_claude_session_id(command, option) is not None
+        for option in ("--resume", "-r")
+    ):
+        return "resume specified ID"
     latest = {"--last"} if kind == "codex" else {"--continue", "-c"}
     option_end = command.index("--") if "--" in command else len(command)
     if any(value in latest for value in command[1:option_end]):
