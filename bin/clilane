@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import os
+import pwd
 import re
 import select
 import shlex
@@ -33,7 +34,7 @@ from typing import BinaryIO, Callable, Iterator, Mapping, Sequence
 
 
 PROGRAM = "clilane"
-VERSION = "0.14.4"
+VERSION = "0.15.0"
 TASK_STATE_INITIALIZING = "initializing"
 TASK_STATE_RUNNING = "running"
 TASK_STATE_STOPPED = "stopped"
@@ -66,6 +67,7 @@ HUB_HISTORY_BATCH_DEFAULT = 20
 HUB_HISTORY_BATCH_MAX = 1000
 HUB_LEFT_GATE_COLUMNS = 8
 HUB_LEFT_AGENT_KINDS = frozenset({"claude", "codex", "kimi"})
+CLAUDE_OBSERVED_IDS_MAX = 64
 HUB_RESUME_ARGUMENTS: dict[str, tuple[list[str], frozenset[str], frozenset[str]]] = {
     "claude": (
         ["--continue"],
@@ -288,6 +290,7 @@ class Task:
     pid: int | None
     attached: bool
     origin: str
+    binding: dict[str, object] | None = None
 
     @property
     def state(self) -> str:
@@ -1159,6 +1162,345 @@ def decode_meta(value: str) -> dict[str, object]:
     return decoded
 
 
+def claude_plain_command(command: Sequence[str]) -> bool:
+    return len(command) == 1 or any(
+        hub_claude_session_id(command, option) is not None
+        for option in ("--session-id", "--resume", "-r")
+    )
+
+
+def claude_tracking_executable(spec: LaunchSpec) -> str | None:
+    if (
+        Path(spec.command[0]).name != "claude"
+        or spec.provider not in {None, "claude"}
+        or not claude_plain_command(spec.command)
+    ):
+        return None
+    search_path = os.pathsep.join(
+        value if os.path.isabs(value) else os.path.join(spec.cwd, value)
+        for value in spec.environment.get("PATH", os.defpath).split(os.pathsep)
+    )
+    requested = spec.command[0]
+    if os.sep in requested and not os.path.isabs(requested):
+        requested = os.path.join(spec.cwd, requested)
+    executable = shutil.which(requested, path=search_path)
+    if executable is None:
+        return None
+    try:
+        executable = str(Path(executable).resolve())
+        before = os.stat(executable)
+        with open(executable, "rb") as handle:
+            magic = handle.read(4)
+        if magic not in {
+            b"\x7fELF",
+            b"\xcf\xfa\xed\xfe",
+            b"\xfe\xed\xfa\xcf",
+            b"\xca\xfe\xba\xbe",
+            b"\xbe\xba\xfe\xca",
+        }:
+            return None
+        version, exceeded = run_bounded_process(
+            [executable, "--version"],
+            2.0,
+            1024,
+            getattr(HUB_LAUNCH_STATE, "cancelled", None),
+            spec.environment,
+            spec.cwd,
+        )
+        after = os.stat(executable)
+    except concurrent.futures.CancelledError:
+        raise HubLaunchCancelled("Launch cancelled · draft kept") from None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    matched = re.fullmatch(rb"(\d+)\.(\d+)\.(\d+) \(Claude Code\)\s*", version.stdout)
+    if (
+        not exceeded
+        and version.returncode == 0
+        and matched is not None
+        and (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        and int(matched[1]) == 2
+        and tuple(int(part) for part in matched.groups()) >= (2, 1, 316)
+    ):
+        return executable
+    return None
+
+
+def claude_tracking_supported(spec: LaunchSpec) -> bool:
+    return claude_tracking_executable(spec) is not None
+
+
+def claude_binding_identity(spec: LaunchSpec) -> tuple[str, str]:
+    home = spec.environment.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir
+    configured = spec.environment.get("CLAUDE_CONFIG_DIR") or str(Path(home) / ".claude")
+    directory = Path(configured)
+    if not directory.is_absolute():
+        directory = Path(spec.cwd) / directory
+    namespace_environment = {"CLAUDE_CONFIG_DIR": str(directory.resolve())}
+    provider_environment = {
+        key: value
+        for key, value in spec.environment.items()
+        if key.startswith(
+            ("ANTHROPIC_", "CLAUDE_", "AWS_", "GOOGLE_", "GCLOUD_", "VERTEX_", "AZURE_")
+        )
+        or key.upper() in {
+            "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+            "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS", "NODE_OPTIONS",
+            "CLOUD_ML_REGION", "CLOUD_ML_PROJECT_ID",
+        }
+    }
+    namespace = selection_digest({"provider": "claude", "environment": namespace_environment})
+    command = [spec.command[0]] if claude_plain_command(spec.command) else list(spec.command)
+    fingerprint = selection_digest(
+        {
+            "profile": spec.profile,
+            "provider": spec.provider,
+            "command": command,
+            "cwd": spec.cwd,
+            "environment": spec.environment
+            if spec.profile is not None
+            else {**provider_environment, **namespace_environment},
+        }
+    )
+    return namespace, fingerprint
+
+
+def ensure_claude_resume_available(
+    spec: LaunchSpec, tasks: Sequence[Task] | None = None
+) -> None:
+    requested = next(
+        (
+            value
+            for option in ("--session-id", "--resume", "-r")
+            if (value := hub_claude_session_id(spec.command, option)) is not None
+        ),
+        None,
+    )
+    if requested is None:
+        return
+    namespace, _ = claude_binding_identity(spec)
+    for task in list_tasks() if tasks is None else tasks:
+        binding = task.binding
+        if binding is None:
+            continue
+        provider_pid = binding.get("provider_pid")
+        provider_live = (
+            type(provider_pid) is int
+            and provider_pid > 0
+            and isinstance(binding.get("provider_started"), str)
+            and process_start_time(provider_pid) == binding["provider_started"]
+        )
+        if task.dead and not provider_live and managed_session_empty(task):
+            continue
+        if not isinstance(binding.get("namespace"), str):
+            raise CliLaneError(f"cannot verify conversation ownership for lane {task.name}")
+        if binding.get("namespace") != namespace:
+            continue
+        observed = binding.get("observed_ids", [])
+        if not isinstance(observed, list) or not all(isinstance(value, str) for value in observed):
+            raise CliLaneError(f"cannot verify conversation ownership for lane {task.name}")
+        reserved = {value.lower() for value in observed}
+        initial = binding.get("requested_id")
+        if isinstance(initial, str):
+            reserved.add(initial.lower())
+        if (
+            len(observed) >= CLAUDE_OBSERVED_IDS_MAX
+            or binding.get("observed_overflow")
+            or requested.lower() in reserved
+        ):
+            raise CliLaneError(
+                f"conversation ID is already owned by running lane {task.name}; "
+                "exit that lane before resuming"
+            )
+
+
+def claude_settings_path(task_id: str, log_path: str) -> Path:
+    if re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", task_id) is None:
+        raise CliLaneError("invalid Claude tracking task ID")
+    return Path(log_path).parent.parent / "claude-hooks" / f"{task_id}.json"
+
+
+def remove_claude_settings(task_id: str, log_path: str) -> None:
+    path = claude_settings_path(task_id, log_path)
+    try:
+        parent = path.parent.lstat()
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid()
+        or stat.S_IMODE(parent.st_mode) != 0o700
+        or not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600 or metadata.st_nlink != 1
+    ):
+        raise CliLaneError("refusing unexpected Claude hook settings file")
+    path.unlink()
+
+
+def prepare_claude_tracking(
+    spec: LaunchSpec,
+    task_id: str,
+    log_path: str,
+    control_binary: str,
+    control_socket: str,
+    session: str,
+    executable: str,
+) -> tuple[dict[str, object], list[str]]:
+    namespace, fingerprint = claude_binding_identity(spec)
+    nonce = uuid.uuid4().hex
+    binding: dict[str, object] = {
+        "schema_version": 1,
+        "task_id": task_id,
+        "nonce": nonce,
+        "profile": spec.profile,
+        "namespace": namespace,
+        "fingerprint": fingerprint,
+        "requested_id": next(
+            (
+                value
+                for option in ("--session-id", "--resume", "-r")
+                if (value := hub_claude_session_id(spec.command, option)) is not None
+            ),
+            None,
+        ),
+        "observed_ids": [],
+        "observed_overflow": False,
+        "final_id": None,
+        "reason": None,
+        "provider_pid": 0,
+        "provider_started": "",
+    }
+    hook = {
+        "type": "command",
+        "command": str(Path(sys.executable).resolve()),
+        "args": [
+            str(Path(__file__).resolve()), "__claude-event", control_binary,
+            control_socket, session, task_id, nonce,
+        ],
+        "timeout": 5,
+    }
+    settings = {"hooks": {event: [{"hooks": [hook]}] for event in ("SessionStart", "SessionEnd")}}
+    path = claude_settings_path(task_id, log_path)
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    metadata = path.parent.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise CliLaneError("Claude tracking directory must be private and owned by this user")
+    descriptor = os.open(
+        path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(settings, handle, separators=(",", ":"))
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    return binding, [executable, *spec.command[1:], "--settings", str(path)]
+
+
+def claude_tracking_started(task_id: str, nonce: str) -> None:
+    pane = os.environ["TMUX_PANE"]
+    binding = decode_meta(
+        tmux(["show-options", "-qv", "-t", pane, "@agt_claude_binding"])
+        .stdout.decode().strip()
+    )
+    if binding.get("task_id") != task_id or binding.get("nonce") != nonce:
+        raise CliLaneError("Claude tracking ownership changed before launch")
+    started = process_start_time(os.getpid())
+    if started is None:
+        raise CliLaneError("could not identify the Claude provider process")
+    binding.update(provider_pid=os.getpid(), provider_started=started)
+    tmux(["set-option", "-t", pane, "@agt_claude_binding", encode_meta(binding)])
+
+
+def claude_event(session: str, task_id: str, nonce: str) -> int:
+    raw = sys.stdin.buffer.read(65537)
+    if len(raw) > 65536:
+        return 0
+    try:
+        event = json.loads(raw)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return 0
+    if not isinstance(event, dict) or event.get("agent_id") or event.get("parent_session_id"):
+        return 0
+    event_name = event.get("hook_event_name")
+    session_id = event.get("session_id")
+    if (
+        not isinstance(session_id, str)
+        or hub_claude_session_id(["claude", "--resume", session_id], "--resume") is None
+    ):
+        return 0
+    if event_name not in {"SessionStart", "SessionEnd"}:
+        return 0
+    reason = event.get("reason")
+    if event_name == "SessionEnd" and reason not in {
+        "clear", "resume", "logout", "prompt_input_exit", "other",
+    }:
+        return 0
+    for _ in range(3):
+        task = next(
+            (item for item in list_tasks() if item.id == task_id and item.session == session),
+            None,
+        )
+        if task is None or task.dead or task.binding is None:
+            return 0
+        binding = task.binding
+        parent = os.getppid()
+        if (
+            type(binding.get("schema_version")) is not int
+            or binding.get("schema_version") != 1
+            or binding.get("task_id") != task_id
+            or binding.get("nonce") != nonce
+            or binding.get("provider_pid") != parent
+            or process_start_time(parent) != binding.get("provider_started")
+            or event.get("cwd") != task.cwd
+        ):
+            return 0
+        updated = dict(binding)
+        observed = binding.get("observed_ids")
+        if not isinstance(observed, list) or not all(isinstance(value, str) for value in observed):
+            return 0
+        if session_id not in observed and len(observed) < CLAUDE_OBSERVED_IDS_MAX:
+            updated["observed_ids"] = [*observed, session_id]
+        elif session_id not in observed:
+            updated["observed_overflow"] = True
+        if event_name == "SessionEnd":
+            updated["final_id"] = session_id if reason == "prompt_input_exit" else None
+            updated["reason"] = reason
+        else:
+            updated["final_id"] = None
+            updated["reason"] = None
+        encoded = encode_meta(updated)
+        condition = tmux_all(
+            [
+                tmux_option_equals("@agt_claude_binding", encode_meta(binding)),
+                tmux_option_equals("@agt_ready", task_id),
+                "#{==:#{pane_id},#{@agt_pane}}",
+                "#{==:#{pane_dead},0}",
+            ]
+        )
+        if os.getppid() != parent or process_start_time(parent) != binding.get("provider_started"):
+            return 0
+        tmux(
+            [
+                "if-shell", "-t", task.pane, "-F", condition,
+                shlex.join(["set-option", "-t", task.session, "@agt_claude_binding", encoded]),
+                "",
+            ],
+            check=False,
+        )
+        current = tmux(
+            ["show-options", "-qv", "-t", task.session, "@agt_claude_binding"],
+            check=False,
+        )
+        if current.stdout.decode().strip() == encoded:
+            return 0
+    return 0
+
+
 def encode_launcher(
     command: Sequence[str],
     on_exit: str | None,
@@ -1166,6 +1508,7 @@ def encode_launcher(
     task_id: str,
     log_path: str,
     environment_keys: Sequence[str],
+    claude_nonce: str | None = None,
 ) -> str:
     return encode_meta(
         {
@@ -1175,6 +1518,7 @@ def encode_launcher(
             "id": task_id,
             "log": log_path,
             "environment_keys": list(environment_keys),
+            "claude_nonce": claude_nonce,
         }
     )
 
@@ -1473,6 +1817,9 @@ def supervise(encoded_command: str) -> int:
     if child == 0:
         for sent_signal in forwarded:
             signal.signal(sent_signal, signal.SIG_DFL)
+        claude_nonce = launcher.get("claude_nonce")
+        if isinstance(claude_nonce, str):
+            claude_tracking_started(str(launcher["id"]), claude_nonce)
         tmux(
             [
                 "set-option", "-p", "-t", os.environ["TMUX_PANE"],
@@ -1662,6 +2009,7 @@ def list_tasks(timeout: float | None = None) -> list[Task]:
         "#{?#{OPENCLAW_SESSION},bot,local}",
         "#{@agt_pane}",
         "#{@agt_ready}",
+        "#{@agt_claude_binding}",
     ]
     completed = tmux(
         ["list-panes", "-a", "-F", FIELD_SEPARATOR.join(fields)],
@@ -1694,6 +2042,7 @@ def list_tasks(timeout: float | None = None) -> list[Task]:
             origin,
             canonical_pane,
             ready,
+            encoded_binding,
         ) = values
         if not session.startswith(SESSION_PREFIX) or not encoded:
             continue
@@ -1728,6 +2077,8 @@ def list_tasks(timeout: float | None = None) -> list[Task]:
             pid=optional_int(pid),
             attached=(optional_int(attached) or 0) > 0,
             origin=origin if origin in {"bot", "local"} else "local",
+            binding=(decode_meta(encoded_binding) if encoded_binding else {})
+            if meta.get("claude_tracking") is True else None,
         )
         candidates.setdefault(session, []).append((task, canonical_pane, ready))
     tasks: list[Task] = []
@@ -1916,6 +2267,8 @@ def run_bounded_process(
     timeout: float,
     max_bytes: int,
     cancel_event: threading.Event | None = None,
+    environment: Mapping[str, str] | None = None,
+    cwd: str | None = None,
 ) -> tuple[subprocess.CompletedProcess[bytes], bool]:
     process = subprocess.Popen(
         command,
@@ -1923,6 +2276,8 @@ def run_bounded_process(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=True,
+        env=environment,
+        cwd=cwd,
     )
     if process.stdout is None or process.stderr is None:
         terminate_process_group(process)
@@ -2879,7 +3234,7 @@ def respawn_task_arguments(
     ]
 
 
-def run_task(spec: LaunchSpec) -> Task:
+def run_task(spec: LaunchSpec, *, require_claude_tracking: bool = False) -> Task:
     spec = complete_launch_spec(
         name=spec.name,
         cwd_value=spec.cwd,
@@ -2893,12 +3248,19 @@ def run_task(spec: LaunchSpec) -> Task:
     )
     hub_launch_checkpoint()
     preflight_launch(spec, inspect_tmux=False)
+    tracking_executable = claude_tracking_executable(spec)
+    tracking = tracking_executable is not None
+    if require_claude_tracking and not tracking:
+        raise CliLaneError("Claude session tracking is no longer available; refusing an untracked resume")
+    hub_launch_checkpoint()
     with registry_lock():
         existing_environment = preflight_launch(spec)
         existing = list_tasks()
         backfill_records(existing)
         if any(task.name == spec.name for task in existing):
             raise CliLaneError(f"task already exists: {spec.name}")
+        if tracking:
+            ensure_claude_resume_available(spec, existing)
         cwd = Path(spec.cwd)
         command = list(spec.command)
         task_id = str(uuid.uuid4())
@@ -2942,6 +3304,7 @@ def run_task(spec: LaunchSpec) -> Task:
             "created": created_stamp,
             "log": str(log_path),
             "on_exit": spec.on_exit,
+            "claude_tracking": tracking,
         }
         script = Path(__file__).resolve()
         python_binary = str(Path(sys.executable).resolve())
@@ -2949,6 +3312,7 @@ def run_task(spec: LaunchSpec) -> Task:
         committed = False
         pane = ""
         started: str | None = None
+        settings_path: Path | None = None
         try:
             created = tmux(initial_task_queue(session, str(cwd), meta))
             pane = created.stdout.decode().strip()
@@ -2958,6 +3322,15 @@ def run_task(spec: LaunchSpec) -> Task:
             if not Path(control_socket).is_absolute():
                 raise CliLaneError("could not resolve the managed tmux socket")
             environment["CLILANE_TMUX_SOCKET"] = control_socket
+            execution_command = command
+            binding = None
+            if tracking_executable is not None:
+                binding, execution_command = prepare_claude_tracking(
+                    spec, task_id, str(log_path), control_binary, control_socket, session, tracking_executable,
+                )
+                settings_path = claude_settings_path(task_id, str(log_path))
+                require_portable_footprint("Claude provider launch", execution_command, environment)
+                tmux(["set-option", "-t", session, "@agt_claude_binding", encode_meta(binding)])
             placeholder_pane = pane
             set_task_environment(session, environment, existing_environment)
             replacement = tmux(
@@ -2992,12 +3365,19 @@ def run_task(spec: LaunchSpec) -> Task:
             )
             tmux(["pipe-pane", "-t", pane, sink])
             launcher = encode_launcher(
-                command,
+                execution_command,
                 spec.on_exit,
                 spec.name,
                 task_id,
                 str(log_path),
                 sorted(environment),
+                str(binding["nonce"]) if binding is not None else None,
+            )
+            require_portable_footprint(
+                "tmux supervisor launch",
+                [control_binary, "-S", control_socket, *respawn_task_arguments(pane, str(cwd), python_binary,
+                 str(script), control_binary, control_socket, launcher)],
+                tmux_client_environment(),
             )
             tmux(
                 respawn_task_arguments(
@@ -3055,6 +3435,8 @@ def run_task(spec: LaunchSpec) -> Task:
                 if log_created:
                     log_path.unlink(missing_ok=True)
                     log_path.with_suffix(log_path.suffix + ".previous").unlink(missing_ok=True)
+                if settings_path is not None:
+                    settings_path.unlink(missing_ok=True)
                 delete_record(task_id)
 
 
@@ -4957,27 +5339,71 @@ def hub_preset_launch_settings(
     return selected, legacy_launch_environment(environment), None, None
 
 
-def resume_hub_task(
-    task: Task, presets: Sequence[dict[str, object]], context: str
-) -> Task:
-    if not task.committed:
-        raise CliLaneError(f"task is still initializing: {task.name}")
-    if not task.dead:
-        raise CliLaneError(f"task is still running: {task.name}")
-    preset = hub_matching_preset(task, presets)
-    if preset is not None:
-        selected, launch_environment, profile_name, provider = (
-            hub_preset_launch_settings(preset, context)
+def claude_resume_id(task: Task) -> str:
+    binding = task.binding
+    if (
+        not isinstance(binding, dict)
+        or type(binding.get("schema_version")) is not int
+        or binding.get("schema_version") != 1
+        or binding.get("task_id") != task.id
+    ):
+        raise CliLaneError(f"cannot resume {task.name}: invalid Claude session binding")
+    session_id = binding.get("final_id")
+    if (
+        not isinstance(session_id, str)
+        or hub_claude_session_id(["claude", "--resume", session_id], "--resume") is None
+        or binding.get("reason") != "prompt_input_exit"
+        or not task.committed
+        or not task.dead
+        or type(task.exit_code) is not int
+        or task.exit_code != 0
+        or task.signal_name
+        or task.stop_requested
+    ):
+        raise CliLaneError(
+            f"cannot resume {task.name}: no verified Claude exit receipt; "
+            "use native resume with the original profile"
         )
-        kind = hub_preset_kind(selected)
+    return session_id
+
+
+def claude_resume_spec(task: Task, context: str) -> LaunchSpec:
+    session_id = claude_resume_id(task)
+    binding = task.binding
+    profile_name = binding.get("profile")
+    if (
+        "profile" not in binding
+        or (profile_name is not None and not isinstance(profile_name, str))
+        or any(
+            not isinstance(binding.get(key), str)
+            or re.fullmatch(r"[0-9a-f]{64}", binding[key]) is None
+            for key in ("namespace", "fingerprint")
+        )
+    ):
+        raise CliLaneError(f"cannot resume {task.name}: invalid Claude launch identity")
+    environment = hub_launch_environment(context)
+    if profile_name is None:
+        command = task.command
+        launch_environment = legacy_launch_environment(environment)
+        provider = None
     else:
-        launch_environment = legacy_launch_environment(hub_launch_environment(context))
-        profile_name = provider = None
-        kind = hub_command_kind(task.command)
-    spec = complete_launch_spec(
+        data = hub_context_data(context)
+        profile = load_profiles(Path(str(data["profiles"]))).get(profile_name)
+        if profile is None or profile.provider != "claude":
+            raise CliLaneError(
+                f"cannot resume {task.name}: original Claude profile is unavailable"
+            )
+        if profile.cwd_mode == "fixed" and resolved_hub_directory(
+            profile.cwd_path, profile.name, environment
+        ) != str(Path(task.cwd).resolve()):
+            raise CliLaneError(f"cannot resume {task.name}: original profile directory changed")
+        command = profile.command
+        launch_environment = profile_launch_environment(profile, environment)
+        provider = profile.provider
+    original = complete_launch_spec(
         name=task.name,
         cwd_value=task.cwd,
-        command=hub_resume_command(task.command, kind, task.name),
+        command=command,
         wait=False,
         timeout=None,
         on_exit=None,
@@ -4985,6 +5411,62 @@ def resume_hub_task(
         profile=profile_name,
         provider=provider,
     )
+    namespace, fingerprint = claude_binding_identity(original)
+    if namespace != binding["namespace"] or fingerprint != binding["fingerprint"]:
+        raise CliLaneError(
+            f"cannot resume {task.name}: original Claude launch identity changed; "
+            "restore the original profile and environment"
+        )
+    if not claude_tracking_supported(original):
+        raise CliLaneError(
+            f"cannot resume {task.name}: Claude no longer supports verified session tracking"
+        )
+    spec = complete_launch_spec(
+        name=task.name,
+        cwd_value=task.cwd,
+        command=[original.command[0], "--resume", session_id],
+        wait=False,
+        timeout=None,
+        on_exit=None,
+        environment=launch_environment,
+        profile=profile_name,
+        provider=provider,
+    )
+    ensure_claude_resume_available(spec)
+    return spec
+
+
+def resume_hub_task(
+    task: Task, presets: Sequence[dict[str, object]], context: str
+) -> Task:
+    if not task.committed:
+        raise CliLaneError(f"task is still initializing: {task.name}")
+    if not task.dead:
+        raise CliLaneError(f"task is still running: {task.name}")
+    if task.binding is not None:
+        spec = claude_resume_spec(task, context)
+    else:
+        preset = hub_matching_preset(task, presets)
+        if preset is not None:
+            selected, launch_environment, profile_name, provider = (
+                hub_preset_launch_settings(preset, context)
+            )
+            kind = hub_preset_kind(selected)
+        else:
+            launch_environment = legacy_launch_environment(hub_launch_environment(context))
+            profile_name = provider = None
+            kind = hub_command_kind(task.command)
+        spec = complete_launch_spec(
+            name=task.name,
+            cwd_value=task.cwd,
+            command=hub_resume_command(task.command, kind, task.name),
+            wait=False,
+            timeout=None,
+            on_exit=None,
+            environment=launch_environment,
+            profile=profile_name,
+            provider=provider,
+        )
     old_log = validated_log_path(task)
     carried: Path | None = None
     if old_log.exists():
@@ -4997,7 +5479,7 @@ def resume_hub_task(
             os.replace(carried, old_log)
         raise
     try:
-        resumed = run_task(spec)
+        resumed = run_task(spec, require_claude_tracking=task.binding is not None)
     except CliLaneError as error:
         if carried is not None:
             os.replace(carried, old_log)
@@ -5029,6 +5511,9 @@ def hub_history_batch(environment: Mapping[str, object]) -> int:
 
 def hub_resume_kind(task: Task, presets: Sequence[dict[str, object]]) -> str | None:
     try:
+        if task.binding is not None:
+            claude_resume_id(task)
+            return "claude"
         preset = hub_matching_preset(task, presets)
         kind = hub_preset_kind(preset) if preset is not None else hub_command_kind(task.command)
         if kind not in HUB_RESUME_ARGUMENTS:
@@ -5041,6 +5526,8 @@ def hub_resume_kind(task: Task, presets: Sequence[dict[str, object]]) -> str | N
 
 def hub_resume_action(task: Task, presets: Sequence[dict[str, object]]) -> str:
     kind = hub_resume_kind(task, presets)
+    if task.binding is not None:
+        return "resume recorded ID" if kind == "claude" else "resume unavailable"
     if kind is None:
         return "rerun"
     command = hub_resume_command(task.command, kind, task.name)
@@ -6254,6 +6741,8 @@ def remove_task_locked(task: Task, force: bool, grace: float) -> None:
         if log_path:
             log_path.unlink(missing_ok=True)
             log_path.with_suffix(log_path.suffix + ".previous").unlink(missing_ok=True)
+            if current.binding is not None:
+                remove_claude_settings(current.id, str(log_path))
         if current.id:
             delete_record(current.id)
         return
@@ -6272,6 +6761,8 @@ def remove_task_locked(task: Task, force: bool, grace: float) -> None:
     if log_path:
         log_path.unlink(missing_ok=True)
         log_path.with_suffix(log_path.suffix + ".previous").unlink(missing_ok=True)
+        if current.binding is not None:
+            remove_claude_settings(current.id, str(log_path))
     if current.id:
         delete_record(current.id)
 
@@ -6338,6 +6829,7 @@ def reap_record(record: TaskRecord, live_sessions: frozenset[str]) -> None:
     kill_managed_session(record.session)
     log_path.unlink(missing_ok=True)
     log_path.with_suffix(log_path.suffix + ".previous").unlink(missing_ok=True)
+    remove_claude_settings(record.id, str(log_path))
     delete_record(record.id)
 
 
@@ -6785,6 +7277,9 @@ def execute(arguments: argparse.Namespace) -> int:
 
 def main() -> int:
     try:
+        if len(sys.argv) == 7 and sys.argv[1] == "__claude-event":
+            configure_tmux_control(sys.argv[2], sys.argv[3])
+            return claude_event(sys.argv[4], sys.argv[5], sys.argv[6])
         if len(sys.argv) == 5 and sys.argv[1] == "__supervise":
             configure_tmux_control(sys.argv[2], sys.argv[3])
             return supervise(sys.argv[4])
