@@ -69,6 +69,13 @@ class _Terminal:
     def send(self, value: bytes) -> None:
         os.write(self.descriptor, value)
 
+    def resize(self, columns: int, rows: int) -> None:
+        fcntl.ioctl(
+            self.descriptor, termios.TIOCSWINSZ,
+            struct.pack("HHHH", rows, columns, 0, 0),
+        )
+        os.kill(self.pid, signal.SIGWINCH)
+
     def expect(self, value: str, since: int = 0, timeout: float = 15.0) -> None:
         expected = value.encode()
         deadline = time.monotonic() + timeout
@@ -232,6 +239,37 @@ def _hub_popup_values(environment: dict[str, str]) -> list[str]:
     ]
 
 
+def _hub_pane_info(environment: dict[str, str], session: str) -> list[str]:
+    result = _tmux(
+        environment,
+        ["display-message", "-p", "-t", session,
+         "#{pane_id}|#{pane_pid}|#{pane_tty}|#{pane_width}|#{pane_height}|#{history_limit}|#{history_size}"],
+    )
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    values = result.stdout.decode().strip().split("|")
+    assert len(values) == 7 and values[0].startswith("%"), (session, values)
+    return values
+
+
+def _hub_sessions(environment: dict[str, str]) -> set[str]:
+    result = _tmux(environment, ["list-sessions", "-F", "#{session_name}"])
+    return {name for name in result.stdout.decode().splitlines() if name.startswith("hub_")}
+
+
+def _close_hub_pane(environment: dict[str, str], client: str) -> None:
+    clients = _tmux(
+        environment, ["list-clients", "-F", "#{client_name}|#{client_session}"]
+    ).stdout.decode().splitlines()
+    session = next(line.split("|", 1)[1] for line in clients if line.startswith(client + "|"))
+    assert session.startswith("hub_"), session
+    pane = _tmux(
+        environment, ["show-options", "-qv", "-t", session, "@agt_hub_pane_id"]
+    ).stdout.decode().strip()
+    assert pane.startswith("%"), pane
+    closed = _tmux(environment, ["kill-pane", "-t", pane])
+    assert closed.returncode == 0, closed.stderr.decode(errors="replace")
+
+
 def _call_clilane_function(
     environment: dict[str, str], name: str, arguments: Sequence[str]
 ) -> None:
@@ -342,8 +380,7 @@ def _exercise_hub_lifecycle(environment: dict[str, str]) -> None:
         ).stdout.decode().splitlines()
         assert len(clients) == 1, clients
         client, _ = clients[0].split("|", 1)
-        closed = _tmux(environment, ["display-popup", "-c", client, "-C"])
-        assert closed.returncode == 0, closed.stderr.decode(errors="replace")
+        _close_hub_pane(environment, client)
         assert terminal.wait(5.0) == 0
         terminal.close()
         terminal = None
@@ -351,9 +388,10 @@ def _exercise_hub_lifecycle(environment: dict[str, str]) -> None:
         deadline = time.monotonic() + 5.0
         while _hub_context_counts(environment) != (0, 0):
             if time.monotonic() >= deadline:
-                raise AssertionError("popup-loss cleanup left a hub context behind")
+                raise AssertionError("pane-loss cleanup left a hub context behind")
             time.sleep(0.05)
         assert _hub_popup_count(environment) == 0
+        assert _hub_sessions(environment) == set()
 
         terminal = _Terminal([], environment)
         terminal.expect("This clilane server")
@@ -366,9 +404,20 @@ def _exercise_hub_lifecycle(environment: dict[str, str]) -> None:
         original_values = _hub_popup_values(environment)
         assert len(original_values) == 1, original_values
         original_popup = original_values[0]
+        old_pid, old_context, old_generation, backend = original_popup.split(":")
+        assert old_pid == client_pid and backend == "pane"
+        original_session = "hub_" + old_generation
+        original_pane = _hub_pane_info(environment, original_session)
+        repeated = _run(
+            environment,
+            ["__hub-open", client, original_session, client_pid, ""],
+        )
+        assert repeated.returncode == 0
+        assert _hub_popup_values(environment) == original_values
+        assert _hub_pane_info(environment, original_session)[:3] == original_pane[:3]
         redraw_mark = terminal.mark()
         reopened = subprocess.Popen(
-            [str(CLILANE), "__hub-open", client, "hub", client_pid, ""],
+            [str(CLILANE), "__hub-open", client, original_session, client_pid, old_context],
             cwd=ROOT,
             env=environment,
             stdout=subprocess.PIPE,
@@ -394,25 +443,18 @@ def _exercise_hub_lifecycle(environment: dict[str, str]) -> None:
         handshake_mark = terminal.mark()
         terminal.send(b"\x15")
         terminal.expect("> ▏", handshake_mark)
-        old_pid, old_context, old_generation = original_popup.split(":", 2)
-        assert old_pid == client_pid
-        _call_clilane_function(
-            environment,
-            "finish_hub_popup",
-            [client, client_pid, old_context, old_generation],
-        )
+        for callback in ("finish_hub_popup", "finish_hub_pane"):
+            _call_clilane_function(
+                environment, callback,
+                [client, client_pid, old_context, old_generation],
+            )
         assert _hub_popup_values(environment) == [current_popup]
         assert _hub_context_counts(environment) == (1, 1)
         assert terminal.running()
-        current_pid, current_context, _ = current_popup.split(":", 2)
+        current_pid, current_context, current_generation, backend = current_popup.split(":")
         assert current_pid == client_pid
-        launch_popup = f"{current_popup}:launch"
-        _call_clilane_function(
-            environment,
-            "replace_hub_popup",
-            [client, client_pid, current_context, current_popup, launch_popup],
-        )
-        assert _hub_popup_values(environment) == [launch_popup]
+        assert backend == "pane" and current_generation != old_generation
+        assert current_context == old_context
 
         created = _tmux(
             environment,
@@ -424,11 +466,8 @@ def _exercise_hub_lifecycle(environment: dict[str, str]) -> None:
             ["switch-client", "-E", "-c", client, "-t", escape_session],
         )
         assert switched.returncode == 0, switched.stderr.decode(errors="replace")
-        closed = _tmux(environment, ["display-popup", "-c", client, "-C"])
-        assert closed.returncode == 0, closed.stderr.decode(errors="replace")
         stdout, stderr = reopened.communicate(timeout=5)
-        assert reopened.returncode == 1, stdout.decode(errors="replace")
-        assert b"could not open the session switcher" in stderr, stderr
+        assert reopened.returncode == 0, stderr.decode(errors="replace")
         reopened = None
         attached = _tmux(
             environment,
@@ -437,6 +476,7 @@ def _exercise_hub_lifecycle(environment: dict[str, str]) -> None:
         assert attached == [f"{client}|{escape_session}"], attached
         assert terminal.running()
         assert _hub_popup_count(environment) == 0
+        assert _hub_sessions(environment) == set()
         assert _hub_context_counts(environment) == (1, 1)
         detached = _tmux(environment, ["detach-client", "-t", client])
         assert detached.returncode == 0, detached.stderr.decode(errors="replace")
@@ -615,15 +655,15 @@ def _exercise_hub_lifecycle(environment: dict[str, str]) -> None:
         assert len(clients) == 1, clients
         client, _ = clients[0].split("|", 1)
         resume_mark = outer_terminal.mark()
-        closed = _tmux(environment, ["display-popup", "-c", client, "-C"])
-        assert closed.returncode == 0, closed.stderr.decode(errors="replace")
+        _close_hub_pane(environment, client)
         outer_terminal.expect(outer_marker, resume_mark)
         deadline = time.monotonic() + 5.0
         while _hub_context_counts(environment) != (0, 0):
             if time.monotonic() >= deadline:
-                raise AssertionError("nested popup-loss cleanup left a context behind")
+                raise AssertionError("nested pane-loss cleanup left a context behind")
             time.sleep(0.05)
         assert _hub_popup_count(environment) == 0
+        assert _hub_sessions(environment) == set()
         outer_terminal.send(b"\x02d")
         assert outer_terminal.wait() == 0
         outer_terminal.close()
@@ -640,6 +680,126 @@ def _exercise_hub_lifecycle(environment: dict[str, str]) -> None:
         _tmux(environment, ["kill-session", "-t", escape_session])
         _tmux(environment, ["kill-session", "-t", recursive_session])
         _cleanup(environment)
+
+
+def _exercise_hub_launch_loss(environment: dict[str, str]) -> None:
+    root = Path(environment["CLILANE_STATE_HOME"])
+    for submitted in (False, True):
+        mode = "submitted" if submitted else "unsubmitted"
+        marker = root / f"{mode}-held.json"
+        lost = root / f"{mode}-ownership-lost"
+        release = root / f"{mode}-release"
+        delivery = root / f"{mode}-delivery.txt"
+        wrapper = root / f"{mode}-clilane"
+        config = root / f"{mode}-hub.json"
+        receiver = (
+            "import sys\nfrom pathlib import Path\n"
+            "for line in sys.stdin:\n"
+            f"    with Path({str(delivery)!r}).open('a') as stream: stream.write(line)\n"
+            "    print(line,end='',flush=True)\n"
+        )
+        config.write_text(json.dumps({
+            "schema_version": 1,
+            "agents": [{"name": f"held-{mode}", "command": [sys.executable, "-u", "-c", receiver], "dir": str(root)}],
+        }))
+        wrapper.write_text(
+            f"#!{sys.executable}\n"
+            "import json,runpy,time\n"
+            "from pathlib import Path\n"
+            f"namespace=runpy.run_path({str(CLILANE)!r},run_name='held_clilane')\n"
+            "scope=namespace['main'].__globals__\n"
+            "scope['__file__']=__file__\n"
+            "owned=scope['hub_popup_owned']\n"
+            "def observed_owned(*args):\n"
+            "    result=owned(*args)\n"
+            "    if not result and args[-1].endswith(':pane:launch'):\n"
+            f"        Path({str(lost)!r}).touch()\n"
+            "    return result\n"
+            "scope['hub_popup_owned']=observed_owned\n"
+            "send=scope['send_hub_prompt']\n"
+            "def held_send(preset,task,prompt):\n"
+            f"    if {submitted!r}: send(preset,task,prompt)\n"
+            f"    marker=Path({str(marker)!r})\n"
+            "    marker.with_suffix('.tmp').write_text(json.dumps({'id':task.id,'name':task.name}))\n"
+            "    marker.with_suffix('.tmp').replace(marker)\n"
+            "    deadline=time.monotonic()+30\n"
+            f"    while not Path({str(release)!r}).exists():\n"
+            "        scope['hub_launch_checkpoint']()\n"
+            "        if time.monotonic()>=deadline: raise scope['CliLaneError']('held worker timed out')\n"
+            "        time.sleep(0.02)\n"
+            f"    if not {submitted!r}: send(preset,task,prompt)\n"
+            "scope['send_hub_prompt']=held_send\n"
+            "raise SystemExit(scope['main']())\n"
+        )
+        wrapper.chmod(0o700)
+        terminal: _Terminal | None = None
+        escape = f"held-escape-{mode}"
+        prompt = f"owned launch {mode} {os.getpid()}"
+        try:
+            terminal = _Terminal(["hub", "--config", str(config)], environment, executable=wrapper)
+            terminal.expect("This clilane server")
+            terminal.send(prompt.encode() + b"\r")
+            deadline = time.monotonic() + 10.0
+            while not marker.exists():
+                assert time.monotonic() < deadline, bytes(terminal.output).decode(errors="replace")
+                terminal.settle(quiet=0.05, timeout=0.1)
+            task = json.loads(marker.read_text())
+            claim = _hub_popup_values(environment)
+            assert len(claim) == 1 and claim[0].endswith(":pane:launch"), claim
+            client, client_pid, source = _tmux(
+                environment, ["list-clients", "-F", "#{client_name}|#{client_pid}|#{client_session}"]
+            ).stdout.decode().strip().split("|")
+            assert source.startswith("hub_"), source
+            assert claim[0].startswith(client_pid + ":"), claim
+            created = _tmux(environment, ["new-session", "-d", "-s", escape, "--", "/bin/cat"])
+            assert created.returncode == 0, created.stderr
+            switched = _tmux(environment, ["switch-client", "-E", "-c", client, "-t", escape])
+            assert switched.returncode == 0, switched.stderr
+            if submitted:
+                deadline = time.monotonic() + 5.0
+                while not lost.exists():
+                    assert time.monotonic() < deadline, "UI did not observe ownership loss"
+                    terminal.settle(quiet=0.05, timeout=0.1)
+                assert source in _hub_sessions(environment), "UI exited before its submitted worker unwound"
+                _wait_for_state(environment, task["name"], "running")
+                logged = _run(environment, ["log", task["id"], "--lines", "50"]).stdout
+                assert prompt in logged, logged
+                deadline = time.monotonic() + 5.0
+                while not delivery.exists() or delivery.read_text() != prompt + "\n":
+                    assert time.monotonic() < deadline, "submitted prompt was not delivered exactly once"
+                    time.sleep(0.05)
+                release.touch()
+            else:
+                _wait_for_state(environment, task["name"], "stopped")
+                logged = _run(environment, ["log", task["id"], "--lines", "50"]).stdout
+                assert prompt not in logged, logged
+                assert not delivery.exists() or delivery.read_text() == ""
+            deadline = time.monotonic() + 10.0
+            while _hub_sessions(environment):
+                assert time.monotonic() < deadline, _hub_sessions(environment)
+                terminal.settle(quiet=0.05, timeout=0.1)
+            assert _hub_popup_count(environment) == 0
+            assert _hub_context_counts(environment) == (1, 1)
+            assert _tmux(
+                environment, ["list-clients", "-F", "#{client_name}|#{client_session}"]
+            ).stdout.decode().splitlines() == [f"{client}|{escape}"]
+            assert terminal.running()
+            if submitted:
+                _wait_for_state(environment, task["name"], "running")
+                assert delivery.read_text() == prompt + "\n"
+            detached = _tmux(environment, ["detach-client", "-t", client])
+            assert detached.returncode == 0, detached.stderr
+            assert terminal.wait() == 0
+            deadline = time.monotonic() + 5.0
+            while _hub_context_counts(environment) != (0, 0):
+                assert time.monotonic() < deadline, _hub_context_counts(environment)
+                time.sleep(0.05)
+        finally:
+            release.touch()
+            if terminal is not None:
+                terminal.close()
+            _tmux(environment, ["kill-session", "-t", "=" + escape])
+            _cleanup(environment)
 
 
 def _last_frame(terminal: _Terminal, since: int) -> str:
@@ -753,7 +913,7 @@ def _exercise_switcher_keys(environment: dict[str, str]) -> None:
         sessions = _tmux(
             environment, ["list-sessions", "-F", "#{session_name}"]
         ).stdout.decode().split()
-        job_session = next(session for session in sessions if session != "hub")
+        job_session = next(session for session in sessions if session.startswith("agt_"))
         terminal = _Terminal(["attach", "keys-job"], environment)
         _wait_for_client_session(environment, terminal, job_session)
         mark = terminal.mark()
@@ -1001,7 +1161,7 @@ def _exercise_switcher_sections(environment: dict[str, str], tool_bin: Path) -> 
         sessions = _tmux(
             environment, ["list-sessions", "-F", "#{session_name}"]
         ).stdout.decode().split()
-        before = set(sessions)
+        before = {session for session in sessions if session.startswith("agt_")}
         mark = terminal.mark()
         terminal.send(b"\r")
         terminal.expect("Pane is dead", mark)
@@ -1009,11 +1169,12 @@ def _exercise_switcher_sections(environment: dict[str, str], tool_bin: Path) -> 
         mark = terminal.mark()
         terminal.send(b"\x11")
         terminal.expect("This clilane server", mark)
-        assert set(
+        assert {
+            session for session in
             _tmux(environment, ["list-sessions", "-F", "#{session_name}"])
-            .stdout.decode()
-            .split()
-        ) == before, "opening a finished plain job changed the session set"
+            .stdout.decode().split()
+            if session.startswith("agt_")
+        } == before, "opening a finished plain job changed the task session set"
 
         mark = terminal.mark()
         terminal.send(b"\x15")
@@ -1090,7 +1251,7 @@ def _exercise_terminfo_case(
             for session in _tmux(environment, ["list-sessions", "-F", "#{session_name}"])
             .stdout.decode()
             .split()
-            if session != "hub"
+            if session.startswith("agt_")
         )
         terminal = _Terminal(["attach", "ti-job"], environment)
         if expect_notice:
@@ -1159,6 +1320,7 @@ def main() -> int:
         lifecycle_environment["CLILANE_STATE_HOME"] = str(lifecycle_state)
         lifecycle_environment["CLILANE_TMUX_SOCKET"] = f"clp-life-{os.getpid()}"
         _exercise_hub_lifecycle(lifecycle_environment)
+        _exercise_hub_launch_loss(lifecycle_environment)
         keys_environment = dict(environment)
         keys_state = root / "keys-state"
         keys_state.mkdir(mode=0o700)
@@ -1448,6 +1610,46 @@ def main() -> int:
             terminal.expect("empty: →/Enter view", mark)
             time.sleep(0.25)
             terminal.expect("[codex ·", mark)
+            main_sessions = _hub_sessions(environment)
+            assert len(main_sessions) == 1, main_sessions
+            main_session = next(iter(main_sessions))
+            main_pane = _hub_pane_info(environment, main_session)
+            other_mark = other_terminal.mark()
+            other_terminal.send(b"\x11")
+            other_terminal.expect("This clilane server", other_mark)
+            other_terminal.expect("[other ·", other_mark)
+            peer_sessions = _hub_sessions(environment) - main_sessions
+            assert len(peer_sessions) == 1, peer_sessions
+            peer_session = next(iter(peer_sessions))
+            peer_pane = _hub_pane_info(environment, peer_session)
+            other_terminal.resize(80, 18)
+            terminal.send(b"resize-main")
+            other_terminal.send(b"resize-peer")
+            for columns, rows in ((32, 8), (18, 5), (160, 48), (100, 24)):
+                terminal.resize(columns, rows)
+                deadline = time.monotonic() + 5.0
+                while (
+                    _hub_pane_info(environment, main_session)[3:5] != [str(columns), str(rows)]
+                    or _hub_pane_info(environment, peer_session)[3:5] != ["80", "18"]
+                ):
+                    assert time.monotonic() < deadline, (
+                        (columns, rows), _hub_pane_info(environment, main_session),
+                        _hub_pane_info(environment, peer_session),
+                    )
+                    terminal.settle(quiet=0.05, timeout=0.1)
+                    other_terminal.settle(quiet=0.05, timeout=0.1)
+                assert _hub_pane_info(environment, main_session)[:3] == main_pane[:3]
+                assert _hub_pane_info(environment, peer_session)[:3] == peer_pane[:3]
+            for session, draft in ((main_session, b"resize-main"), (peer_session, b"resize-peer")):
+                deadline = time.monotonic() + 5.0
+                while draft not in _tmux(environment, ["capture-pane", "-p", "-t", session]).stdout:
+                    assert time.monotonic() < deadline, f"draft lost in {session}"
+                    terminal.settle(quiet=0.05, timeout=0.1)
+                    other_terminal.settle(quiet=0.05, timeout=0.1)
+                assert _hub_pane_info(environment, session)[-2:] == ["0", "0"]
+            edit_mark = terminal.mark()
+            terminal.send(b"\x15")
+            terminal.expect("> ▏", edit_mark)
             agent_mark = terminal.mark()
             terminal.send(b"\x1b[Z")
             terminal.expect("[hermes ·", agent_mark)
@@ -1467,8 +1669,16 @@ def main() -> int:
             terminal.send(b"\t")
             terminal.expect("[kimi ·", agent_mark)
             prompt = f"hub message {os.getpid()}\nsecond line"
-            terminal.send(b"\x1b[200~" + prompt.encode() + b"\x1b[201~")
+            terminal.send(b"\x1b[200~")
+            for index in range(0, len(prompt), 5):
+                terminal.send(prompt[index:index + 5].encode())
+                terminal.resize(80 + 10 * (index % 3), 20 + index % 4)
+                time.sleep(0.025)
+            terminal.send(b"\x1b[201~")
+            terminal.resize(100, 24)
             terminal.expect(prompt.replace("\n", " "), mark)
+            assert _hub_pane_info(environment, main_session)[:3] == main_pane[:3]
+            assert _hub_pane_info(environment, main_session)[-2:] == ["0", "0"]
             assert len(_tasks(environment)) == 2
 
             mark = terminal.mark()
@@ -1480,9 +1690,12 @@ def main() -> int:
             other_prompt = f"other client {os.getpid()}"
             other_terminal.settle()
             other_mark = other_terminal.mark()
-            other_terminal.send(b"\x11")
-            other_terminal.expect("This clilane server", other_mark)
-            other_terminal.expect("[other ·", other_mark)
+            assert b"resize-peer" in _tmux(
+                environment, ["capture-pane", "-p", "-t", peer_session]
+            ).stdout
+            other_terminal.send(b"\x15")
+            other_terminal.expect("> ▏", other_mark)
+            other_terminal.resize(100, 24)
             other_mark = other_terminal.mark()
             other_terminal.send(other_prompt.encode() + b"\r")
             other_terminal.expect("Starting other-", other_mark)

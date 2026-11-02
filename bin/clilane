@@ -34,7 +34,7 @@ from typing import BinaryIO, Callable, Iterator, Mapping, Sequence
 
 
 PROGRAM = "clilane"
-VERSION = "0.15.0"
+VERSION = "0.16.0"
 TASK_STATE_INITIALIZING = "initializing"
 TASK_STATE_RUNNING = "running"
 TASK_STATE_STOPPED = "stopped"
@@ -48,6 +48,10 @@ TMUX_SOCKET_OVERRIDE: str | None = None
 SESSION_PREFIX = "agt_"
 SERVER_TAG = "agt-v1"
 HUB_SESSION = "hub"
+HUB_PANE_SESSION_PREFIX = "hub_"
+HUB_PANE_KEY_TABLE = "agt-hub-pane"
+HUB_PANE_OPTION = "@agt_hub_pane"
+HUB_PANE_ID_OPTION = "@agt_hub_pane_id"
 HUB_MAX_PRESETS = 9
 HUB_CONTEXT_OPTION_PREFIX = "@agt_hub_context_"
 HUB_CLIENT_CONTEXT_OPTION_PREFIX = "@agt_hub_client_"
@@ -4563,11 +4567,11 @@ def tmux_client_equals(client: str, client_pid: str, session: str) -> str:
     condition = tmux_all(
         [
             f"#{{==:#{{client_name}},{client}}}",
-            f"#{{==:#{{client_pid}},{client_pid}}}",
             f"#{{==:#{{client_session}},{session}}}",
         ]
     )
-    return f"#{{L:#{{?{condition},1,}}}}"
+    owned_pid = f"#{{==:#{{client_pid}},{client_pid}}}"
+    return f"#{{L:#{{?{owned_pid},#{{?{condition},1,}},}}}}"
 
 
 def hub_popup_owner_condition(
@@ -4576,15 +4580,65 @@ def hub_popup_owner_condition(
     context: str,
     popup_value: str,
 ) -> str:
-    return tmux_all(
-        [
-            tmux_option_equals(hub_client_popup_option(client), popup_value),
-            tmux_option_equals(
-                hub_client_context_option(client), f"{client_pid}:{context}"
-            ),
-            tmux_client_equals(client, client_pid, HUB_SESSION),
-        ]
+    generation = hub_pane_generation(popup_value)
+    conditions = [
+        tmux_option_equals(hub_client_popup_option(client), popup_value),
+        tmux_option_equals(
+            hub_client_context_option(client), f"{client_pid}:{context}"
+        ),
+        tmux_client_equals(
+            client, client_pid,
+            hub_pane_session(generation) if generation is not None else HUB_SESSION,
+        ),
+    ]
+    if generation is not None:
+        conditions.append(hub_pane_identity_condition(popup_value))
+        active = tmux_all([
+            f"#{{==:#{{session_name}},{hub_pane_session(generation)}}}",
+            f"#{{==:#{{pane_id}},#{{{HUB_PANE_ID_OPTION}}}}}",
+        ])
+        conditions.append(f"#{{S:#{{?{active},1,}}}}")
+    return tmux_all(conditions)
+
+
+def hub_pane_generation(value: str) -> str | None:
+    matched = re.fullmatch(
+        r"[1-9][0-9]{0,19}:[0-9a-f]{32}:([0-9a-f]{32}):pane(?::launch)?", value
     )
+    return matched[1] if matched is not None else None
+
+
+def hub_pane_session(generation: str) -> str:
+    if not HUB_CONTEXT_PATTERN.fullmatch(generation):
+        raise CliLaneError("invalid hub pane generation")
+    return HUB_PANE_SESSION_PREFIX + generation
+
+
+def hub_pane_identity_condition(value: str, pane: str | None = None) -> str:
+    generation = hub_pane_generation(value)
+    if generation is None:
+        raise CliLaneError("invalid hub pane ownership")
+    base = value.removesuffix(":launch")
+    conditions = [
+        f"#{{==:#{{session_name}},{hub_pane_session(generation)}}}",
+        tmux_option_equals(HUB_PANE_OPTION, base),
+    ]
+    if pane is not None:
+        conditions.append(tmux_option_equals(HUB_PANE_ID_OPTION, pane))
+    return f"#{{S:#{{?{tmux_all(conditions)},1,}}}}"
+
+
+def hub_popup_owned(client: str, client_pid: str, context: str, value: str) -> bool:
+    shown = tmux(
+        ["display-message", "-p", hub_popup_owner_condition(client, client_pid, context, value)],
+        check=False,
+    )
+    return shown.returncode == 0 and shown.stdout.decode().strip() == "1"
+
+
+def hub_ui_interrupted() -> bool:
+    interrupted = getattr(HUB_LAUNCH_STATE, "interrupted", None)
+    return interrupted is not None and interrupted.is_set()
 
 
 def run_tmux_commands_if(condition: str, commands: Sequence[Sequence[str]]) -> None:
@@ -4631,13 +4685,13 @@ def switch_hub_popup(
     target: str,
 ) -> None:
     option = hub_client_popup_option(client)
+    commands = [["set-option", "-gu", option]]
+    if hub_pane_generation(popup_value) is None:
+        commands.append(["display-popup", "-c", client, "-C"])
+    commands.append(["switch-client", "-E", "-c", client, "-t", target])
     run_tmux_commands_if(
         hub_popup_owner_condition(client, client_pid, context, popup_value),
-        [
-            ["set-option", "-gu", option],
-            ["display-popup", "-c", client, "-C"],
-            ["switch-client", "-E", "-c", client, "-t", target],
-        ],
+        commands,
     )
 
 
@@ -4665,6 +4719,89 @@ def finish_hub_popup(
     for owned_value in (popup_value, f"{popup_value}:launch"):
         detach_hub_popup(client, client_pid, context, owned_value)
         clear_hub_popup(client, owned_value)
+
+
+def finish_hub_pane(
+    client: str, client_pid: str, context: str, generation: str,
+    pane: str | None = None,
+) -> None:
+    value = f"{client_pid}:{context}:{generation}:pane"
+    for owned_value in (value, f"{value}:launch"):
+        detach_hub_popup(client, client_pid, context, owned_value)
+        clear_hub_popup(client, owned_value)
+    run_tmux_commands_if(
+        hub_pane_identity_condition(value, pane),
+        [["kill-session", "-t", "=" + hub_pane_session(generation)]],
+    )
+
+
+def create_hub_pane(
+    client_pid: str, context: str, generation: str, columns: int, rows: int,
+) -> str:
+    session = hub_pane_session(generation)
+    value = f"{client_pid}:{context}:{generation}:pane"
+    created = tmux([
+        "new-session", "-d", "-E", "-P", "-F", "#{pane_id}",
+        "-s", session, "-x", str(columns), "-y", str(rows),
+        "-c", str(state_root()), "--", "/bin/sleep", "2147483647",
+        ";", "set-option", "-t", session, HUB_PANE_OPTION, value,
+    ], check=False)
+    bootstrap = created.stdout.decode().strip()
+    try:
+        if created.returncode != 0:
+            detail = created.stderr.decode(errors="replace").strip()
+            raise CliLaneError(detail or "could not create the session switcher")
+        for option, setting in (
+            ("history-limit", "0"), ("status", "off"),
+            ("prefix", "None"), ("prefix2", "None"),
+            ("key-table", HUB_PANE_KEY_TABLE), ("destroy-unattached", "off"),
+            ("detach-on-destroy", "on"),
+        ):
+            tmux(["set-option", "-t", session, option, setting])
+        tmux(["unbind-key", "-T", HUB_PANE_KEY_TABLE, "Any"], check=False)
+        for key in (
+            "C-q", "C-c", "C-d", "C-r", "C-u", "C-x",
+            "Left", "Right", "Up", "Down", "Tab", "BTab", "Enter", "Escape",
+            "C-PPage", "C-NPage", "C-Tab", "C-BTab",
+        ):
+            tmux(["bind-key", "-T", HUB_PANE_KEY_TABLE, key, "send-keys", key])
+        for key in (
+            "MouseDown1Pane", "MouseUp1Pane", "SecondClick1Pane", "TripleClick1Pane",
+            "WheelUpPane", "WheelDownPane",
+        ):
+            tmux(["bind-key", "-T", HUB_PANE_KEY_TABLE, key, "send-keys", "-M"])
+        created = tmux([
+            "new-window", "-d", "-P", "-F", "#{pane_id}", "-t", session + ":",
+            "-c", str(state_root()), "--", "/bin/sleep", "2147483647",
+        ])
+        pane = created.stdout.decode().strip()
+        tmux(["set-option", "-t", session, HUB_PANE_ID_OPTION, pane])
+        tmux(["set-option", "-w", "-t", pane, "window-size", "latest"])
+        tmux(["set-option", "-w", "-t", pane, "remain-on-exit", "off"])
+        tmux(["set-option", "-w", "-t", pane, "automatic-rename", "off"])
+        tmux(["rename-window", "-t", pane, "Sessions"])
+        tmux(["select-window", "-t", pane])
+        tmux(["kill-window", "-t", bootstrap])
+        return pane
+    except BaseException:
+        identity = tmux_all([
+            f"#{{==:#{{session_name}},{session}}}",
+            tmux_option_equals(HUB_PANE_OPTION, value),
+        ])
+        run_tmux_commands_if(
+            f"#{{S:#{{?{identity},1,}}}}",
+            [["kill-session", "-t", "=" + session]],
+        )
+        if re.fullmatch(r"%[0-9]+", bootstrap):
+            identity = tmux_all([
+                f"#{{==:#{{session_name}},{session}}}",
+                f"#{{==:#{{pane_id}},{bootstrap}}}",
+            ])
+            run_tmux_commands_if(
+                f"#{{S:#{{?{identity},1,}}}}",
+                [["kill-pane", "-t", bootstrap]],
+            )
+        raise
 
 
 def hub_register(client: str, client_pid: str, context: str) -> int:
@@ -4696,9 +4833,19 @@ def hub_open(
 ) -> int:
     context = supplied_context
     generation = ""
+    pane = ""
+    started = False
     try:
         if not hub_client_exists(client, client_pid):
             return 0
+        if not supplied_context:
+            current = tmux(
+                ["show-options", "-gqv", hub_client_popup_option(client)]
+            ).stdout.decode().strip()
+            if hub_pane_generation(current) is not None:
+                current_context = hub_client_context(client, client_pid)
+                if hub_popup_owned(client, client_pid, current_context, current):
+                    return 0
         if supplied_context:
             register_hub_client(client, client_pid, supplied_context)
         dimensions = tmux(
@@ -4726,54 +4873,65 @@ def hub_open(
         ensure_hub_session()
         for task in list_tasks():
             configure_task_status(task.session, task.command)
-        tmux(["switch-client", "-E", "-c", client, "-t", HUB_SESSION])
         generation = uuid.uuid4().hex
-        popup_value = f"{client_pid}:{context}:{generation}"
-        tmux(["set-option", "-g", hub_client_popup_option(client), popup_value])
-        tmux(["display-popup", "-c", client, "-C"], check=False)
-        command = (
-            f"{hub_helper_prefix('__hub-ui')}"
-            f"{shlex.quote(client)} {shlex.quote(client_pid)} "
-            f"{shlex.quote(source)} {shlex.quote(context)} {shlex.quote(generation)}"
-        )
-        shown = tmux(
+        value = f"{client_pid}:{context}:{generation}:pane"
+        pane = create_hub_pane(client_pid, context, generation, columns, rows)
+        run_tmux_commands_if(
+            tmux_all([
+                tmux_client_equals(client, client_pid, source),
+                tmux_option_equals(hub_client_context_option(client), f"{client_pid}:{context}"),
+                hub_pane_identity_condition(value, pane),
+            ]),
             [
-                "display-popup",
-                "-c",
-                client,
-                "-E",
-                "-B",
-                "-w",
-                "100%",
-                "-h",
-                "100%",
-                "-x",
-                "0",
-                "-y",
-                "0",
-                command,
+                ["set-option", "-g", hub_client_popup_option(client), value],
+                ["display-popup", "-c", client, "-C"],
+                ["switch-client", "-E", "-c", client, "-t", hub_pane_session(generation)],
             ],
-            check=False,
         )
-        current_popup = tmux(
-            ["show-options", "-gqv", hub_client_popup_option(client)]
-        ).stdout.decode().strip()
-        released = current_popup not in (popup_value, f"{popup_value}:launch")
-        finish_hub_popup(client, client_pid, context, generation)
-        if shown.returncode != 0 and not released:
-            detail = shown.stderr.decode(errors="replace").strip()
-            raise CliLaneError(detail or "could not open the session switcher")
+        if not hub_popup_owned(client, client_pid, context, value):
+            return 0
+        control_binary, control_socket = tmux_control_paths()
+        tmux(
+            [
+                "respawn-pane", "-k", "-t", pane,
+                "-e", f"CLILANE_TMUX_SOCKET={SOCKET}",
+                "-e", f"CLILANE_STATE_HOME={state_root()}",
+                "--", str(Path(sys.executable).resolve()), str(Path(__file__).resolve()),
+                "__hub-pane", control_binary, control_socket,
+                client, client_pid, source, context, generation,
+            ]
+        )
+        started = True
+        while True:
+            state = tmux(
+                ["display-message", "-p", "-t", pane,
+                 f"#{{session_name}}|#{{{HUB_PANE_OPTION}}}|#{{pane_dead}}"],
+                check=False,
+            )
+            if state.returncode != 0:
+                break
+            values = state.stdout.decode().strip().split("|")
+            if values != [hub_pane_session(generation), value, "0"]:
+                break
+            time.sleep(0.1)
         return 0
     except CliLaneError:
         if hub_client_exists(client, client_pid):
             raise
         return 0
     finally:
+        if generation and pane:
+            if (
+                not started
+                and (source == HUB_SESSION or source.startswith(SESSION_PREFIX))
+                and not tmux_session_absent(source)
+            ):
+                switch_hub_popup(
+                    client, client_pid, context,
+                    f"{client_pid}:{context}:{generation}:pane", source,
+                )
+            finish_hub_pane(client, client_pid, context, generation, pane)
         if not hub_client_exists(client, client_pid):
-            if generation:
-                popup_value = f"{client_pid}:{context}:{generation}"
-                clear_hub_popup(client, popup_value)
-                clear_hub_popup(client, f"{popup_value}:launch")
             if context and HUB_CONTEXT_PATTERN.fullmatch(context):
                 discard_unattached_hub_context(context)
 
@@ -5609,18 +5767,29 @@ def hub_claimed_launch(
                                 leave = leave or event[0] == "quit"
                     else:
                         time.sleep(0.05)
-                    if not hub_client_exists(client, client_pid):
+                    if hub_ui_interrupted() or not hub_popup_owned(
+                        client, client_pid, context, claim_value
+                    ):
                         with submission_lock:
                             if not submitted.is_set():
                                 cancelled.set()
                         leave = True
                 task = future.result()
+                if hub_ui_interrupted() or not hub_popup_owned(
+                    client, client_pid, context, claim_value
+                ):
+                    with submission_lock:
+                        if not submitted.is_set():
+                            cancelled.set()
+                    leave = True
                 if cancelled.is_set():
                     stop_task(task.id, 0.5)
                     raise HubLaunchCancelled("Launch cancelled · draft kept")
             finally:
                 if not future.done():
-                    cancelled.set()
+                    with submission_lock:
+                        if not submitted.is_set():
+                            cancelled.set()
     except CliLaneError as error:
         if leave:
             detach_hub_popup(client, client_pid, context, claim_value)
@@ -5930,7 +6099,8 @@ def hub_draw(
 
 
 def hub_ui(
-    client: str, client_pid: str, source: str, context: str, generation: str
+    client: str, client_pid: str, source: str, context: str, generation: str,
+    pane_mode: bool = False,
 ) -> int:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise CliLaneError("the session switcher needs an interactive terminal")
@@ -5939,6 +6109,8 @@ def hub_ui(
     if not hub_client_exists(client, client_pid):
         raise CliLaneError("the clilane client is no longer attached")
     popup_value = f"{client_pid}:{context}:{generation}"
+    if pane_mode:
+        popup_value += ":pane"
     current_popup = tmux(
         ["show-options", "-gqv", hub_client_popup_option(client)]
     ).stdout.decode().strip()
@@ -6061,6 +6233,10 @@ def hub_ui(
             )
 
         while True:
+            if hub_ui_interrupted() or (pane_mode and not hub_popup_owned(
+                client, client_pid, context, popup_value
+            )):
+                return 0
             all_tasks = hub_task_order(list_tasks())
             ongoing_count = sum(1 for task in all_tasks if not task.dead)
             hidden_history = max(0, len(all_tasks) - ongoing_count - history_limit)
@@ -6391,6 +6567,29 @@ def hub_launch_environment(context: str) -> dict[str, str]:
     return {
         key: value for key, value in environment.items() if isinstance(value, str)
     }
+
+
+def hub_pane(
+    client: str, client_pid: str, source: str, context: str, generation: str
+) -> int:
+    interrupted = threading.Event()
+    HUB_LAUNCH_STATE.interrupted = interrupted
+    previous_handlers: dict[signal.Signals, object] = {}
+    for sent_signal in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        previous_handlers[sent_signal] = signal.signal(
+            sent_signal, lambda _number, _frame: interrupted.set()
+        )
+    try:
+        return hub_ui(client, client_pid, source, context, generation, pane_mode=True)
+    finally:
+        try:
+            finish_hub_pane(
+                client, client_pid, context, generation, os.environ.get("TMUX_PANE")
+            )
+        finally:
+            for sent_signal, previous_handler in previous_handlers.items():
+                signal.signal(sent_signal, previous_handler)
+            del HUB_LAUNCH_STATE.interrupted
 
 
 def hub_standby() -> int:
@@ -7308,6 +7507,11 @@ def main() -> int:
         if len(sys.argv) == 9 and sys.argv[1] == "__hub-ui":
             configure_tmux_control(sys.argv[2], sys.argv[3])
             return hub_ui(
+                sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8]
+            )
+        if len(sys.argv) == 9 and sys.argv[1] == "__hub-pane":
+            configure_tmux_control(sys.argv[2], sys.argv[3])
+            return hub_pane(
                 sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8]
             )
         if len(sys.argv) == 7 and sys.argv[1] == "__hub-ui":
