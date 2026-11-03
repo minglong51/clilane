@@ -286,16 +286,29 @@ clilane
 | `Tab` / `Shift-Tab` | Choose Codex, Kimi, Claude, or another configured preset. |
 | `Up` / `Down` | Select a running or finished job. |
 | `Enter` | Start the chosen agent when the composer has text. |
-| `Right` / `Enter` | Open the selected running job when the composer is empty. On a finished Claude, Codex, or Kimi job, `Enter` resumes it (see `Ctrl-R`) and opens the new session; on any other finished job, `Enter` opens the dead pane. `Right` always opens the pane. |
+| `Right` / `Enter` | Open the selected running job when the composer is empty. On a finished job, `Enter` resumes an eligible agent conversation and opens it; otherwise it opens the finished pane. `Right` always opens the pane. |
 | `Space` | With an empty composer, peek at the selected job's latest output without opening it. While the peek is open, the composer replies to that job: type a message and press `Enter` to deliver it through the job's terminal. `Space` again closes the peek. |
-| `Ctrl-R` | Resume the selected finished job: relaunch the same command in the same directory under the same name, with `--continue` for Claude and Kimi and `resume --last` for Codex, so the agent picks up its newest conversation in that directory. A job that matches a configured preset relaunches through that preset, including its clean profile; any other job relaunches with the raw environment. The previous log becomes the new job's `.previous` log until the new log rotates. |
+| `Ctrl-R` | Relaunch the selected finished job in the same directory under the same name, using the resume or rerun action shown in the switcher. See the resume behavior below. The previous log becomes the new job's `.previous` log until the new log rotates. |
 | `Ctrl-X` | Stop the selected running job, or remove a finished one. Press it twice within 2 seconds; any other key cancels. |
 | `Left` / `Right` | Move the composer cursor while typing. |
 | `Esc` | Clear the composer, or close an open peek. With an empty composer, return to the job you came from, or leave the switcher when you opened it from your shell. |
 | `Ctrl-C` / `Ctrl-D` | Clear the composer. With an empty composer, press the same key twice within 2 seconds to leave the switcher. |
 | `Ctrl-Q` | Leave the switcher immediately. Every job keeps running. |
 | `Ctrl-Q` or `Ctrl-b w` in a job | Background that job and return to the switcher. |
-| `Left` in an agent job | At an empty Claude, Codex, or Kimi prompt, background the job and return to the switcher, like Claude's agent view. Anywhere else `Left` moves the cursor as usual. |
+| `Left` / `Right` in an agent job | At an empty Claude, Codex, or Kimi prompt, switch to the previous or next running session, wrapping at either end. Prompt drafts and copy mode retain ordinary arrow-key behavior. Use `Ctrl-Q` for the switcher. |
+
+Tracked Claude jobs resume the conversation recorded at a clean native exit, using
+the original profile and launch environment. If that exit record is missing or
+the launch identity changed, CLI Lane refuses automatic resume; use Claude's
+native session picker with the original profile instead.
+
+Other agent jobs preserve an explicit resume selection when present. Otherwise,
+Claude and Kimi use `--continue`, and Codex uses `resume --last`; these select the
+provider's latest conversation, which may differ from the job you selected.
+Automatic final-conversation tracking for Codex and Kimi is not available. These
+jobs relaunch through a matching configured preset, including its clean profile,
+or through the raw environment when no preset matches. Unsupported fork commands
+are refused; non-agent jobs rerun their saved command.
 
 The list is split into `ONGOING` jobs and `HISTORY`, newest first. History shows
 the latest 20 finished jobs; moving the selection past the last one reveals the
