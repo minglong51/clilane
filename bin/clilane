@@ -88,6 +88,20 @@ HUB_RESUME_ARGUMENTS: dict[str, tuple[list[str], frozenset[str], frozenset[str]]
 HUB_AGENT_READY_TIMEOUT_SECONDS = 10.0
 HUB_AGENT_READY_POLL_SECONDS = 0.05
 HUB_PROMPT_AGENT_ORDER = ("codex", "kimi", "claude", "omp")
+HUB_NATIVE_AGENT_COMMANDS: dict[str, tuple[str, ...]] = {
+    "kiro-cli": ("chat",),
+    "gemini": (),
+    "opencode": (),
+    "copilot": (),
+    "aider": (),
+    "amp": (),
+    "goose": ("session",),
+    "pi": (),
+    "cursor-agent": (),
+    "droid": (),
+    "qwen": (),
+    "hermes": ("chat",),
+}
 FIELD_SEPARATOR = "|"
 ON_EXIT_TIMEOUT = 30.0
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -3799,11 +3813,19 @@ def discover_hub_presets(
         search_roots.append(str(candidate))
     search_path = os.pathsep.join(search_roots)
     presets: list[dict[str, object]] = []
-    for name in HUB_PROMPT_AGENT_ORDER:
+    commands = {
+        **dict.fromkeys(HUB_PROMPT_AGENT_ORDER, ()),
+        **HUB_NATIVE_AGENT_COMMANDS,
+    }
+    for name, arguments in commands.items():
         executable = shutil.which(name, path=search_path)
         if executable:
             presets.append(
-                {"name": name, "command": [executable], "dir": str(launch_directory)}
+                {
+                    "name": name,
+                    "command": [executable, *arguments],
+                    "dir": str(launch_directory),
+                }
             )
     return presets
 
@@ -5286,6 +5308,11 @@ def send_hub_prompt(preset: dict[str, object], task: Task, prompt: str) -> None:
     hub_launch_submit(lambda: key_task(task.id, ["Enter"]))
 
 
+def hub_requires_native_prompt(preset: dict[str, object]) -> bool:
+    command = list(preset["command"])
+    return bool(command) and Path(str(command[0])).name.lower() in HUB_NATIVE_AGENT_COMMANDS
+
+
 def launch_hub_preset(
     preset: dict[str, object], name: str, context: str, prompt: str = ""
 ) -> Task:
@@ -5294,6 +5321,11 @@ def launch_hub_preset(
     selected, launch_environment, profile_name, provider = hub_preset_launch_settings(
         preset, context
     )
+    if prompt and hub_requires_native_prompt(selected):
+        raise CliLaneError(
+            "Draft kept · Esc clears; select New session, "
+            f"Enter opens {selected['name']}"
+        )
     spec = complete_launch_spec(
         name=name,
         cwd_value=str(selected["dir"]),
@@ -5907,7 +5939,10 @@ def hub_no_presets_notice(
         return f"Add agent presets to {config}"
     if config_present:
         return f"Config disables discovery · Remove it or add agent presets to {config}"
-    return f"Install Codex, Kimi, or Claude · Or install OMP · Add agent presets to {config}"
+    return (
+        "Install Codex, Kimi, or Claude · Or Kiro, Gemini, OMP, OpenCode, or another "
+        f"supported CLI · Add agent presets to {config}"
+    )
 
 
 def hub_terminal_size() -> os.terminal_size:
@@ -6043,6 +6078,8 @@ def hub_draw(
             first,
             f"type message · Enter start new ({agents}) · Space/Esc close · Ctrl-Q leave",
         ]
+        if preset is not None and hub_requires_native_prompt(preset):
+            hints[1] = f"New session opens {preset['name']} · Space/Esc close · Ctrl-Q leave"
     else:
         action_hint = "empty: →/Enter view · click open · Space peek · Esc back · Ctrl-X stop"
         if selected < len(tasks) and tasks[selected].dead and hub_resume_kind(tasks[selected], presets):
@@ -6061,12 +6098,23 @@ def hub_draw(
             f"type message · Tab agent ({agents}) · Enter start · ↑↓ jobs",
             action_hint,
         ]
+        if preset is not None and hub_requires_native_prompt(preset):
+            hints[0] = f"{preset['name']}: use New session · type inside the agent · Tab agent"
+            if selected == len(tasks):
+                hints[0] = f"Enter open {preset['name']} · type inside the agent · Tab agent"
+                hints[1] = "empty: Enter open agent · ↑↓ jobs · Ctrl-Q leave"
+            if prompt:
+                hints[0] = f"Type inside {preset['name']} · Esc clear · Tab agent"
     if compact:
         target = tasks[selected] if selected < len(tasks) else None
         if prompt:
             action = "send" if reply_to is not None else "start"
         elif target is None:
-            action = "start"
+            action = (
+                "open"
+                if preset is not None and hub_requires_native_prompt(preset)
+                else "start"
+            )
         elif target.dead and hub_resume_kind(target, presets):
             action = hub_resume_action(target, presets)
         else:
@@ -6086,6 +6134,11 @@ def hub_draw(
                 hints[1] = "Ctrl-Q leave Space peek"
             else:
                 hints[1] = "Ctrl-Q exit Ctrl-X stop"
+        if (
+            prompt and reply_to is None
+            and preset is not None and hub_requires_native_prompt(preset)
+        ):
+            hints = ["Type inside the agent", "Esc clear · Ctrl-Q exit"]
     lines.extend(
         [
             hub_composer_line(preset, prompt, cursor, width, reply_to),
@@ -6316,7 +6369,11 @@ def hub_ui(
                 selected = clicked
                 selected_key = item_keys[selected]
                 if selected == len(tasks):
-                    notice = "Type your first message below · Tab chooses the agent"
+                    notice = (
+                        "Enter opens a new session · Tab chooses the agent"
+                        if preset is not None and hub_requires_native_prompt(preset)
+                        else "Type your first message below · Tab chooses the agent"
+                    )
                     continue
                 key = "right"
             if key == "up":
@@ -6504,8 +6561,9 @@ def hub_ui(
                         tasks[selected].session,
                     )
                     return 0
-                notice = "Type a message to start a new session"
-                continue
+                if preset is None or not hub_requires_native_prompt(preset):
+                    notice = "Type a message to start a new session"
+                    continue
             if peek_key and selected < len(tasks) and not tasks[selected].dead:
                 target = tasks[selected]
                 try:
@@ -7189,6 +7247,7 @@ def parser() -> argparse.ArgumentParser:
   clilane
   clilane run codex-app -C ~/projects/sample-app -- codex
   clilane run kimi-research -C ~/projects/research -- kimi
+  clilane run kiro-app -C ~/projects/sample-app -- kiro-cli chat
   clilane list
   clilane fleet
   clilane status codex-app
@@ -7196,7 +7255,15 @@ def parser() -> argparse.ArgumentParser:
 
 Only tasks started through clilane appear. Click a session tab to switch, or
 use Left/Right at an empty Claude, Codex, or Kimi prompt. With text in the prompt,
-arrows move the cursor. Click Sessions or press Ctrl-Q for the full list.""",
+arrows move the cursor. Click Sessions or press Ctrl-Q for the full list;
+press Ctrl-Q again there to detach. Ctrl-PageUp/PageDown switches lanes for
+every CLI, including OMP. To quit OMP itself, press Ctrl-D at an empty prompt.
+
+Without hub.json, Sessions discovers installed Codex, Kimi, Claude, OMP,
+Kiro CLI, Gemini, OpenCode, Copilot, Aider, Amp, Goose, Pi, Cursor Agent,
+Droid, Qwen Code, and Hermes commands on PATH. For newly supported CLIs,
+select New session, use Tab to choose an agent, and press Enter with an
+empty composer to open it. Type messages inside their own terminal.""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     root.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
