@@ -504,7 +504,7 @@ def _exercise_hub_lifecycle(environment: dict[str, str]) -> None:
                     + standby.decode(errors="replace")
                 )
             time.sleep(0.05)
-        assert b"Ctrl-b w to reopen" in standby
+        assert b"Ctrl-B to reopen" in standby
         pane = _tmux(
             environment,
             [
@@ -870,7 +870,7 @@ def _exercise_switcher_keys(environment: dict[str, str]) -> None:
         terminal.send(b"\x03")
         terminal.expect("Detach and discard drafts?", mark)
         mark = terminal.mark()
-        terminal.send(b"\x1b\x02h")
+        terminal.send(b"\x1b\x1bOP")
         terminal.expect("KEYBOARD HELP", mark)
         assert terminal.running()
         terminal.resize(40, 10)
@@ -893,7 +893,7 @@ def _exercise_switcher_keys(environment: dict[str, str]) -> None:
         terminal = _Terminal(["attach", "keys-job"], environment)
         _wait_for_client_session(environment, terminal, job_session)
         mark = terminal.mark()
-        terminal.send(b"\x02w")
+        terminal.send(b"\x02")
         terminal.expect("This clilane server", mark)
         mark = terminal.mark()
         terminal.send(b"keep this draft")
@@ -901,13 +901,13 @@ def _exercise_switcher_keys(environment: dict[str, str]) -> None:
         terminal.send(b"\x1b")
         _wait_for_client_session(environment, terminal, job_session)
         mark = terminal.mark()
-        terminal.send(b"\x02w")
+        terminal.send(b"\x02")
         terminal.expect("keep this draft", mark)
         assert _tasks(environment)[0]["id"] == job["id"]
         terminal.send(b"\x03")
         _wait_for_client_session(environment, terminal, job_session)
         mark = terminal.mark()
-        terminal.send(b"\x02w")
+        terminal.send(b"\x02")
         terminal.expect("keep this draft", mark)
         mark = terminal.mark()
         terminal.send(b"\x11")
@@ -922,7 +922,7 @@ def _exercise_switcher_keys(environment: dict[str, str]) -> None:
         terminal = _Terminal(["attach", "keys-job"], environment)
         _wait_for_client_session(environment, terminal, job_session)
         mark = terminal.mark()
-        terminal.send(b"\x02w")
+        terminal.send(b"\x02")
         terminal.expect("This clilane server", mark)
         terminal.settle()
         assert "keep this draft" not in _last_frame(terminal, mark)
@@ -1165,7 +1165,7 @@ def _exercise_switcher_sections(environment: dict[str, str], tool_bin: Path) -> 
         terminal.expect("Pane is dead", mark)
         assert terminal.running(), "Enter on a finished plain job left the client"
         mark = terminal.mark()
-        terminal.send(b"\x02w")
+        terminal.send(b"\x02")
         terminal.expect("This clilane server", mark)
         assert {
             session for session in
@@ -1194,7 +1194,7 @@ def _exercise_switcher_sections(environment: dict[str, str], tool_bin: Path) -> 
         terminal.settle()
         assert next(task["id"] for task in _tasks(environment) if task["name"] == "agent-job") == agent_id
         mark = terminal.mark()
-        terminal.send(b"\x02w")
+        terminal.send(b"\x02")
         terminal.expect("This clilane server", mark)
         terminal.send(b"\x12")
         deadline = time.monotonic() + 15.0
@@ -1234,40 +1234,63 @@ def _exercise_keyboard_portability(environment: dict[str, str], root: Path) -> N
         _run(environment, ["run", "portable-other", "--", "/bin/cat"])
         terminal = _Terminal(["attach", "portable-omp"], environment)
         terminal.expect("READY")
-        native = b"\x11\x03\x04\x18\x12\x1b[D\x02\x02"
+        native = b"\x11\x03\x04\x18\x12\x1b[D"
         terminal.send(native)
         deadline = time.monotonic() + 5.0
-        expected = b"\x11\x03\x04\x18\x12\x1b[D\x02"
+        expected = native
         while not received.exists() or received.read_bytes() != expected:
             assert time.monotonic() < deadline, received.read_bytes() if received.exists() else b""
             terminal.settle()
         for key in ("C-q", "C-Tab", "C-BTab", "C-PPage", "C-NPage"):
             assert not _tmux(environment, ["list-keys", "-T", "root", key]).stdout.strip()
+        assert _tmux(environment, ["show-options", "-gv", "prefix"]).stdout.strip() == b"None"
         mark = terminal.mark()
-        terminal.send(b"\x02n")
+        terminal.send(b"\x02")
+        terminal.expect("This clilane server", mark)
+        terminal.send(b"\x02")
+        _wait_for_attached_task(environment, terminal, "portable-omp")
+        deadline = time.monotonic() + 5.0
+        while received.read_bytes() != native + b"\x02":
+            assert time.monotonic() < deadline, received.read_bytes()
+            terminal.settle()
+        terminal.settle()
+        mark = terminal.mark()
+        terminal.send(b"\x02")
+        terminal.expect("This clilane server", mark)
+        mark = terminal.mark()
+        terminal.send(b"\x1b[A\r")
         terminal.expect("LOCAL · portable-other", mark)
         mark = terminal.mark()
-        terminal.send(b"\x02p")
+        terminal.send(b"\x02")
+        terminal.expect("This clilane server", mark)
+        mark = terminal.mark()
+        terminal.send(b"\x1b[B\r")
         terminal.expect("LOCAL · portable-omp", mark)
+        mark = terminal.mark()
+        terminal.send(b"\x02")
+        terminal.expect("This clilane server", mark)
         terminal.resize(24, 8)
         mark = terminal.mark()
-        terminal.send(b"\x02h")
+        terminal.send(b"\x1b[B\x1b[B\r")
         terminal.expect("KEYBOARD HELP", mark)
         mark = terminal.mark()
         terminal.send(b"\x1b")
         terminal.expect("CLI LANE", mark)
         terminal.resize(100, 24)
         mark = terminal.mark()
-        terminal.send(b"\x02n")
+        terminal.send(b"\x1b[A\x1b[A\x1b[A\r")
         terminal.expect("LOCAL · portable-other", mark)
         mark = terminal.mark()
-        terminal.send(b"\x02w")
+        terminal.send(b"\x02")
         terminal.expect("This clilane server", mark)
         mark = terminal.mark()
-        terminal.send(b"saved while reading help\x02h")
+        terminal.send(b"saved while reading help\x1b[B\r")
         terminal.expect("KEYBOARD HELP", mark)
         mark = terminal.mark()
-        terminal.send(b"\x11")
+        terminal.send(b"\x1b")
+        terminal.expect("This clilane server", mark)
+        mark = terminal.mark()
+        terminal.send(b"\x1b[B\r")
         terminal.expect("Detach and discard drafts?", mark)
         terminal.resize(20, 4)
         mark = terminal.mark()
@@ -1278,6 +1301,36 @@ def _exercise_keyboard_portability(environment: dict[str, str], root: Path) -> N
         assert all(task["state"] == "running" for task in _tasks(environment))
         terminal.close()
         terminal = None
+
+        terminal = _Terminal(["attach", "portable-other"], environment)
+        _wait_for_attached_task(environment, terminal, "portable-other")
+        terminal.resize(20, 4)
+        terminal.send(b"\x02")
+        terminal.expect("Ctrl-Q detach")
+        terminal.send(b"\x11")
+        assert terminal.wait() == 0
+        terminal.close()
+
+        terminal = _Terminal(["attach", "portable-other"], environment)
+        _wait_for_attached_task(environment, terminal, "portable-other")
+        terminal.send(b"\x02")
+        terminal.expect("This clilane server")
+        for label, expected in (("?  Help", "KEYBOARD HELP"), ("Detach ·", None)):
+            session = _client_sessions(environment)[0]
+            frame = _tmux(environment, ["capture-pane", "-p", "-t", session]).stdout.decode().splitlines()
+            row = next(index + 1 for index, line in enumerate(frame) if label in line)
+            mark = terminal.mark()
+            terminal.send(f"\x1b[<0;3;{row}M\x1b[<0;3;{row}m".encode())
+            if expected is not None:
+                terminal.expect(expected, mark)
+                mark = terminal.mark()
+                terminal.send(b"\x1b")
+                terminal.expect("This clilane server", mark)
+            else:
+                assert terminal.wait() == 0
+        terminal.close()
+        terminal = None
+        assert all(task["state"] == "running" for task in _tasks(environment))
     finally:
         if terminal is not None:
             terminal.close()
@@ -1335,7 +1388,7 @@ def _exercise_terminfo_case(
             terminal.expect(notice)
         _wait_for_client_session(environment, terminal, job_session)
         mark = terminal.mark()
-        terminal.send(b"\x02w")
+        terminal.send(b"\x02")
         terminal.expect("This clilane server", mark)
         terminal.send(b"\x11")
         assert terminal.wait() == 0
@@ -1484,7 +1537,7 @@ def main() -> int:
             )
             discovery_terminal.expect("LOCAL · codex-launch-project", mark)
             mark = discovery_terminal.mark()
-            discovery_terminal.send(b"\x02w")
+            discovery_terminal.send(b"\x02")
             discovery_terminal.expect("This clilane server", mark)
             discovery_terminal.expect("codex-launch-project", mark)
             discovery_terminal.expect("Enter open · Space preview", mark)
@@ -1526,7 +1579,7 @@ def main() -> int:
             )
             discovery_terminal.expect("LOCAL · source-ui")
             mark = discovery_terminal.mark()
-            discovery_terminal.send(b"\x02w")
+            discovery_terminal.send(b"\x02")
             discovery_terminal.expect("This clilane server", mark)
             discovery_terminal.expect("[kimi · source-project]", mark)
             source_prompt = f"source project {os.getpid()}"
@@ -1539,7 +1592,7 @@ def main() -> int:
             )
             discovery_terminal.expect("LOCAL · kimi-source-project", mark)
             mark = discovery_terminal.mark()
-            discovery_terminal.send(b"\x02w")
+            discovery_terminal.send(b"\x02")
             discovery_terminal.expect("This clilane server", mark)
             discovery_terminal.expect("kimi-source-project", mark)
             discovery_terminal.expect("Enter open · Space preview", mark)
@@ -1639,7 +1692,7 @@ def main() -> int:
             ).stdout
 
             mark = terminal.mark()
-            terminal.send(b"\x02w")
+            terminal.send(b"\x02")
             terminal.expect("This clilane server", mark)
             terminal.expect("ORIGIN", mark)
             terminal.expect("BOT", mark)
@@ -1655,7 +1708,7 @@ def main() -> int:
 
             terminal.settle()
             mark = terminal.mark()
-            terminal.send(b"\x02w")
+            terminal.send(b"\x02")
             terminal.expect("This clilane server", mark)
             terminal.expect("Enter open · Space preview", mark)
             time.sleep(0.25)
@@ -1687,7 +1740,7 @@ def main() -> int:
 
             terminal.settle()
             mark = terminal.mark()
-            terminal.send(b"\x02w")
+            terminal.send(b"\x02")
             terminal.expect("This clilane server", mark)
             terminal.expect("Enter open · Space preview", mark)
             time.sleep(0.25)
@@ -1697,7 +1750,7 @@ def main() -> int:
             main_session = next(iter(main_sessions))
             main_pane = _hub_pane_info(environment, main_session)
             other_mark = other_terminal.mark()
-            other_terminal.send(b"\x02w")
+            other_terminal.send(b"\x02")
             other_terminal.expect("This clilane server", other_mark)
             other_terminal.expect("[other ·", other_mark)
             peer_sessions = _hub_sessions(environment) - main_sessions
@@ -1785,7 +1838,7 @@ def main() -> int:
             other_terminal.expect(other_prompt, other_mark)
             other_terminal.settle()
             other_mark = other_terminal.mark()
-            other_terminal.send(b"\x02w")
+            other_terminal.send(b"\x02")
             other_terminal.expect("This clilane server", other_mark)
             other_terminal.expect("[other ·", other_mark)
             other_terminal.send(b"\x11")
@@ -1793,7 +1846,7 @@ def main() -> int:
 
             terminal.settle()
             mark = terminal.mark()
-            terminal.send(b"\x02w")
+            terminal.send(b"\x02")
             terminal.expect("This clilane server", mark)
             terminal.expect("kimi-", mark)
             terminal.expect("[kimi ·", mark)
@@ -1825,7 +1878,7 @@ def main() -> int:
             terminal.expect("adopted=adopted", mark)
             assert len(_tasks(environment)) == len(tasks) + 1
             mark = terminal.mark()
-            terminal.send(b"\x02w")
+            terminal.send(b"\x02")
             terminal.expect("This clilane server", mark)
             terminal.send(b"\x11")
             assert terminal.wait() == 0
@@ -1885,7 +1938,7 @@ def main() -> int:
             terminal = _Terminal(["attach", "local-ui"], large_environment)
             terminal.expect("LOCAL · local-ui")
             mark = terminal.mark()
-            terminal.send(b"\x02w")
+            terminal.send(b"\x02")
             terminal.expect("environment is too large", mark)
             blocked_prompt = f"blocked launch {os.getpid()}"
             mark = terminal.mark()
