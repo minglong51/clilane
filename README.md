@@ -94,8 +94,8 @@ clilane status demo
 clilane read demo
 ```
 
-Attach to its terminal when you need full interaction. Press `Ctrl-B`, release it,
-then press `w` to return to Sessions. `Ctrl-B`, then `d` detaches and keeps jobs
+Attach to its terminal when you need full interaction. Press `Ctrl-B` once to
+return to Sessions. Select Detach and press Enter to leave with jobs
 running:
 
 ```bash
@@ -281,24 +281,27 @@ is an explicit alias for the same view.
 clilane
 ```
 
-Use the **Control** key on both Mac and PC keyboards. For `Ctrl-B, then w`,
-press Control-B, release both keys, then press `w`. These shortcuts do not need
+Press **Ctrl-B once** to open Sessions, use **Up/Down** to choose, and press
+**Enter** to open. **Esc** returns without clearing your draft. **Help** and
+**Detach** are choices in the same list; you can select or click them.
+Use the Control key on both Mac and PC keyboards. Everyday navigation needs no
 Command, Option, Fn, or Page keys. Windows Terminal clients can use WSL or SSH to
 a machine running CLI Lane; CLI Lane itself requires a Unix environment and tmux.
 
-**Upgrading from 0.17:** `Ctrl-Q` now reaches the agent's native command, including
-OMP's follow-up action. Use `Ctrl-B, then w` for Sessions. Modified Tab/Page keys
+**Upgrading from 0.18:** `Ctrl-B` opens Sessions immediately; the extra `w` and
+other prefix letters are no longer needed. Choose the next job, Help, or Detach
+in the list. `Ctrl-Q` reaches the agent's native command, including
+OMP's follow-up action. Modified Tab/Page keys
 also stay with the terminal or agent. In OMP, `Ctrl-D` exits normal chat and
 `Ctrl-C` exits first-run setup; detaching CLI Lane keeps OMP running.
 
 | Key | Behavior |
 | --- | --- |
-| `Ctrl-B`, then `w` | Open Sessions from an agent. |
-| `Ctrl-B`, then `n` / `p` | Switch to the next / previous running session. |
-| `Ctrl-B`, then `d` | Detach; jobs keep running. |
-| `Ctrl-B`, then `h` | Open scrollable keyboard help. In Sessions, `F1` also opens help. |
+| `Ctrl-B` | Open Sessions immediately from an agent. |
+| Select Help, then `Enter` | Open scrollable keyboard help. `F1` also opens help in Sessions. |
+| Select Detach, then `Enter` | Detach; jobs keep running. Drafts require confirmation before discarding. |
 | `Tab` / `Shift-Tab` | Choose the next / previous agent and select New session. |
-| `Up` / `Down` | Select a running or finished job. |
+| `Up` / `Down` | Select a running or finished job, New session, Help, or Detach. |
 | `Enter` | Open the selected job, including a finished pane. On New session, open the chosen agent; a typed first message starts and submits it for Codex, Kimi, Claude, or OMP. In a live preview, send the typed reply. |
 | `Space` | With an empty composer, preview the selected job. Type in a live preview to reply to that job. `Space` again closes an empty preview. |
 | `Ctrl-R` | Explicitly resume or rerun the selected finished job using the action shown. See resume behavior below. The previous log becomes the new job's `.previous` log until it rotates. |
@@ -312,11 +315,13 @@ also stay with the terminal or agent. In OMP, `Ctrl-D` exits normal chat and
 | `Delete` (PC) / `Fn-Delete` (Mac) | Delete the next character. |
 | `Ctrl-D` in Sessions | Delete the next character; with an empty composer, request detach. |
 | `Ctrl-K`, `Ctrl-U`, `Ctrl-Y` | Erase to the end, clear the draft, or paste the last cut text. |
-| `Left` / `Right` in an agent | At an empty Claude, Codex, or Kimi prompt, switch running sessions. Drafts and copy mode retain ordinary arrows. For OMP, Kiro, and other agents, use `Ctrl-B`, then `n` / `p`. |
+| `Left` / `Right` in an agent | At an empty Claude, Codex, or Kimi prompt, switch running sessions. Drafts and copy mode retain ordinary arrows. For OMP, Kiro, and other agents, use `Ctrl-B` and choose a session. |
 
 Drafts are temporary and belong to the attached client. Reopening Sessions restores
-them; detaching discards them. `Ctrl-B` twice sends a literal Control-B to an agent.
-Inside an outer tmux with its default prefix, press `Ctrl-B` twice, then `w`, to
+them; detaching discards them. Once Sessions is visible, pressing `Ctrl-B` again
+returns and sends a literal Control-B to the source agent. Use `Esc` to return
+without sending a key.
+Inside an outer tmux with its default prefix, press `Ctrl-B` twice to
 reach CLI Lane's Sessions; the first prefix is handled by the outer tmux.
 
 Tracked Claude jobs resume the conversation recorded at a clean native exit, using
@@ -424,7 +429,7 @@ named `agt` for compatibility with tasks created before the project was renamed.
 | `fleet status HOST:TASK` | Show one task on a fleet host as JSON. |
 | `fleet log HOST:TASK` | Read a fleet task's persistent log. `--lines` defaults to 200. |
 | `status TARGET` | Show one task by name or unique ID prefix. Supports `--json`. |
-| `attach TARGET` | Attach interactively. `Ctrl-B`, then `w` returns to Sessions. |
+| `attach TARGET` | Attach interactively. `Ctrl-B` returns to Sessions. |
 | `hub` | Open the same switcher as bare `clilane`. `--config` overrides the presets file. |
 | `read TARGET` | Print the last 200 terminal lines. `--all` prints retained scrollback. |
 | `log TARGET` | Read persistent output. `--lines` defaults to 200; `--follow` follows rotation. |
@@ -556,7 +561,7 @@ logs under `~/.local/state/agt` remain readable for compatibility.
 - Fleet snapshots are point-in-time; a task can change immediately afterward.
 - Fleet ages assume host clocks are reasonably synchronized.
 - Raw terminal logs are not structured or redacted.
-- Windows is unsupported.
+- Native Windows is unsupported; use WSL or SSH to a Unix host.
 
 ## License
 

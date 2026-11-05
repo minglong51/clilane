@@ -35,7 +35,7 @@ from typing import BinaryIO, Callable, Iterator, Mapping, Sequence
 
 
 PROGRAM = "clilane"
-VERSION = "0.18.0"
+VERSION = "0.19.0"
 TASK_STATE_INITIALIZING = "initializing"
 TASK_STATE_RUNNING = "running"
 TASK_STATE_STOPPED = "stopped"
@@ -74,14 +74,13 @@ HUB_HISTORY_BATCH_MAX = 1000
 HUB_LEFT_GATE_COLUMNS = 8
 HUB_LEFT_AGENT_KINDS = frozenset({"claude", "codex", "kimi"})
 HUB_KEY_HELP = (
-    "Ctrl-B, release, then:",
-    " w  Sessions",
-    " n/p  next/previous",
-    " d  detach; jobs run",
-    " h  keyboard help",
+    "Ctrl-B opens Sessions.",
+    "Up/Down choose; Enter opens.",
+    "Esc goes back; drafts stay.",
+    "Help and Detach are menu choices.",
     "",
     "In Sessions:",
-    " Up/Down  select job",
+    " Up/Down  select job or action",
     " Tab/Shift-Tab  agent",
     " Enter  open / send reply",
     " New session + Enter opens any agent",
@@ -107,7 +106,8 @@ HUB_KEY_HELP = (
     "Replies stay with their own job.",
     "Inside agents, native Ctrl-Q/C/D",
     "and modified Tab/Page keys pass through.",
-    "Ctrl-B twice sends Ctrl-B to the agent.",
+    "Once Sessions is open, Ctrl-B returns",
+    "and sends Ctrl-B to the source agent.",
     "Ctrl means Control on Mac and PC.",
     "Windows clients need WSL or SSH to CliLane.",
 )
@@ -3177,7 +3177,7 @@ def configure_task_status(session: str, command: Sequence[str]) -> None:
             "-t",
             session,
             "status-right",
-            " ←/→ empty · Ctrl-B w Sessions " if agent else " Ctrl-B w Sessions · n/p tabs ",
+            " ←/→ empty · Ctrl-B Sessions " if agent else " Ctrl-B Sessions ",
         ],
         check=False,
     )
@@ -3742,7 +3742,7 @@ def print_status(task: Task, as_json: bool) -> None:
 def require_attach_terminal() -> None:
     if hub_command_is_recursive():
         raise CliLaneError(
-            "already inside CLI Lane; click Sessions or press Ctrl-b w to open the list"
+            "already inside CLI Lane; click Sessions or press Ctrl-B to open the list"
         )
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise CliLaneError("attaching needs an interactive terminal")
@@ -4309,18 +4309,15 @@ def hub_left_check_command() -> str:
 def bind_hub_keys() -> None:
     open_command = hub_open_command()
     configure_hub_navigation()
-    for key in ("c", "%", '"'):
-        tmux([
-            "bind-key", "-T", "prefix", key, "display-message",
-            "Press Ctrl-B then w for Sessions; choose New session to start another lane",
-        ])
+    tmux(["set-option", "-g", "prefix", "None"])
+    tmux(["set-option", "-g", "prefix2", "None"])
     tmux(["unbind-key", "-T", "root", "C-q"], check=False)
     tmux(
         [
             "bind-key",
             "-T",
-            "prefix",
-            "w",
+            "root",
+            "C-b",
             f"run-shell -b {tmux_quoted(open_command)}",
         ]
     )
@@ -4374,7 +4371,7 @@ def configure_hub_navigation() -> None:
         + ",}}"
     )
     status = (
-        "#[align=left range=left bold] ‹ Sessions [Ctrl-B w] #[norange nobold] "
+        "#[align=left range=left bold] ‹ Sessions [Ctrl-B] #[norange nobold] "
         "#[list=on]#[list=left-marker range=user|previous]‹ "
         "#[list=right-marker range=user|next] ›#[norange list=on]"
         + session_tabs
@@ -4409,13 +4406,6 @@ def configure_hub_navigation() -> None:
         tmux(["unbind-key", "-T", "root", key], check=False)
     for key in ("C-PPage", "C-NPage", "C-Tab", "C-BTab"):
         tmux(["unbind-key", "-T", "root", key], check=False)
-    for key, command in (("p", previous_command), ("n", next_command)):
-        tmux(["bind-key", "-T", "prefix", key, command])
-    for key in ("h", "?"):
-        tmux([
-            "bind-key", "-T", "prefix", key,
-            "run-shell -b " + tmux_quoted(hub_open_command(show_help=True)),
-        ])
 
 
 def hub_cycle_command(direction: int) -> str:
@@ -4747,11 +4737,14 @@ def switch_hub_popup(
     context: str,
     popup_value: str,
     target: str,
+    *, send_prefix: bool = False,
 ) -> None:
     option = hub_client_popup_option(client)
     commands = [["set-option", "-gu", option]]
     if hub_pane_generation(popup_value) is None:
         commands.append(["display-popup", "-c", client, "-C"])
+    if send_prefix:
+        commands.append(["send-keys", "-t", target, "C-b"])
     commands.append(["switch-client", "-E", "-c", client, "-t", target])
     run_tmux_commands_if(
         hub_popup_owner_condition(client, client_pid, context, popup_value),
@@ -4923,12 +4916,6 @@ def hub_open(
         if dimensions.returncode != 0:
             return 0
         columns, rows = map(int, dimensions.stdout.decode().split())
-        if columns < 24 or rows < 8:
-            tmux(
-                ["display-message", "-c", client, "Resize to 24x8, then press Ctrl-B then w"],
-                check=False,
-            )
-            return 0
         context = hub_client_context(client, client_pid)
         data = hub_context_data(context)
         environment = data["environment"]
@@ -6093,7 +6080,9 @@ def hub_draw(
             rows.append((f"HISTORY (showing 0 of {history_total})", None, "1"))
         rows.append((f"   … {hidden_history} more · ↓ to reveal", None, "2"))
     rows.append(("+  New session", len(tasks), ""))
-    selected = max(0, min(selected, len(tasks)))
+    rows.append(("?  Help", len(tasks) + 1, ""))
+    rows.append(("   Detach · jobs keep running", len(tasks) + 2, ""))
+    selected = max(0, min(selected, len(tasks) + 2))
     selected_row = next(
         (position for position, (_, index, _) in enumerate(rows) if index == selected),
         len(rows) - 1,
@@ -6122,7 +6111,7 @@ def hub_draw(
     lines = [
         "\033[1mCLI LANE\033[0m",
         fleet_display_cell(
-            "This clilane server · Ctrl-B h help · Ctrl-Q detach (jobs keep running)",
+            "This clilane server · Up/Down choose · Enter open · Esc back",
             width,
         ),
         fleet_display_cell(
@@ -6165,7 +6154,12 @@ def hub_draw(
             if target.dead and (hub_resume_kind(target, presets) or hub_command_kind(target.command) is None)
             else "Ctrl-X remove" if target.dead else "Ctrl-X stop"
         )
-        hints = ["Enter open · Space preview · " + action, "Esc back · Ctrl-B h help · Ctrl-Q detach"]
+        hints = ["Enter open · Space preview · " + action, "Esc back · Help and Detach below"]
+    elif selected > len(tasks):
+        hints = [
+            "Enter opens keyboard help" if selected == len(tasks) + 1 else "Enter detaches; jobs keep running",
+            "Up/Down choose · Esc back",
+        ]
     else:
         name = str(preset["name"]) if preset else "agent"
         hints = [
@@ -6176,7 +6170,7 @@ def hub_draw(
         if prompt and preset and hub_requires_native_prompt(preset):
             hints = [f"Type inside {name} · Ctrl-U clear draft", "Then Enter opens the agent · Esc back"]
     if compact:
-        lines[1] = "↑↓ jobs · Ctrl-B h help"
+        lines[1] = "↑↓ choose · Enter open"
         if target is not None:
             if reply_to is not None and prompt and not reply_to.dead:
                 hints[0] = "Enter send reply"
@@ -6192,7 +6186,7 @@ def hub_draw(
                     hints[0] = "Ctrl-X remove"
             else:
                 hints[0] = "Enter open · Space preview"
-        else:
+        elif selected == len(tasks):
             hints[0] = "Enter start · Tab agent" if prompt else "Enter open · Tab agent"
             if prompt and preset and hub_requires_native_prompt(preset):
                 hints[0] = "Ctrl-U clear to open"
@@ -6313,7 +6307,6 @@ def hub_ui(
     if prompt:
         agent_index = next((i for i, item in enumerate(presets) if item["name"] == saved_agent), agent_index)
     killed_text = ""
-    prefix_pending = False
     help_offset: int | None = 0 if show_help else None
     confirm_hint = ""
     confirm_task = ""
@@ -6392,7 +6385,7 @@ def hub_ui(
             ongoing_count = sum(1 for task in all_tasks if not task.dead)
             hidden_history = max(0, len(all_tasks) - ongoing_count - history_limit)
             tasks = all_tasks[: len(all_tasks) - hidden_history]
-            item_keys = [task.id for task in tasks] + [""]
+            item_keys = [task.id for task in tasks] + ["", "help", "detach"]
             if selected_key not in item_keys:
                 selected_key = ""
             selected = item_keys.index(selected_key)
@@ -6449,28 +6442,25 @@ def hub_ui(
             if too_small and key == "enter" and confirm_action != "detach":
                 continue
             if too_small and key not in {"quit", "interrupt", "eof", "escape", "enter", "prefix"}:
-                if not prefix_pending:
-                    continue
+                continue
             if key == "interrupt":
                 key = "escape"
-            if prefix_pending:
-                prefix_pending = False
-                if key == "prefix":
-                    key = "left"
-                elif key == "escape":
+            if key == "prefix":
+                if help_offset is not None or peek_key or confirm_action:
+                    key = "escape"
+                elif source_task is not None and not tmux_session_absent(source):
+                    if save_drafts():
+                        switch_hub_popup(
+                            client, client_pid, context, popup_value, source,
+                            send_prefix=not source_task.dead,
+                        )
+                        return 0
                     continue
-                elif key == "text" and text_value in {"w", "n", "p", "d", "h", "?"}:
-                    key = {"w": "sessions", "n": "next-lane", "p": "previous-lane", "d": "quit", "h": "help", "?": "help"}[text_value]
                 else:
-                    notice = "Ctrl-B then w Sessions · n/p tabs · d detach · h help"
+                    notice = "Sessions · Up/Down choose · Enter open · Esc back"
                     continue
-            elif key == "prefix":
-                prefix_pending = True
-                confirm_task = confirm_action = confirm_hint = ""
-                notice = "Ctrl-B then w Sessions · n/p tabs · d detach · h help"
-                continue
             if help_offset is not None:
-                if key in {"help", "escape", "sessions"}:
+                if key in {"help", "escape"}:
                     help_offset = None
                 elif key in {"up", "wheel-up"}:
                     help_offset = max(0, help_offset - 1)
@@ -6485,19 +6475,6 @@ def hub_ui(
                 help_offset = 0
                 confirm_task = confirm_action = confirm_hint = ""
                 continue
-            if key == "sessions":
-                notice = "Sessions · Up/Down select · Enter open · Esc back"
-                continue
-            if key in {"next-lane", "previous-lane"}:
-                active = [index for index, task in enumerate(tasks) if not task.dead]
-                if not active:
-                    notice = "No running sessions · select New session to start one"
-                    continue
-                direction = 1 if key == "next-lane" else -1
-                position = active.index(selected) if selected in active else (-1 if direction == 1 else 0)
-                selected = active[(position + direction) % len(active)]
-                selected_key = item_keys[selected]
-                key = "open"
             confirmed = bool(confirm_action) and key == "enter"
             if confirmed:
                 key = "quit" if confirm_action == "detach" else "stop"
@@ -6531,6 +6508,11 @@ def hub_ui(
                 selected = (selected + 1) % max(1, item_count)
                 selected_key = item_keys[selected]
                 continue
+            if key in {"enter", "open"} and selected_key in {"help", "detach"}:
+                if selected_key == "help":
+                    help_offset = 0
+                    continue
+                key = "quit"
             if key == "eof":
                 key = "delete" if prompt else "quit"
             if key == "escape":
@@ -6810,7 +6792,7 @@ def hub_standby() -> int:
             if size != previous_size:
                 message = (
                     "CLI LANE · Switcher inactive · "
-                    "Ctrl-b w to reopen · Ctrl-b d to detach"
+                    "Ctrl-B to reopen Sessions"
                 )
                 sys.stdout.write("\033[H\033[2J" + message)
                 sys.stdout.flush()
@@ -7402,9 +7384,9 @@ def parser() -> argparse.ArgumentParser:
 
 Only tasks started through clilane appear. Click a session tab to switch, or
 use Left/Right at an empty Claude, Codex, or Kimi prompt. With text in the prompt,
-arrows move the cursor. Click Sessions, or press Ctrl-B, release, then w.
-Ctrl-B then n/p switches lanes; Ctrl-B then d detaches with jobs running.
-Ctrl-B then h shows keyboard help. These keys use Control on both Mac and PC;
+arrows move the cursor. Click Sessions, or press Ctrl-B once.
+Use Up/Down and Enter to choose a session, Help, or Detach. Esc goes back.
+Ctrl-B uses Control on both Mac and PC;
 no Command, Option, Fn, or Page keys are required. Windows clients use WSL or SSH.
 Native Ctrl-Q/Ctrl-C/Ctrl-D and modified Tab/Page keys pass through to agents.
 For OMP: Ctrl-D exits normal chat; Ctrl-C exits its first-run setup.
