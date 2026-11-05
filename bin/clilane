@@ -6181,7 +6181,15 @@ def hub_draw(
             if reply_to is not None and prompt and not reply_to.dead:
                 hints[0] = "Enter send reply"
             elif target.dead:
-                hints[0] = "Enter open · Ctrl-R resume" if hub_resume_kind(target, presets) else "Enter open · Ctrl-R rerun"
+                if hub_resume_kind(target, presets) or hub_command_kind(target.command) is None:
+                    action = hub_resume_action(target, presets)
+                    action = {
+                        "resume latest in project": "latest (project)",
+                        "resume latest across projects": "latest (all dirs)",
+                    }.get(action, action)
+                    hints[0] = f"Ctrl-R {action}"
+                else:
+                    hints[0] = "Ctrl-X remove"
             else:
                 hints[0] = "Enter open · Space preview"
         else:
@@ -6189,6 +6197,8 @@ def hub_draw(
             if prompt and preset and hub_requires_native_prompt(preset):
                 hints[0] = "Ctrl-U clear to open"
         hints[1] = "Esc back · Ctrl-Q detach"
+        if target is not None and target.dead:
+            hints[1] = "Enter open · Ctrl-Q out"
     if confirmation:
         hints = ["Enter confirm", "Esc cancel"]
     lines.extend(
