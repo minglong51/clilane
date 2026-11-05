@@ -94,8 +94,9 @@ clilane status demo
 clilane read demo
 ```
 
-Attach to its terminal when you need full interaction. Press `Ctrl-Q` to leave it
-running and return to the switcher; press `Ctrl-Q` again there to detach:
+Attach to its terminal when you need full interaction. Press `Ctrl-B`, release it,
+then press `w` to return to Sessions. `Ctrl-B`, then `d` detaches and keeps jobs
+running:
 
 ```bash
 clilane attach demo
@@ -280,22 +281,43 @@ is an explicit alias for the same view.
 clilane
 ```
 
+Use the **Control** key on both Mac and PC keyboards. For `Ctrl-B, then w`,
+press Control-B, release both keys, then press `w`. These shortcuts do not need
+Command, Option, Fn, or Page keys. Windows Terminal clients can use WSL or SSH to
+a machine running CLI Lane; CLI Lane itself requires a Unix environment and tmux.
+
+**Upgrading from 0.17:** `Ctrl-Q` now reaches the agent's native command, including
+OMP's follow-up action. Use `Ctrl-B, then w` for Sessions. Modified Tab/Page keys
+also stay with the terminal or agent. In OMP, `Ctrl-D` exits normal chat and
+`Ctrl-C` exits first-run setup; detaching CLI Lane keeps OMP running.
+
 | Key | Behavior |
 | --- | --- |
-| Type | Write the first message for a new session in the bottom composer. |
-| `Tab` / `Shift-Tab` | Choose Codex, Kimi, Claude, or another configured preset. |
+| `Ctrl-B`, then `w` | Open Sessions from an agent. |
+| `Ctrl-B`, then `n` / `p` | Switch to the next / previous running session. |
+| `Ctrl-B`, then `d` | Detach; jobs keep running. |
+| `Ctrl-B`, then `h` | Open scrollable keyboard help. In Sessions, `F1` also opens help. |
+| `Tab` / `Shift-Tab` | Choose the next / previous agent and select New session. |
 | `Up` / `Down` | Select a running or finished job. |
-| `Enter` | Start the chosen agent when the composer has text. |
-| `Right` / `Enter` | Open the selected running job when the composer is empty. On a finished job, `Enter` resumes an eligible agent conversation and opens it; otherwise it opens the finished pane. `Right` always opens the pane. |
-| `Space` | With an empty composer, peek at the selected job's latest output without opening it. While the peek is open, the composer replies to that job: type a message and press `Enter` to deliver it through the job's terminal. `Space` again closes the peek. |
-| `Ctrl-R` | Relaunch the selected finished job in the same directory under the same name, using the resume or rerun action shown in the switcher. See the resume behavior below. The previous log becomes the new job's `.previous` log until the new log rotates. |
-| `Ctrl-X` | Stop the selected running job, or remove a finished one. Press it twice within 2 seconds; any other key cancels. |
-| `Left` / `Right` | Move the composer cursor while typing. |
-| `Esc` | Clear the composer, or close an open peek. With an empty composer, return to the job you came from, or leave the switcher when you opened it from your shell. |
-| `Ctrl-C` / `Ctrl-D` | Clear the composer. With an empty composer, press the same key twice within 2 seconds to leave the switcher. |
-| `Ctrl-Q` | Leave the switcher immediately. Every job keeps running. |
-| `Ctrl-Q` or `Ctrl-b w` in a job | Background that job and return to the switcher. |
-| `Left` / `Right` in an agent job | At an empty Claude, Codex, or Kimi prompt, switch to the previous or next running session, wrapping at either end. Prompt drafts and copy mode retain ordinary arrow-key behavior. Use `Ctrl-Q` for the switcher. |
+| `Enter` | Open the selected job, including a finished pane. On New session, open the chosen agent; a typed first message starts and submits it for Codex, Kimi, Claude, or OMP. In a live preview, send the typed reply. |
+| `Space` | With an empty composer, preview the selected job. Type in a live preview to reply to that job. `Space` again closes an empty preview. |
+| `Ctrl-R` | Explicitly resume or rerun the selected finished job using the action shown. See resume behavior below. The previous log becomes the new job's `.previous` log until it rotates. |
+| `Ctrl-X` | Ask to stop a running job or remove a finished one. `Enter` confirms; `Esc` cancels. The confirmation has no timer. |
+| `Esc` / `Ctrl-C` in Sessions | Close help or a preview, otherwise return to the source job or leave Sessions. Drafts are preserved until detach; leaving asks before discarding them. Replies stay with their own job when selection changes. |
+| `Ctrl-Q` in Sessions | Detach, keeping jobs running. If drafts exist, `Enter` confirms discarding them and `Esc` cancels. |
+| `Left` / `Right` | Move the composer cursor. With an empty composer, `Right` opens the selected pane or New session. |
+| `Ctrl-A` / `Ctrl-E`, `Home` / `End` | Move to the beginning / end of the composer. |
+| `Ctrl-Left` / `Ctrl-Right`, `Option-Left` / `Option-Right` | Move by word when the terminal forwards these keys. Option-b/f also work when Option sends Meta. |
+| `Ctrl-W` / `Option-Delete` | Erase the previous word. |
+| `Delete` (PC) / `Fn-Delete` (Mac) | Delete the next character. |
+| `Ctrl-D` in Sessions | Delete the next character; with an empty composer, request detach. |
+| `Ctrl-K`, `Ctrl-U`, `Ctrl-Y` | Erase to the end, clear the draft, or paste the last cut text. |
+| `Left` / `Right` in an agent | At an empty Claude, Codex, or Kimi prompt, switch running sessions. Drafts and copy mode retain ordinary arrows. For OMP, Kiro, and other agents, use `Ctrl-B`, then `n` / `p`. |
+
+Drafts are temporary and belong to the attached client. Reopening Sessions restores
+them; detaching discards them. `Ctrl-B` twice sends a literal Control-B to an agent.
+Inside an outer tmux with its default prefix, press `Ctrl-B` twice, then `w`, to
+reach CLI Lane's Sessions; the first prefix is handled by the outer tmux.
 
 Tracked Claude jobs resume the conversation recorded at a clean native exit, using
 the original profile and launch environment. If that exit record is missing or
@@ -320,16 +342,19 @@ by OpenClaw or another automation lane as `BOT`. All of them are ordinary CLI La
 tasks on the current host and tmux socket. CLI Lane does not import unrelated
 processes or historical conversations from an agent's own session store.
 
-Typing a message and pressing `Enter` starts the selected preset immediately, gives
-it an agent-and-project task name, and delivers the message through its terminal.
+Selecting New session and pressing `Enter` with an empty composer opens any
+configured agent. Codex, Kimi, Claude, and OMP also accept a first message in the
+switcher; typing selects New session, and `Enter` starts the agent and delivers
+the message. For Kiro and the other native-launch tools, type inside the agent.
 The message is not stored in the command arguments or task metadata. It can still
 appear in the terminal log, just as if you had typed it directly into the agent.
 
 When the optional `~/.config/clilane/hub.json` file is absent (or absent under
-`$XDG_CONFIG_HOME`), CLI Lane discovers executable `codex`, `kimi`, and `claude`
-commands from the shell PATH captured when the switcher opens. New sessions start
-in the directory where you ran `clilane`; returning from a managed job uses that
-job's directory instead. Installed agents are shown in Codex, Kimi, Claude order.
+`$XDG_CONFIG_HOME`), CLI Lane discovers installed Codex, Kimi, Claude, OMP, Kiro CLI,
+Gemini, OpenCode, Copilot, Aider, Amp, Goose, Pi, Cursor Agent, Droid, Qwen Code,
+and Hermes commands from the shell PATH captured when the switcher opens. New
+sessions start in the directory where you ran `clilane`; returning from a managed
+job uses that job's directory instead.
 
 A present config file is authoritative, including an intentionally empty agents
 list. Use it to override commands, directories, ordering among same-kind presets,
@@ -399,7 +424,7 @@ named `agt` for compatibility with tasks created before the project was renamed.
 | `fleet status HOST:TASK` | Show one task on a fleet host as JSON. |
 | `fleet log HOST:TASK` | Read a fleet task's persistent log. `--lines` defaults to 200. |
 | `status TARGET` | Show one task by name or unique ID prefix. Supports `--json`. |
-| `attach TARGET` | Attach interactively. `Ctrl-Q` returns to the switcher. |
+| `attach TARGET` | Attach interactively. `Ctrl-B`, then `w` returns to Sessions. |
 | `hub` | Open the same switcher as bare `clilane`. `--config` overrides the presets file. |
 | `read TARGET` | Print the last 200 terminal lines. `--all` prints retained scrollback. |
 | `log TARGET` | Read persistent output. `--lines` defaults to 200; `--follow` follows rotation. |
