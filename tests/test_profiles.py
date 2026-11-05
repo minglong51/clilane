@@ -1176,8 +1176,8 @@ class RealTmuxProfileTests(unittest.TestCase):
         try:
             terminal.expect("LOCAL · clean-agent-view")
             mark = terminal.mark()
-            terminal.send(b"\x11")
-            terminal.expect("type message · Tab agent", mark)
+            terminal.send(b"\x02w")
+            terminal.expect("Enter open · Space preview", mark)
             windows = subprocess.run(
                 [
                     self.tmux_binary,

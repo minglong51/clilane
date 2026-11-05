@@ -21,6 +21,7 @@ import stat
 import subprocess
 import sys
 import termios
+import textwrap
 import threading
 import time
 import tty
@@ -34,7 +35,7 @@ from typing import BinaryIO, Callable, Iterator, Mapping, Sequence
 
 
 PROGRAM = "clilane"
-VERSION = "0.17.0"
+VERSION = "0.18.0"
 TASK_STATE_INITIALIZING = "initializing"
 TASK_STATE_RUNNING = "running"
 TASK_STATE_STOPPED = "stopped"
@@ -57,12 +58,13 @@ HUB_CONTEXT_OPTION_PREFIX = "@agt_hub_context_"
 HUB_CLIENT_CONTEXT_OPTION_PREFIX = "@agt_hub_client_"
 HUB_CLIENT_POPUP_OPTION_PREFIX = "@agt_hub_popup_"
 HUB_ENV_MAX_BYTES = 256 * 1024
+HUB_DRAFT_MAX_BYTES = 64 * 1024
 HUB_CONFIG_SCHEMA_VERSIONS = frozenset({1, 2})
 HUB_CONTEXT_SCHEMA_VERSION = 2
 HUB_REFRESH_SECONDS = 0.5
-HUB_EXIT_CONFIRM_SECONDS = 2.0
 HUB_KEY_SEQUENCE_SECONDS = 0.1
 HUB_KEY_PARAMETER_MAX_BYTES = 16
+HUB_PENDING_INPUT: dict[int, bytes] = {}
 HUB_ARROW_KEYS = {b"A": "up", b"B": "down", b"C": "right", b"D": "left"}
 HUB_PROMPT_MAX_CHARS = 8000
 HUB_PEEK_CAPTURE_LINES = 40
@@ -71,6 +73,44 @@ HUB_HISTORY_BATCH_DEFAULT = 20
 HUB_HISTORY_BATCH_MAX = 1000
 HUB_LEFT_GATE_COLUMNS = 8
 HUB_LEFT_AGENT_KINDS = frozenset({"claude", "codex", "kimi"})
+HUB_KEY_HELP = (
+    "Ctrl-B, release, then:",
+    " w  Sessions",
+    " n/p  next/previous",
+    " d  detach; jobs run",
+    " h  keyboard help",
+    "",
+    "In Sessions:",
+    " Up/Down  select job",
+    " Tab/Shift-Tab  agent",
+    " Enter  open / send reply",
+    " New session + Enter opens any agent",
+    " Space  preview / reply",
+    " Ctrl-R  resume / rerun",
+    " Ctrl-X  stop / remove",
+    " Enter confirms; Esc cancels",
+    " Esc / Ctrl-C  back",
+    " Ctrl-Q  detach; jobs run",
+    "",
+    "Edit a draft:",
+    " Ctrl-A/E  start/end",
+    " Home/End  start/end",
+    " Ctrl/Option-Left/Right  word",
+    " Ctrl-W / Option-Delete  erase word",
+    " Delete / Fn-Delete  forward delete",
+    " Ctrl-D  forward delete (empty: detach)",
+    " Ctrl-K  erase to end",
+    " Ctrl-U  clear",
+    " Ctrl-Y  restore erased text",
+    "",
+    "Drafts stay until you detach.",
+    "Replies stay with their own job.",
+    "Inside agents, native Ctrl-Q/C/D",
+    "and modified Tab/Page keys pass through.",
+    "Ctrl-B twice sends Ctrl-B to the agent.",
+    "Ctrl means Control on Mac and PC.",
+    "Windows clients need WSL or SSH to CliLane.",
+)
 CLAUDE_OBSERVED_IDS_MAX = 64
 HUB_RESUME_ARGUMENTS: dict[str, tuple[list[str], frozenset[str], frozenset[str]]] = {
     "claude": (
@@ -3137,7 +3177,7 @@ def configure_task_status(session: str, command: Sequence[str]) -> None:
             "-t",
             session,
             "status-right",
-            " ←/→ tabs · empty prompt " if agent else " Ctrl-PgUp/PgDn tabs ",
+            " ←/→ empty · Ctrl-B w Sessions " if agent else " Ctrl-B w Sessions · n/p tabs ",
         ],
         check=False,
     )
@@ -3737,6 +3777,7 @@ def discard_unattached_hub_context(context: str) -> None:
         )
     tmux(["set-hook", "-gu", hub_detach_hook(context)], check=False)
     tmux(["set-option", "-gu", option], check=False)
+    tmux(["set-option", "-gu", hub_draft_option(context)], check=False)
 
 
 def attach_client(arguments: Sequence[str]) -> int:
@@ -4059,8 +4100,8 @@ def hub_helper_prefix(action: str) -> str:
     return tmux_literal(command + " ", 1)
 
 
-def hub_open_command(context: str = "") -> str:
-    prefix = hub_helper_prefix("__hub-open")
+def hub_open_command(context: str = "", *, show_help: bool = False) -> str:
+    prefix = hub_helper_prefix("__hub-help" if show_help else "__hub-open")
     return (
         f"{prefix}'#{{client_name}}' '#{{session_name}}' '#{{client_pid}}' "
         f"{tmux_literal(shlex.quote(context), 1)}"
@@ -4271,17 +4312,9 @@ def bind_hub_keys() -> None:
     for key in ("c", "%", '"'):
         tmux([
             "bind-key", "-T", "prefix", key, "display-message",
-            "CLI Lane uses one pane per session; press Ctrl-Q to open Sessions and start another lane",
+            "Press Ctrl-B then w for Sessions; choose New session to start another lane",
         ])
-    tmux(
-        [
-            "bind-key",
-            "-T",
-            "root",
-            "C-q",
-            f"run-shell -b {tmux_quoted(open_command)}",
-        ]
-    )
+    tmux(["unbind-key", "-T", "root", "C-q"], check=False)
     tmux(
         [
             "bind-key",
@@ -4341,7 +4374,7 @@ def configure_hub_navigation() -> None:
         + ",}}"
     )
     status = (
-        "#[align=left range=left bold] ‹ Sessions #[norange nobold] "
+        "#[align=left range=left bold] ‹ Sessions [Ctrl-B w] #[norange nobold] "
         "#[list=on]#[list=left-marker range=user|previous]‹ "
         "#[list=right-marker range=user|next] ›#[norange list=on]"
         + session_tabs
@@ -4374,13 +4407,15 @@ def configure_hub_navigation() -> None:
         ])
     for key in ("C-MouseDown1Status", "MouseDown3Status", "M-MouseDown3Status"):
         tmux(["unbind-key", "-T", "root", key], check=False)
-    for key, command in (
-        ("C-PPage", previous_command),
-        ("C-NPage", next_command),
-        ("C-Tab", next_command),
-        ("C-BTab", previous_command),
-    ):
-        tmux(["bind-key", "-T", "root", key, command])
+    for key in ("C-PPage", "C-NPage", "C-Tab", "C-BTab"):
+        tmux(["unbind-key", "-T", "root", key], check=False)
+    for key, command in (("p", previous_command), ("n", next_command)):
+        tmux(["bind-key", "-T", "prefix", key, command])
+    for key in ("h", "?"):
+        tmux([
+            "bind-key", "-T", "prefix", key,
+            "run-shell -b " + tmux_quoted(hub_open_command(show_help=True)),
+        ])
 
 
 def hub_cycle_command(direction: int) -> str:
@@ -4434,6 +4469,11 @@ def hub_context_option(context: str) -> str:
     if not HUB_CONTEXT_PATTERN.fullmatch(context):
         raise CliLaneError("invalid hub context")
     return f"{HUB_CONTEXT_OPTION_PREFIX}{context}"
+
+
+def hub_draft_option(context: str) -> str:
+    hub_context_option(context)
+    return f"@agt_hub_drafts_{context}"
 
 
 def hub_client_context_option(client: str) -> str:
@@ -4543,6 +4583,7 @@ def register_hub_client(client: str, client_pid: str, context: str) -> None:
             ["set-option", "-gu", hub_context_option(previous_entry[1])],
             check=False,
         )
+        tmux(["set-option", "-gu", hub_draft_option(previous_entry[1])], check=False)
 
 
 def hub_client_context(client: str, client_pid: str) -> str:
@@ -4568,6 +4609,7 @@ def forget_hub_client(client: str, client_pid: str, context: str) -> None:
             ["set-option", "-gu", option],
             ["set-hook", "-gu", hub_detach_hook(context)],
             ["set-option", "-gu", hub_context_option(context)],
+            ["set-option", "-gu", hub_draft_option(context)],
         ],
     )
 
@@ -4729,6 +4771,7 @@ def detach_hub_popup(
             ["set-option", "-gu", client_option],
             ["set-hook", "-gu", hub_detach_hook(context)],
             ["set-option", "-gu", hub_context_option(context)],
+            ["set-option", "-gu", hub_draft_option(context)],
             ["detach-client", "-t", client],
         ],
     )
@@ -4782,9 +4825,11 @@ def create_hub_pane(
             tmux(["set-option", "-t", session, option, setting])
         tmux(["unbind-key", "-T", HUB_PANE_KEY_TABLE, "Any"], check=False)
         for key in (
-            "C-q", "C-c", "C-d", "C-r", "C-u", "C-x",
+            "C-q", "C-c", "C-d", "C-r", "C-u", "C-x", "C-b",
+            "C-a", "C-e", "C-f", "C-w", "C-k", "C-y",
             "Left", "Right", "Up", "Down", "Tab", "BTab", "Enter", "Escape",
-            "C-PPage", "C-NPage", "C-Tab", "C-BTab",
+            "Home", "End", "DC", "F1", "C-Left", "C-Right", "C-DC",
+            "M-Left", "M-Right", "M-b", "M-f", "M-d", "M-BSpace",
         ):
             tmux(["bind-key", "-T", HUB_PANE_KEY_TABLE, key, "send-keys", key])
         for key in (
@@ -4851,7 +4896,8 @@ def hub_forget(
 
 
 def hub_open(
-    client: str, source: str, client_pid: str, supplied_context: str
+    client: str, source: str, client_pid: str, supplied_context: str,
+    *, show_help: bool = False,
 ) -> int:
     context = supplied_context
     generation = ""
@@ -4879,7 +4925,7 @@ def hub_open(
         columns, rows = map(int, dimensions.stdout.decode().split())
         if columns < 24 or rows < 8:
             tmux(
-                ["display-message", "-c", client, "Resize to 24x8, then press Ctrl-Q"],
+                ["display-message", "-c", client, "Resize to 24x8, then press Ctrl-B then w"],
                 check=False,
             )
             return 0
@@ -4921,6 +4967,7 @@ def hub_open(
                 "--", str(Path(sys.executable).resolve()), str(Path(__file__).resolve()),
                 "__hub-pane", control_binary, control_socket,
                 client, client_pid, source, context, generation,
+                *(["help"] if show_help else []),
             ]
         )
         started = True
@@ -4977,6 +5024,8 @@ def hub_task_order(tasks: Sequence[Task]) -> list[Task]:
 
 
 def hub_read_byte(descriptor: int, timeout: float) -> bytes | None:
+    if descriptor in HUB_PENDING_INPUT:
+        return HUB_PENDING_INPUT.pop(descriptor)
     readable, _, _ = select.select([descriptor], [], [], timeout)
     if not readable:
         return None
@@ -5025,9 +5074,16 @@ def hub_key(descriptor: int) -> tuple[str, str] | None:
             return "escape", ""
         if introducer == b"O":
             final = hub_read_byte(descriptor, HUB_KEY_SEQUENCE_SECONDS)
-            return HUB_ARROW_KEYS.get(final or b"", "ignore"), ""
+            return {**HUB_ARROW_KEYS, b"H": "home", b"F": "end", b"P": "help"}.get(final or b"", "ignore"), ""
         if introducer != b"[":
-            return "ignore", ""
+            key = {
+                b"b": "word-left", b"f": "word-right", b"d": "delete-word",
+                b"\x7f": "backspace-word", b"\x08": "backspace-word",
+            }.get(introducer)
+            if key is not None:
+                return key, ""
+            HUB_PENDING_INPUT[descriptor] = introducer
+            return "escape", ""
         parameters = bytearray()
         while True:
             byte = hub_read_byte(descriptor, HUB_KEY_SEQUENCE_SECONDS)
@@ -5050,9 +5106,18 @@ def hub_key(descriptor: int) -> tuple[str, str] | None:
         if not parameters:
             if final == b"Z":
                 return "backtab", ""
-            return HUB_ARROW_KEYS.get(final, "ignore"), ""
+            return {**HUB_ARROW_KEYS, b"H": "home", b"F": "end"}.get(final, "ignore"), ""
         if final == b"~" and parameters == b"200":
             return "text", hub_read_paste(descriptor)
+        if bytes(parameters) in {b"1;3", b"1;5", b"1;9"}:
+            return {
+                b"D": "word-left", b"C": "word-right", b"H": "home", b"F": "end",
+            }.get(final, "ignore"), ""
+        if final == b"~":
+            return {
+                b"1": "home", b"7": "home", b"4": "end", b"8": "end",
+                b"3": "delete", b"3;5": "delete-word", b"11": "help",
+            }.get(bytes(parameters), "ignore"), ""
         return "ignore", ""
     controls = {
         b"\r": "enter",
@@ -5066,6 +5131,13 @@ def hub_key(descriptor: int) -> tuple[str, str] | None:
         b"\x12": "resume",
         b"\x15": "clear",
         b"\x18": "stop",
+        b"\x01": "home",
+        b"\x02": "prefix",
+        b"\x05": "end",
+        b"\x06": "right",
+        b"\x17": "backspace-word",
+        b"\x0b": "kill-end",
+        b"\x19": "yank",
     }
     if first in controls:
         return controls[first], ""
@@ -5323,7 +5395,7 @@ def launch_hub_preset(
     )
     if prompt and hub_requires_native_prompt(selected):
         raise CliLaneError(
-            "Draft kept · Esc clears; select New session, "
+            "Draft kept · Ctrl-U clears; select New session, "
             f"Enter opens {selected['name']}"
         )
     spec = complete_launch_spec(
@@ -5901,7 +5973,8 @@ def hub_composer_line(
 ) -> str:
     label_width = max(1, min(width - 8, width // 2))
     if reply_to is not None:
-        agent = fleet_display_cell(f"reply · {reply_to.name}", label_width)
+        label = "draft" if reply_to.dead else "reply"
+        agent = fleet_display_cell(f"{label} · {reply_to.name}", label_width)
     elif preset:
         project = Path(str(preset["dir"])).name or str(preset["dir"])
         agent = fleet_display_cell(
@@ -5952,6 +6025,14 @@ def hub_terminal_size() -> os.terminal_size:
         return os.terminal_size((80, 24))
 
 
+def hub_help_lines(columns: int) -> list[str]:
+    return [
+        part
+        for line in HUB_KEY_HELP
+        for part in (textwrap.wrap(line, max(1, columns - 1), break_on_hyphens=False) or [""])
+    ]
+
+
 def hub_draw(
     tasks: Sequence[Task],
     selected: int,
@@ -5962,13 +6043,27 @@ def hub_draw(
     notice: str,
     peek: tuple[Task, Sequence[str], bool] | None = None,
     hidden_history: int = 0,
+    help_offset: int | None = None,
+    confirmation: str = "",
 ) -> dict[int, int]:
     columns, height = hub_terminal_size()
     width = max(1, columns - 1)
     height = max(1, height)
+    if help_offset is not None and columns >= 24 and height >= 8:
+        help_lines = hub_help_lines(columns)
+        count = max(1, height - 2)
+        offset = min(help_offset, max(0, len(help_lines) - count))
+        lines = ["KEYBOARD HELP", *help_lines[offset:offset + count], "↑↓ scroll · Esc back"]
+        sys.stdout.write("\033[H\033[2J" + "\r\n".join(
+            fleet_display_cell(line, width) for line in lines[:height]
+        ))
+        sys.stdout.flush()
+        return {}
     if columns < 24 or height < 8:
-        lines = ["Ctrl-Q leave", "Resize to at least 24×8", "Draft kept"]
-        if notice:
+        lines = ["Ctrl-Q detach", "Resize to at least 24×8", "Draft kept"]
+        if confirmation == "detach":
+            lines = ["Discard drafts?", "Enter yes · Esc no", "Jobs keep running"]
+        elif notice:
             lines.insert(1, notice)
         sys.stdout.write(
             "\033[H\033[2J"
@@ -5978,7 +6073,6 @@ def hub_draw(
         return {}
     compact = width < 80 or height < 16
     preset = presets[agent_index] if presets else None
-    agents = " / ".join(str(item["name"]) for item in presets) or "no presets"
     ongoing_total = sum(1 for task in tasks if not task.dead)
     shown_history = len(tasks) - ongoing_total
     history_total = shown_history + hidden_history
@@ -6028,7 +6122,7 @@ def hub_draw(
     lines = [
         "\033[1mCLI LANE\033[0m",
         fleet_display_cell(
-            "This clilane server · LOCAL terminal · BOT OpenClaw/automation · Ctrl-Q leave",
+            "This clilane server · Ctrl-B h help · Ctrl-Q detach (jobs keep running)",
             width,
         ),
         fleet_display_cell(
@@ -6058,87 +6152,45 @@ def hub_draw(
         lines.append(f"\033[1m{fleet_display_cell(notice, width)}\033[0m")
     else:
         lines.append("")
-    reply_to = peek[0] if peek is not None and not peek[0].dead else None
-    if reply_to is not None:
+    reply_to = peek[0] if peek is not None else None
+    target = tasks[selected] if selected < len(tasks) else None
+    if reply_to is not None and not reply_to.dead:
         hints = [
-            f"type reply to {reply_to.name} · Enter send · ↑↓ jobs",
-            "empty: →/Enter view · Space/Esc close · Ctrl-X stop · Ctrl-Q leave",
+            "Enter send reply" if prompt else "Enter open · type to reply",
+            "Esc close preview · Ctrl-X stop · Ctrl-Q detach",
         ]
-    elif peek is not None:
-        if peek[2]:
-            first = f"Enter/Ctrl-R {hub_resume_action(peek[0], presets)} · → pane · Ctrl-X remove"
-        else:
-            repeat = (
-                "Ctrl-R rerun"
-                if hub_command_kind(peek[0].command) is None
-                else "resume unavailable"
-            )
-            first = f"{peek[0].name} finished · Enter/→ open pane · {repeat} · Ctrl-X remove"
-        hints = [
-            first,
-            f"type message · Enter start new ({agents}) · Space/Esc close · Ctrl-Q leave",
-        ]
-        if preset is not None and hub_requires_native_prompt(preset):
-            hints[1] = f"New session opens {preset['name']} · Space/Esc close · Ctrl-Q leave"
+    elif target is not None:
+        action = (
+            f"Ctrl-R {hub_resume_action(target, presets)} · Ctrl-X remove"
+            if target.dead and (hub_resume_kind(target, presets) or hub_command_kind(target.command) is None)
+            else "Ctrl-X remove" if target.dead else "Ctrl-X stop"
+        )
+        hints = ["Enter open · Space preview · " + action, "Esc back · Ctrl-B h help · Ctrl-Q detach"]
     else:
-        action_hint = "empty: →/Enter view · click open · Space peek · Esc back · Ctrl-X stop"
-        if selected < len(tasks) and tasks[selected].dead and hub_resume_kind(tasks[selected], presets):
-            action_hint = (
-                f"empty: Enter/Ctrl-R {hub_resume_action(tasks[selected], presets)}"
-                " · → pane · Space peek · Ctrl-X remove"
-            )
-        elif selected < len(tasks) and tasks[selected].dead:
-            repeat = (
-                "Ctrl-R rerun"
-                if hub_command_kind(tasks[selected].command) is None
-                else "resume unavailable"
-            )
-            action_hint = f"empty: Enter/→ view · {repeat} · Space peek · Ctrl-X remove"
+        name = str(preset["name"]) if preset else "agent"
         hints = [
-            f"type message · Tab agent ({agents}) · Enter start · ↑↓ jobs",
-            action_hint,
+            f"Enter {'starts' if prompt else 'opens'} {name} · Tab/Shift-Tab agent",
+            "Type inside the agent" if preset and hub_requires_native_prompt(preset)
+            else "Or type a first message · Enter start",
         ]
-        if preset is not None and hub_requires_native_prompt(preset):
-            hints[0] = f"{preset['name']}: use New session · type inside the agent · Tab agent"
-            if selected == len(tasks):
-                hints[0] = f"Enter open {preset['name']} · type inside the agent · Tab agent"
-                hints[1] = "empty: Enter open agent · ↑↓ jobs · Ctrl-Q leave"
-            if prompt:
-                hints[0] = f"Type inside {preset['name']} · Esc clear · Tab agent"
+        if prompt and preset and hub_requires_native_prompt(preset):
+            hints = [f"Type inside {name} · Ctrl-U clear draft", "Then Enter opens the agent · Esc back"]
     if compact:
-        target = tasks[selected] if selected < len(tasks) else None
-        if prompt:
-            action = "send" if reply_to is not None else "start"
-        elif target is None:
-            action = (
-                "open"
-                if preset is not None and hub_requires_native_prompt(preset)
-                else "start"
-            )
-        elif target.dead and hub_resume_kind(target, presets):
-            action = hub_resume_action(target, presets)
-        else:
-            action = "view"
-        lines[1] = "↑↓ jobs · Space peek"
-        if action == "resume latest in project":
-            hints = ["Enter latest in project", "Ctrl-Q leave"]
-        elif action == "resume latest across projects":
-            hints = ["Enter latest (all dirs)", "Ctrl-Q leave"]
-        elif reply_to is not None:
-            hints = [f"Enter {action} · Esc close", "Ctrl-Q leave"]
-        else:
-            hints = [f"Enter {action} · Tab agent", "Ctrl-Q leave"]
+        lines[1] = "↑↓ jobs · Ctrl-B h help"
         if target is not None:
-            if target.dead:
-                lines[1] = "↑↓ jobs · Ctrl-X remove"
-                hints[1] = "Ctrl-Q leave Space peek"
+            if reply_to is not None and prompt and not reply_to.dead:
+                hints[0] = "Enter send reply"
+            elif target.dead:
+                hints[0] = "Enter open · Ctrl-R resume" if hub_resume_kind(target, presets) else "Enter open · Ctrl-R rerun"
             else:
-                hints[1] = "Ctrl-Q exit Ctrl-X stop"
-        if (
-            prompt and reply_to is None
-            and preset is not None and hub_requires_native_prompt(preset)
-        ):
-            hints = ["Type inside the agent", "Esc clear · Ctrl-Q exit"]
+                hints[0] = "Enter open · Space preview"
+        else:
+            hints[0] = "Enter start · Tab agent" if prompt else "Enter open · Tab agent"
+            if prompt and preset and hub_requires_native_prompt(preset):
+                hints[0] = "Ctrl-U clear to open"
+        hints[1] = "Esc back · Ctrl-Q detach"
+    if confirmation:
+        hints = ["Enter confirm", "Esc cancel"]
     lines.extend(
         [
             hub_composer_line(preset, prompt, cursor, width, reply_to),
@@ -6154,6 +6206,7 @@ def hub_draw(
 def hub_ui(
     client: str, client_pid: str, source: str, context: str, generation: str,
     pane_mode: bool = False,
+    show_help: bool = False,
 ) -> int:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise CliLaneError("the session switcher needs an interactive terminal")
@@ -6234,11 +6287,25 @@ def hub_ui(
                 ),
                 0,
             )
-    prompt = ""
-    cursor = 0
-    exit_deadline = 0.0
-    exit_key = ""
-    exit_hint = ""
+    saved_drafts = tmux(["show-options", "-gqv", hub_draft_option(context)]).stdout.decode().strip()
+    draft_data = decode_meta(saved_drafts) if saved_drafts else {}
+    drafts = draft_data.get("drafts", {})
+    if not isinstance(drafts, dict) or any(
+        not isinstance(key, str) or not isinstance(value, list) or len(value) != 2
+        or not isinstance(value[0], str) or len(value[0]) > HUB_PROMPT_MAX_CHARS
+        or type(value[1]) is not int or not 0 <= value[1] <= len(value[0])
+        for key, value in drafts.items()
+    ):
+        raise CliLaneError("corrupt session drafts")
+    draft_key = "new"
+    prompt, cursor = drafts.get(draft_key, ["", 0])
+    saved_agent = draft_data.get("agent")
+    if prompt:
+        agent_index = next((i for i, item in enumerate(presets) if item["name"] == saved_agent), agent_index)
+    killed_text = ""
+    prefix_pending = False
+    help_offset: int | None = 0 if show_help else None
+    confirm_hint = ""
     confirm_task = ""
     confirm_action = ""
     history_notice = ""
@@ -6268,6 +6335,25 @@ def hub_ui(
         )
     descriptor = sys.stdin.fileno()
     previous = termios.tcgetattr(descriptor)
+    def save_drafts(*, clear_current: bool = False) -> bool:
+        nonlocal notice
+        drafts[draft_key] = [prompt, cursor]
+        encoded = encode_meta({
+            "drafts": {
+                key: value for key, value in drafts.items()
+                if value[0] and not (clear_current and key == draft_key)
+            },
+            "agent": presets[agent_index]["name"] if presets else "",
+        })
+        if len(encoded) > HUB_DRAFT_MAX_BYTES:
+            notice = "Draft storage is full · Ctrl-U clears the current draft"
+            return False
+        run_tmux_commands_if(
+            hub_popup_owner_condition(client, client_pid, context, popup_value),
+            [["set-option", "-g", hub_draft_option(context), encoded]],
+        )
+        return True
+
     try:
         tty.setraw(descriptor)
         sys.stdout.write("\033[?1049h\033[?25l\033[?2004h\033[?1000h\033[?1006h")
@@ -6283,6 +6369,8 @@ def hub_ui(
                 text,
                 peek,
                 hidden_history,
+                help_offset,
+                confirm_action,
             )
 
         while True:
@@ -6300,20 +6388,13 @@ def hub_ui(
             selected = item_keys.index(selected_key)
             item_count = len(item_keys)
             preset = presets[agent_index] if presets else None
-            if exit_deadline and time.monotonic() >= exit_deadline:
-                exit_deadline = 0.0
-                exit_key = ""
-                exit_hint = ""
-                confirm_task = confirm_action = ""
             if peek_key and (
                 selected >= len(tasks) or tasks[selected].id != peek_key
             ):
                 peek_key = ""
                 peek_cache = None
                 if prompt and peek_live:
-                    prompt = ""
-                    cursor = 0
-                    notice = notice or "Reply discarded · that job is no longer selected"
+                    notice = notice or "Reply kept with its job · Space reopens it"
             peek = None
             if peek_key:
                 peek_live = not tasks[selected].dead
@@ -6327,6 +6408,11 @@ def hub_ui(
                     peek_cache = (peek_key, hub_peek_lines(tasks[selected]), peek_cache[2])
                 refresh_peek = False
                 peek = (tasks[selected], peek_cache[1], peek_cache[2])
+            next_draft_key = peek_key or "new"
+            if next_draft_key != draft_key:
+                drafts[draft_key] = [prompt, cursor]
+                draft_key = next_draft_key
+                prompt, cursor = drafts.get(draft_key, ["", 0])
             mouse_rows = hub_draw(
                 tasks,
                 selected,
@@ -6334,9 +6420,11 @@ def hub_ui(
                 agent_index,
                 prompt,
                 cursor,
-                notice or exit_hint,
+                notice or confirm_hint,
                 peek,
                 hidden_history,
+                help_offset,
+                confirm_action,
             )
             event = hub_key(descriptor)
             if event is None:
@@ -6346,15 +6434,67 @@ def hub_ui(
             key, text_value = event
             size = hub_terminal_size()
             too_small = size.columns < 24 or size.lines < 8
-            if too_small and key not in {
-                "quit", "interrupt", "eof",
-            }:
+            if too_small and confirm_action in {"stop", "remove"}:
+                confirm_task = confirm_action = confirm_hint = ""
+            if too_small and key == "enter" and confirm_action != "detach":
                 continue
-            if key not in {"interrupt", "eof", "stop"}:
-                exit_deadline = 0.0
-                exit_key = ""
-                exit_hint = ""
-                confirm_task = confirm_action = ""
+            if too_small and key not in {"quit", "interrupt", "eof", "escape", "enter", "prefix"}:
+                if not prefix_pending:
+                    continue
+            if key == "interrupt":
+                key = "escape"
+            if prefix_pending:
+                prefix_pending = False
+                if key == "prefix":
+                    key = "left"
+                elif key == "escape":
+                    continue
+                elif key == "text" and text_value in {"w", "n", "p", "d", "h", "?"}:
+                    key = {"w": "sessions", "n": "next-lane", "p": "previous-lane", "d": "quit", "h": "help", "?": "help"}[text_value]
+                else:
+                    notice = "Ctrl-B then w Sessions · n/p tabs · d detach · h help"
+                    continue
+            elif key == "prefix":
+                prefix_pending = True
+                confirm_task = confirm_action = confirm_hint = ""
+                notice = "Ctrl-B then w Sessions · n/p tabs · d detach · h help"
+                continue
+            if help_offset is not None:
+                if key in {"help", "escape", "sessions"}:
+                    help_offset = None
+                elif key in {"up", "wheel-up"}:
+                    help_offset = max(0, help_offset - 1)
+                elif key in {"down", "wheel-down"}:
+                    help_offset = min(max(0, len(hub_help_lines(size.columns)) - max(1, size.lines - 2)), help_offset + 1)
+                elif key != "quit":
+                    continue
+                if key != "quit":
+                    continue
+                help_offset = None
+            if key == "help":
+                help_offset = 0
+                confirm_task = confirm_action = confirm_hint = ""
+                continue
+            if key == "sessions":
+                notice = "Sessions · Up/Down select · Enter open · Esc back"
+                continue
+            if key in {"next-lane", "previous-lane"}:
+                active = [index for index, task in enumerate(tasks) if not task.dead]
+                if not active:
+                    notice = "No running sessions · select New session to start one"
+                    continue
+                direction = 1 if key == "next-lane" else -1
+                position = active.index(selected) if selected in active else (-1 if direction == 1 else 0)
+                selected = active[(position + direction) % len(active)]
+                selected_key = item_keys[selected]
+                key = "open"
+            confirmed = bool(confirm_action) and key == "enter"
+            if confirmed:
+                key = "quit" if confirm_action == "detach" else "stop"
+            elif confirm_action:
+                confirm_task = confirm_action = confirm_hint = ""
+                if key == "escape":
+                    continue
             if key in {"wheel-up", "wheel-down"}:
                 if prompt or int(text_value) not in mouse_rows:
                     continue
@@ -6363,19 +6503,12 @@ def hub_ui(
                 clicked = mouse_rows.get(int(text_value))
                 if clicked is None:
                     continue
-                if prompt:
-                    notice = "Draft kept · clear it with Esc to open a session"
-                    continue
                 selected = clicked
                 selected_key = item_keys[selected]
                 if selected == len(tasks):
-                    notice = (
-                        "Enter opens a new session · Tab chooses the agent"
-                        if preset is not None and hub_requires_native_prompt(preset)
-                        else "Type your first message below · Tab chooses the agent"
-                    )
+                    notice = "Enter opens a new session · Tab chooses the agent"
                     continue
-                key = "right"
+                key = "open"
             if key == "up":
                 selected = (selected - 1) % max(1, item_count)
                 selected_key = item_keys[selected]
@@ -6388,64 +6521,76 @@ def hub_ui(
                 selected = (selected + 1) % max(1, item_count)
                 selected_key = item_keys[selected]
                 continue
-            if key == "quit":
-                detach_hub_popup(client, client_pid, context, popup_value)
-                return 0
-            if key == "left":
-                if prompt:
-                    cursor = max(0, cursor - 1)
-                continue
+            if key == "eof":
+                key = "delete" if prompt else "quit"
             if key == "escape":
-                if prompt:
-                    prompt = ""
-                    cursor = 0
-                    continue
                 if peek_key:
                     peek_key = ""
                     continue
                 if source_task is not None and not tmux_session_absent(source):
-                    switch_hub_popup(
-                        client, client_pid, context, popup_value, source
-                    )
-                    return 0
+                    if save_drafts():
+                        switch_hub_popup(client, client_pid, context, popup_value, source)
+                        return 0
+                    continue
+                key = "quit"
+            if key == "quit":
+                drafts[draft_key] = [prompt, cursor]
+                if any(value[0] for value in drafts.values()) and not confirmed:
+                    confirm_action = "detach"
+                    confirm_hint = "Detach and discard drafts? Jobs keep running"
+                    continue
                 detach_hub_popup(client, client_pid, context, popup_value)
                 return 0
-            if key in {"interrupt", "eof"}:
-                if prompt and not too_small:
-                    prompt = ""
-                    cursor = 0
-                    exit_deadline = 0.0
-                    exit_key = ""
-                    exit_hint = ""
-                    continue
-                if key == exit_key and time.monotonic() < exit_deadline:
-                    detach_hub_popup(client, client_pid, context, popup_value)
-                    return 0
-                exit_deadline = time.monotonic() + HUB_EXIT_CONFIRM_SECONDS
-                exit_key = key
-                label = "Ctrl-C" if key == "interrupt" else "Ctrl-D"
-                exit_hint = f"Press {label} again to leave · jobs keep running"
+            if key == "left":
+                cursor = max(0, cursor - 1)
                 continue
+            if key == "home":
+                cursor = 0
+                continue
+            if key == "end":
+                cursor = len(prompt)
+                continue
+            if key in {"word-left", "backspace-word"}:
+                start = cursor
+                while start and prompt[start - 1].isspace():
+                    start -= 1
+                while start and not prompt[start - 1].isspace():
+                    start -= 1
+                if key == "backspace-word":
+                    killed_text = prompt[start:cursor]
+                    prompt = prompt[:start] + prompt[cursor:]
+                cursor = start
+                continue
+            if key in {"word-right", "delete-word"}:
+                end = cursor
+                while end < len(prompt) and prompt[end].isspace():
+                    end += 1
+                while end < len(prompt) and not prompt[end].isspace():
+                    end += 1
+                if key == "delete-word":
+                    killed_text = prompt[cursor:end]
+                    prompt = prompt[:cursor] + prompt[end:]
+                else:
+                    cursor = end
+                continue
+            if key == "delete":
+                prompt = prompt[:cursor] + prompt[cursor + 1:]
+                continue
+            if key == "kill-end":
+                killed_text = prompt[cursor:]
+                prompt = prompt[:cursor]
+                continue
+            if key == "yank":
+                key, text_value = "text", killed_text
             if key == "stop":
                 if selected >= len(tasks):
-                    exit_deadline = 0.0
-                    exit_key = ""
-                    exit_hint = ""
-                    confirm_task = confirm_action = ""
+                    confirm_task = confirm_action = confirm_hint = ""
                     notice = "Select a job to stop or remove"
                     continue
                 target = tasks[selected]
                 action = "remove" if target.dead else "stop"
-                if (
-                    exit_key == key
-                    and confirm_task == target.id
-                    and confirm_action == action
-                    and time.monotonic() < exit_deadline
-                ):
-                    exit_deadline = 0.0
-                    exit_key = ""
-                    exit_hint = ""
-                    confirm_task = confirm_action = ""
+                if confirmed and confirm_task == target.id and confirm_action == action:
+                    confirm_task = confirm_action = confirm_hint = ""
                     redraw(f"{'Stopping' if action == 'stop' else 'Removing'} {target.name}…")
                     try:
                         if action == "stop":
@@ -6453,35 +6598,23 @@ def hub_ui(
                             notice = f"Stopped {target.name}"
                         else:
                             remove_task(target.id, False, HUB_ACTION_GRACE_SECONDS)
+                            drafts.pop(target.id, None)
+                            if draft_key == target.id:
+                                prompt, cursor = "", 0
                             notice = f"Removed {target.name}"
                             survivors = [item.id for item in all_tasks if item.id != target.id]
                             position = [item.id for item in all_tasks].index(target.id)
-                            selected_key = (
-                                survivors[min(position, len(survivors) - 1)]
-                                if survivors
-                                else ""
-                            )
+                            selected_key = survivors[min(position, len(survivors) - 1)] if survivors else ""
                     except CliLaneError as error:
                         notice = str(error)
                     with suppress(termios.error):
                         termios.tcflush(descriptor, termios.TCIFLUSH)
                     refresh_peek = True
                     continue
-                exit_deadline = time.monotonic() + HUB_EXIT_CONFIRM_SECONDS
-                exit_key = key
                 confirm_task = target.id
                 confirm_action = action
-                detail = " (finished)" if target.dead else ""
-                exit_hint = f"Press Ctrl-X again to {action} {target.name}{detail}"
+                confirm_hint = f"{action.capitalize()} {target.name}? Enter confirms · Esc cancels"
                 continue
-            if (
-                key == "enter"
-                and not prompt
-                and selected < len(tasks)
-                and tasks[selected].dead
-                and hub_resume_kind(tasks[selected], presets)
-            ):
-                key = "resume"
             if key == "resume":
                 if selected >= len(tasks):
                     notice = "Select a finished job to resume"
@@ -6490,8 +6623,10 @@ def hub_ui(
                 if not target.dead:
                     notice = f"{target.name} is still running"
                     continue
-                if prompt:
-                    notice = "Clear the composer first (Esc), then Ctrl-R"
+                if (draft_key == target.id and prompt) or (draft_key != target.id and drafts.get(target.id, [""])[0]):
+                    notice = "Reply draft kept · Space opens it · Ctrl-U clears before resume"
+                    continue
+                if not save_drafts():
                     continue
                 action = hub_resume_action(target, presets)
                 redraw(f"{action.capitalize()} · {target.name}… · Ctrl-C cancel")
@@ -6516,6 +6651,8 @@ def hub_ui(
                 if presets:
                     direction = -1 if key == "backtab" else 1
                     agent_index = (agent_index + direction) % len(presets)
+                    peek_key = ""
+                    selected_key = ""
                 else:
                     notice = hub_no_presets_notice(
                         config,
@@ -6524,6 +6661,7 @@ def hub_ui(
                     )
                 continue
             if key == "clear":
+                killed_text = prompt
                 prompt = ""
                 cursor = 0
                 continue
@@ -6542,6 +6680,8 @@ def hub_ui(
                     notice = "Select a job to peek at its output"
                 continue
             if key == "text":
+                if not peek_key:
+                    selected_key = ""
                 available = HUB_PROMPT_MAX_CHARS - len(prompt)
                 inserted = text_value[:available]
                 prompt = prompt[:cursor] + inserted + prompt[cursor:]
@@ -6549,21 +6689,15 @@ def hub_ui(
                 if len(text_value) > available:
                     notice = f"Message limited to {HUB_PROMPT_MAX_CHARS} characters"
                 continue
-            if key not in {"enter", "right"}:
+            if key not in {"enter", "right", "open"}:
                 continue
-            if not prompt:
-                if selected < len(tasks):
-                    switch_hub_popup(
-                        client,
-                        client_pid,
-                        context,
-                        popup_value,
-                        tasks[selected].session,
-                    )
-                    return 0
-                if preset is None or not hub_requires_native_prompt(preset):
-                    notice = "Type a message to start a new session"
+            if selected < len(tasks) and (
+                key == "open" or not prompt or not peek_key or tasks[selected].dead
+            ):
+                if not save_drafts():
                     continue
+                switch_hub_popup(client, client_pid, context, popup_value, tasks[selected].session)
+                return 0
             if peek_key and selected < len(tasks) and not tasks[selected].dead:
                 target = tasks[selected]
                 try:
@@ -6586,6 +6720,8 @@ def hub_ui(
                 )
                 continue
             name = hub_task_name(preset, all_tasks)
+            if not save_drafts(clear_current=True):
+                continue
             redraw(f"Starting {name}… · Ctrl-C cancel")
             launch_preset = preset
             launch_prompt = prompt
@@ -6628,7 +6764,8 @@ def hub_launch_environment(context: str) -> dict[str, str]:
 
 
 def hub_pane(
-    client: str, client_pid: str, source: str, context: str, generation: str
+    client: str, client_pid: str, source: str, context: str, generation: str,
+    *, show_help: bool = False,
 ) -> int:
     interrupted = threading.Event()
     HUB_LAUNCH_STATE.interrupted = interrupted
@@ -6638,7 +6775,7 @@ def hub_pane(
             sent_signal, lambda _number, _frame: interrupted.set()
         )
     try:
-        return hub_ui(client, client_pid, source, context, generation, pane_mode=True)
+        return hub_ui(client, client_pid, source, context, generation, pane_mode=True, show_help=show_help)
     finally:
         try:
             finish_hub_pane(
@@ -7255,15 +7392,26 @@ def parser() -> argparse.ArgumentParser:
 
 Only tasks started through clilane appear. Click a session tab to switch, or
 use Left/Right at an empty Claude, Codex, or Kimi prompt. With text in the prompt,
-arrows move the cursor. Click Sessions or press Ctrl-Q for the full list;
-press Ctrl-Q again there to detach. Ctrl-PageUp/PageDown switches lanes for
-every CLI, including OMP. To quit OMP itself, press Ctrl-D at an empty prompt.
+arrows move the cursor. Click Sessions, or press Ctrl-B, release, then w.
+Ctrl-B then n/p switches lanes; Ctrl-B then d detaches with jobs running.
+Ctrl-B then h shows keyboard help. These keys use Control on both Mac and PC;
+no Command, Option, Fn, or Page keys are required. Windows clients use WSL or SSH.
+Native Ctrl-Q/Ctrl-C/Ctrl-D and modified Tab/Page keys pass through to agents.
+For OMP: Ctrl-D exits normal chat; Ctrl-C exits its first-run setup.
+
+In Sessions, Enter opens a selected job; Ctrl-R explicitly resumes/reruns it.
+New session + Enter opens any agent. Space previews output and lets you reply.
+Esc goes back and keeps drafts until you detach. Ctrl-U clears; Ctrl-Y restores.
+Ctrl-A/E or Home/End moves to the start/end; Ctrl-W erases the previous word.
+Ctrl-X asks before stopping/removing a job; Enter confirms and Esc cancels.
+Ctrl-Q detaches; if drafts exist, confirm discarding them. Jobs keep running.
 
 Without hub.json, Sessions discovers installed Codex, Kimi, Claude, OMP,
 Kiro CLI, Gemini, OpenCode, Copilot, Aider, Amp, Goose, Pi, Cursor Agent,
-Droid, Qwen Code, and Hermes commands on PATH. For newly supported CLIs,
-select New session, use Tab to choose an agent, and press Enter with an
-empty composer to open it. Type messages inside their own terminal.""",
+Droid, Qwen Code, and Hermes commands on PATH. Select New session, use
+Tab/Shift-Tab to choose an agent, and press Enter with an empty composer.
+Type messages inside the agent. Codex/Kimi/Claude/OMP also accept a first
+message in the Sessions composer.""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     root.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -7563,9 +7711,9 @@ def main() -> int:
             return hub_forget(sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7])
         if len(sys.argv) == 6 and sys.argv[1] == "__hub-forget":
             return hub_forget(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
-        if len(sys.argv) == 8 and sys.argv[1] == "__hub-open":
+        if len(sys.argv) == 8 and sys.argv[1] in {"__hub-open", "__hub-help"}:
             configure_tmux_control(sys.argv[2], sys.argv[3])
-            return hub_open(sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7])
+            return hub_open(sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], show_help=sys.argv[1] == "__hub-help")
         if len(sys.argv) == 8 and sys.argv[1] == "__hub-cycle":
             configure_tmux_control(sys.argv[2], sys.argv[3])
             return hub_cycle(sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7])
@@ -7576,10 +7724,10 @@ def main() -> int:
             return hub_ui(
                 sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8]
             )
-        if len(sys.argv) == 9 and sys.argv[1] == "__hub-pane":
+        if (len(sys.argv) == 9 or len(sys.argv) == 10 and sys.argv[9] == "help") and sys.argv[1] == "__hub-pane":
             configure_tmux_control(sys.argv[2], sys.argv[3])
             return hub_pane(
-                sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8]
+                sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8], show_help=len(sys.argv) == 10
             )
         if len(sys.argv) == 7 and sys.argv[1] == "__hub-ui":
             return hub_ui(
