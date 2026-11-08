@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import pwd
+import re
 import shlex
 import shutil
 import stat
@@ -90,6 +91,37 @@ class TemporaryProfileCase(unittest.TestCase):
             profile_document() if value is None else value,
             mode,
         )
+
+
+class NativeNavigationTests(unittest.TestCase):
+    def test_captured_native_editor_states(self) -> None:
+        probe = {"__name__": "navigation_fixture"}
+        exec(clilane.HUB_LEFT_PROBE_SOURCE, probe)
+        cases = json.loads((ROOT / "tests/fixtures/navigation/native-prompts.json").read_text())
+        for case in cases:
+            with self.subTest(agent=case["agent"], version=case["version"], state=case["state"]):
+                check = probe["omp_empty_prompt" if case["agent"] == "omp" else "kiro_empty_prompt"]
+                self.assertEqual(
+                    check(case["rows"], case["row"], case["cursor"], case["columns"]),
+                    case["expected"],
+                )
+                if case["expected"]:
+                    draft = list(case["rows"])
+                    draft[case["row"]] = "╰─ a draft" if case["agent"] == "omp" else "› a draft"
+                    self.assertFalse(check(draft, case["row"], case["cursor"], case["columns"]))
+                    multiline = list(case["rows"])
+                    multiline[case["row"] + 1] = "   unsent second line"
+                    self.assertFalse(check(multiline, case["row"], case["cursor"], case["columns"]))
+                    plain_hint = list(case["rows"])
+                    plain_hint[case["row"]] = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", plain_hint[case["row"]])
+                    self.assertFalse(check(plain_hint, case["row"], case["cursor"], case["columns"]))
+
+    def test_kiro_initial_message_requires_an_interactive_chat_command(self) -> None:
+        for arguments in (["chat"], ["--v2", "chat"], ["chat", "--model", "auto"], ["chat", "--agent=work", "--"]):
+            self.assertTrue(clilane.hub_kiro_input_supported(["/tmp/kiro-cli", *arguments]))
+        for arguments in ([], ["login"], ["chat", "already has input"], ["chat", "--resume"], ["chat", "--no-interactive"], ["chat", "--model"], ["chat", "--", "existing"], ["chat", "--help"], ["chat", "--unknown"]):
+            self.assertFalse(clilane.hub_kiro_input_supported(["/tmp/kiro-cli", *arguments]))
+        self.assertFalse(clilane.hub_kiro_input_supported(["/tmp/another-cli", "chat"]))
 
 
 class RunParserTests(unittest.TestCase):

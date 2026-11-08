@@ -35,7 +35,7 @@ from typing import BinaryIO, Callable, Iterator, Mapping, Sequence
 
 
 PROGRAM = "clilane"
-VERSION = "0.19.0"
+VERSION = "0.20.0"
 TASK_STATE_INITIALIZING = "initializing"
 TASK_STATE_RUNNING = "running"
 TASK_STATE_STOPPED = "stopped"
@@ -72,12 +72,12 @@ HUB_ACTION_GRACE_SECONDS = 3.0
 HUB_HISTORY_BATCH_DEFAULT = 20
 HUB_HISTORY_BATCH_MAX = 1000
 HUB_LEFT_GATE_COLUMNS = 8
-HUB_LEFT_AGENT_KINDS = frozenset({"claude", "codex", "kimi"})
+HUB_LEFT_AGENT_KINDS = frozenset({"claude", "codex", "kimi", "omp", "kiro-cli"})
 HUB_KEY_HELP = (
     "Ctrl-B opens Sessions.",
     "Up/Down choose; Enter opens.",
     "Esc goes back; drafts stay.",
-    "Help and Detach are menu choices.",
+    "Help and Leave CliLane are menu choices.",
     "",
     "In Sessions:",
     " Up/Down  select job or action",
@@ -89,7 +89,7 @@ HUB_KEY_HELP = (
     " Ctrl-X  stop / remove",
     " Enter confirms; Esc cancels",
     " Esc / Ctrl-C  back",
-    " Ctrl-Q  detach; jobs run",
+    " Ctrl-Q  leave; jobs keep running",
     "",
     "Edit a draft:",
     " Ctrl-A/E  start/end",
@@ -97,12 +97,12 @@ HUB_KEY_HELP = (
     " Ctrl/Option-Left/Right  word",
     " Ctrl-W / Option-Delete  erase word",
     " Delete / Fn-Delete  forward delete",
-    " Ctrl-D  forward delete (empty: detach)",
+    " Ctrl-D  forward delete (empty: leave)",
     " Ctrl-K  erase to end",
     " Ctrl-U  clear",
     " Ctrl-Y  restore erased text",
     "",
-    "Drafts stay until you detach.",
+    "Drafts stay until you leave CliLane.",
     "Replies stay with their own job.",
     "Inside agents, native Ctrl-Q/C/D",
     "and modified Tab/Page keys pass through.",
@@ -3159,7 +3159,11 @@ def tmux_session_absent(session: str) -> bool:
 
 
 def configure_task_status(session: str, command: Sequence[str]) -> None:
-    agent = hub_command_kind(command) in HUB_LEFT_AGENT_KINDS
+    kind = (
+        "kiro-cli" if command and Path(command[0]).name == "kiro-cli"
+        else hub_command_kind(command)
+    )
+    agent = kind in HUB_LEFT_AGENT_KINDS
     tmux(
         [
             "set-option",
@@ -3177,12 +3181,12 @@ def configure_task_status(session: str, command: Sequence[str]) -> None:
             "-t",
             session,
             "status-right",
-            " ←/→ empty · Ctrl-B Sessions " if agent else " Ctrl-B Sessions ",
+            " ←/→ empty · Ctrl-B back " if agent else " Ctrl-B back to sessions ",
         ],
         check=False,
     )
     tmux(
-        ["set-option", "-t", session, "@agt_agent", "1"]
+        ["set-option", "-t", session, "@agt_agent", kind]
         if agent
         else ["set-option", "-u", "-t", session, "@agt_agent"],
         check=False,
@@ -3742,7 +3746,7 @@ def print_status(task: Task, as_json: bool) -> None:
 def require_attach_terminal() -> None:
     if hub_command_is_recursive():
         raise CliLaneError(
-            "already inside CLI Lane; click Sessions or press Ctrl-B to open the list"
+            "already inside CLI Lane; click Back to sessions or press Ctrl-B to open the list"
         )
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise CliLaneError("attaching needs an interactive terminal")
@@ -4275,18 +4279,66 @@ def empty_prompt(rows, cursor, columns):
     return True
 
 
+def omp_empty_prompt(rows, row, cursor, columns):
+    if cursor != 3 or row < 1 or row >= len(rows):
+        return False
+    plain = lambda value: "".join(character for character, _, _ in cells(value))
+    status = plain(rows[row - 1])
+    prompt = plain(rows[row])
+    hint = "⇧⇥ to change thinking effort"
+    return (
+        status.startswith(" π > ")
+        and status.endswith("─")
+        and prompt.startswith("╰─ ")
+        and prompt[3:].strip() == hint
+        and columns - len(hint) - 1 <= prompt.index("⇧⇥") <= columns - len(hint)
+        and re.search(
+            r"\x1b\[3m(?:\x1b\[[0-9;:]*m)*to change thinking effort(?:\x1b\[[0-9;:]*m)*$",
+            rows[row],
+        ) is not None
+        and all(not plain(value).strip() for value in rows[row + 1:])
+    )
+
+
+def kiro_empty_prompt(rows, row, cursor, columns):
+    if cursor != 2 or row < 3 or row + 1 >= len(rows):
+        return False
+    plain = lambda value: "".join(character for character, _, _ in cells(value))
+    prompt = cells(rows[row])
+    footer = cells(rows[row + 1])
+    return (
+        plain(rows[row - 3]) == "─" * columns
+        and " · " in plain(rows[row - 2]) and "◔ " in plain(rows[row - 2])
+        and not plain(rows[row - 1]).strip()
+        and plain(rows[row]) == "›  ask a question or describe a task ↵"
+        and all(character.isspace() or foreground for character, _, foreground in prompt[3:])
+        and plain(rows[row + 1]).strip() in {
+            "/copy to clipboard", "/sessions to resume · /copy to clipboard",
+        }
+        and all(character.isspace() or foreground for character, _, foreground in footer)
+        and all(not plain(value).strip() for value in rows[row + 2:])
+        and not any("any key to dismiss" in plain(value) for value in rows[:row - 3])
+    )
+
+
 if __name__ == "__main__":
-    binary, socket_path, pane, cursor_x, cursor_y, columns = sys.argv[1:7]
+    binary, socket_path, pane, cursor_x, cursor_y, columns, agent = sys.argv[1:8]
     captured = subprocess.run(
         [binary, "-S", socket_path, "-f", "/dev/null", "capture-pane", "-p", "-e",
-         "-t", pane, "-S", cursor_y],
+         "-t", pane, "-S", "0"],
         stdin=subprocess.DEVNULL,
         capture_output=True,
         timeout=1.0,
         check=True,
     )
     rows = captured.stdout.decode(errors="replace").splitlines()
-    sys.exit(0 if empty_prompt(rows, int(cursor_x), int(columns)) else 1)
+    row = int(cursor_y)
+    ready = (
+        omp_empty_prompt(rows, row, int(cursor_x), int(columns)) if agent == "omp"
+        else kiro_empty_prompt(rows, row, int(cursor_x), int(columns)) if agent == "kiro-cli"
+        else empty_prompt(rows[row:], int(cursor_x), int(columns))
+    )
+    sys.exit(0 if ready else 1)
 '''
 
 
@@ -4303,7 +4355,7 @@ def hub_left_check_command() -> str:
             shlex.quote(control_socket),
         )
     )
-    return tmux_literal(command + " ", 1) + "'#{pane_id}' '#{cursor_x}' '#{cursor_y}' '#{pane_width}'"
+    return tmux_literal(command + " ", 1) + "'#{pane_id}' '#{cursor_x}' '#{cursor_y}' '#{pane_width}' '#{@agt_agent}'"
 
 
 def bind_hub_keys() -> None:
@@ -4323,9 +4375,9 @@ def bind_hub_keys() -> None:
     )
     left_check = hub_left_check_command()
     left_gate = (
-        "#{&&:#{@agt_agent},#{&&:#{e|<=:#{cursor_x},"
+        "#{&&:#{@agt_agent},#{&&:#{cursor_flag},#{&&:#{e|<=:#{cursor_x},"
         f"{HUB_LEFT_GATE_COLUMNS}"
-        "},#{?pane_in_mode,0,1}}}"
+        "},#{?pane_in_mode,0,1}}}}"
     )
     for key, direction in (("Left", -1), ("Right", 1)):
         switch_command = "run-shell " + tmux_quoted(hub_cycle_command(direction))
@@ -4371,7 +4423,9 @@ def configure_hub_navigation() -> None:
         + ",}}"
     )
     status = (
-        "#[align=left range=left bold] ‹ Sessions [Ctrl-B] #[norange nobold] "
+        "#[align=left range=left bold] "
+        "#{?#{e|>=:#{client_width},64},‹ Back to sessions [Ctrl-B],‹ Back [Ctrl-B]} "
+        "#[norange nobold] "
         "#[list=on]#[list=left-marker range=user|previous]‹ "
         "#[list=right-marker range=user|next] ›#[norange list=on]"
         + session_tabs
@@ -5217,6 +5271,8 @@ def revalidate_hub_preset(
 def hub_prompt_agent_kind(preset: dict[str, object]) -> str | None:
     kind = hub_preset_kind(preset)
     command = list(preset["command"])
+    if hub_kiro_input_supported(command):
+        return "kiro-cli"
     executable = Path(str(command[0]))
     if executable.resolve().name == "cat":
         return None
@@ -5236,17 +5292,22 @@ def hub_prompt_capture(task: Task) -> str:
 
 def hub_agent_composer_ready(task: Task, kind: str) -> bool:
     position = tmux(
-        ["display-message", "-p", "-t", task.pane, "#{cursor_x}|#{cursor_y}"],
+        ["display-message", "-p", "-t", task.pane,
+         "#{cursor_x}|#{cursor_y}|#{pane_width}|#{cursor_flag}"],
         check=False,
     )
     parts = position.stdout.decode(errors="replace").strip().split("|")
-    if position.returncode != 0 or len(parts) != 2 or not all(part.isdigit() for part in parts):
+    if position.returncode != 0 or len(parts) != 4 or not all(part.isdigit() for part in parts):
         return False
-    column, row = (int(part) for part in parts)
+    column, row, columns, cursor_visible = (int(part) for part in parts)
     captured = tmux(["capture-pane", "-e", "-p", "-t", task.pane], check=False)
     rows = captured.stdout.decode(errors="replace").splitlines()
     if captured.returncode != 0 or row >= len(rows):
         return False
+    if kind == "kiro-cli":
+        probe = {"__name__": "clilane_prompt_probe"}
+        exec(HUB_LEFT_PROBE_SOURCE, probe)
+        return bool(cursor_visible and probe["kiro_empty_prompt"](rows, row, column, columns))
     faint = False
     visible: list[str] = []
     for token in re.findall(r"\x1b\[[0-?]*[ -/]*[@-~]|[^\x1b]", rows[row]):
@@ -5299,7 +5360,8 @@ def wait_for_hub_agent_ready(preset: dict[str, object], task: Task) -> None:
             f"could not inspect {task.name}; open it to finish startup"
         ) from error
     try:
-        deadline = time.monotonic() + HUB_AGENT_READY_TIMEOUT_SECONDS
+        timeout = 40.0 if kind == "kiro-cli" else HUB_AGENT_READY_TIMEOUT_SECONDS
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             hub_launch_checkpoint()
             try:
@@ -5367,9 +5429,48 @@ def send_hub_prompt(preset: dict[str, object], task: Task, prompt: str) -> None:
     hub_launch_submit(lambda: key_task(task.id, ["Enter"]))
 
 
+def hub_kiro_input_supported(command: Sequence[str]) -> bool:
+    if not command or Path(command[0]).name != "kiro-cli":
+        return False
+    flags = {
+        "--v2", "--v3", "--tui", "--verbose", "-v", "--trust-all-tools", "-a",
+        "--trust-workspace", "--require-mcp-startup",
+    }
+    values = {
+        "--agent", "--model", "--effort", "--wrap", "-w", "--agent-engine",
+        "--mode", "--trust-tools",
+    }
+    index = 1
+    chat = False
+    while index < len(command):
+        argument = command[index]
+        if argument == "--":
+            return chat and index == len(command) - 1
+        if argument == "chat" and not chat:
+            chat = True
+        elif argument in flags:
+            pass
+        else:
+            option, equals, value = argument.partition("=")
+            if option not in values:
+                return False
+            if equals:
+                if not value and option != "--trust-tools":
+                    return False
+            else:
+                index += 1
+                if index >= len(command) or command[index].startswith("-"):
+                    return False
+        index += 1
+    return chat
+
+
 def hub_requires_native_prompt(preset: dict[str, object]) -> bool:
     command = list(preset["command"])
-    return bool(command) and Path(str(command[0])).name.lower() in HUB_NATIVE_AGENT_COMMANDS
+    return (
+        bool(command) and Path(str(command[0])).name.lower() in HUB_NATIVE_AGENT_COMMANDS
+        and not hub_kiro_input_supported(command)
+    )
 
 
 def launch_hub_preset(
@@ -6047,7 +6148,7 @@ def hub_draw(
         sys.stdout.flush()
         return {}
     if columns < 24 or height < 8:
-        lines = ["Ctrl-Q detach", "Resize to at least 24×8", "Draft kept"]
+        lines = ["Ctrl-Q leave", "Resize to at least 24×8", "Draft kept"]
         if confirmation == "detach":
             lines = ["Discard drafts?", "Enter yes · Esc no", "Jobs keep running"]
         elif notice:
@@ -6081,7 +6182,7 @@ def hub_draw(
         rows.append((f"   … {hidden_history} more · ↓ to reveal", None, "2"))
     rows.append(("+  New session", len(tasks), ""))
     rows.append(("?  Help", len(tasks) + 1, ""))
-    rows.append(("   Detach · jobs keep running", len(tasks) + 2, ""))
+    rows.append(("   Leave CliLane · jobs keep running", len(tasks) + 2, ""))
     selected = max(0, min(selected, len(tasks) + 2))
     selected_row = next(
         (position for position, (_, index, _) in enumerate(rows) if index == selected),
@@ -6146,7 +6247,7 @@ def hub_draw(
     if reply_to is not None and not reply_to.dead:
         hints = [
             "Enter send reply" if prompt else "Enter open · type to reply",
-            "Esc close preview · Ctrl-X stop · Ctrl-Q detach",
+            "Esc close preview · Ctrl-X stop · Ctrl-Q leave",
         ]
     elif target is not None:
         action = (
@@ -6154,10 +6255,10 @@ def hub_draw(
             if target.dead and (hub_resume_kind(target, presets) or hub_command_kind(target.command) is None)
             else "Ctrl-X remove" if target.dead else "Ctrl-X stop"
         )
-        hints = ["Enter open · Space preview · " + action, "Esc back · Help and Detach below"]
+        hints = ["Enter open · Space preview · " + action, "Esc back · Help and Leave below"]
     elif selected > len(tasks):
         hints = [
-            "Enter opens keyboard help" if selected == len(tasks) + 1 else "Enter detaches; jobs keep running",
+            "Enter opens keyboard help" if selected == len(tasks) + 1 else "Enter leaves CliLane; jobs keep running",
             "Up/Down choose · Esc back",
         ]
     else:
@@ -6190,7 +6291,7 @@ def hub_draw(
             hints[0] = "Enter start · Tab agent" if prompt else "Enter open · Tab agent"
             if prompt and preset and hub_requires_native_prompt(preset):
                 hints[0] = "Ctrl-U clear to open"
-        hints[1] = "Esc back · Ctrl-Q detach"
+        hints[1] = "Esc back · Ctrl-Q leave"
         if target is not None and target.dead:
             hints[1] = "Enter open · Ctrl-Q out"
     if confirmation:
@@ -6529,7 +6630,7 @@ def hub_ui(
                 drafts[draft_key] = [prompt, cursor]
                 if any(value[0] for value in drafts.values()) and not confirmed:
                     confirm_action = "detach"
-                    confirm_hint = "Detach and discard drafts? Jobs keep running"
+                    confirm_hint = "Leave and discard drafts? Jobs keep running"
                     continue
                 detach_hub_popup(client, client_pid, context, popup_value)
                 return 0
@@ -6843,7 +6944,7 @@ def ensure_hub_session() -> None:
             "-t",
             HUB_SESSION,
             "status-right",
-            " Click Sessions to choose a session ",
+            " Click Back to sessions to choose a session ",
         ]
     )
     tmux(["set-option", "-t", HUB_SESSION, "status-left", " CLI LANE "])
@@ -7383,27 +7484,29 @@ def parser() -> argparse.ArgumentParser:
   clilane attach codex-app
 
 Only tasks started through clilane appear. Click a session tab to switch, or
-use Left/Right at an empty Claude, Codex, or Kimi prompt. With text in the prompt,
-arrows move the cursor. Click Sessions, or press Ctrl-B once.
-Use Up/Down and Enter to choose a session, Help, or Detach. Esc goes back.
+use Left/Right at a recognized empty Claude, Codex, Kimi, OMP, or Kiro prompt.
+With text in the prompt, arrows move the cursor.
+Click Back to sessions, or press Ctrl-B once.
+Use Up/Down and Enter to choose a session, Help, or Leave CliLane. Esc goes back.
 Ctrl-B uses Control on both Mac and PC;
 no Command, Option, Fn, or Page keys are required. Windows clients use WSL or SSH.
 Native Ctrl-Q/Ctrl-C/Ctrl-D and modified Tab/Page keys pass through to agents.
-For OMP: Ctrl-D exits normal chat; Ctrl-C exits its first-run setup.
+For OMP: Ctrl-D exits with an empty editor; with a draft it deletes forward.
+Ctrl-C leaves OMP's first-run setup and enters chat.
 
 In Sessions, Enter opens a selected job; Ctrl-R explicitly resumes/reruns it.
 New session + Enter opens any agent. Space previews output and lets you reply.
-Esc goes back and keeps drafts until you detach. Ctrl-U clears; Ctrl-Y restores.
+Esc goes back and keeps drafts until you leave CliLane. Ctrl-U clears; Ctrl-Y restores.
 Ctrl-A/E or Home/End moves to the start/end; Ctrl-W erases the previous word.
 Ctrl-X asks before stopping/removing a job; Enter confirms and Esc cancels.
-Ctrl-Q detaches; if drafts exist, confirm discarding them. Jobs keep running.
+Ctrl-Q leaves CliLane; if drafts exist, confirm discarding them. Jobs keep running.
 
 Without hub.json, Sessions discovers installed Codex, Kimi, Claude, OMP,
 Kiro CLI, Gemini, OpenCode, Copilot, Aider, Amp, Goose, Pi, Cursor Agent,
 Droid, Qwen Code, and Hermes commands on PATH. Select New session, use
 Tab/Shift-Tab to choose an agent, and press Enter with an empty composer.
-Type messages inside the agent. Codex/Kimi/Claude/OMP also accept a first
-message in the Sessions composer.""",
+Type messages inside the agent. Codex/Kimi/Claude/OMP and supported Kiro chat
+commands also accept a first message in the Sessions composer.""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     root.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -7487,7 +7590,7 @@ message in the Sessions composer.""",
     status.add_argument("--json", action="store_true", help="emit JSON")
 
     attach = commands.add_parser("attach", help="attach to a task interactively")
-    attach.add_argument("target", help="task name or ID prefix; click Sessions for the list")
+    attach.add_argument("target", help="task name or ID prefix; click Back to sessions for the list")
 
     hub = commands.add_parser("hub", help="open the native session switcher")
     hub.add_argument(
