@@ -1397,13 +1397,11 @@ def _exercise_agent_ux(environment: dict[str, str], root: Path) -> None:
         terminal.expect("keep this draft", mark)
         assert not unexpected.exists() and not submitted.exists()
         assert all(task["state"] != "running" for task in _tasks(environment))
-        terminal.close()
-        terminal = None
-        _cleanup(environment)
+        for task in _tasks(environment):
+            _run(environment, ["rm", task["id"]])
         blocked.unlink()
         received.unlink()
-        terminal = _Terminal(["hub", "--config", str(config)], environment)
-        terminal.expect("This clilane server")
+        terminal.send(b"\x15")
         prompt = '--literal "quoted" $value `text`\nsecond line'
         terminal.send(b"\x1b[200~" + prompt.encode() + b"\x1b[201~\r")
         terminal.expect("AGENT-UX-SUBMITTED")
