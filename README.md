@@ -283,46 +283,58 @@ clilane
 
 Press **Ctrl-B once** to open Sessions, use **Up/Down** to choose, and press
 **Enter** to open. **Esc** returns without clearing your draft. **Help** and
-**Detach** are choices in the same list; you can select or click them.
+**Leave CliLane · jobs keep running** are choices in the same list; you can select
+or click them. The top bar’s **Back to sessions** button opens the same list.
 Use the Control key on both Mac and PC keyboards. Everyday navigation needs no
 Command, Option, Fn, or Page keys. Windows Terminal clients can use WSL or SSH to
 a machine running CLI Lane; CLI Lane itself requires a Unix environment and tmux.
 
 **Upgrading from 0.18:** `Ctrl-B` opens Sessions immediately; the extra `w` and
-other prefix letters are no longer needed. Choose the next job, Help, or Detach
+other prefix letters are no longer needed. Choose the next job, Help, or Leave CliLane
 in the list. `Ctrl-Q` reaches the agent's native command, including
 OMP's follow-up action. Modified Tab/Page keys
-also stay with the terminal or agent. In OMP, `Ctrl-D` exits normal chat and
-`Ctrl-C` exits first-run setup; detaching CLI Lane keeps OMP running.
+also stay with the terminal or agent. In current OMP, `Ctrl-D` exits when the editor
+is empty; with a draft it deletes forward. `Ctrl-C` leaves first-run setup and
+enters chat. Leaving CliLane keeps OMP running.
 
 | Key | Behavior |
 | --- | --- |
 | `Ctrl-B` | Open Sessions immediately from an agent. |
 | Select Help, then `Enter` | Open scrollable keyboard help. `F1` also opens help in Sessions. |
-| Select Detach, then `Enter` | Detach; jobs keep running. Drafts require confirmation before discarding. |
+| Select Leave CliLane, then `Enter` | Leave; jobs keep running. Drafts require confirmation before discarding. |
 | `Tab` / `Shift-Tab` | Choose the next / previous agent and select New session. |
-| `Up` / `Down` | Select a running or finished job, New session, Help, or Detach. |
-| `Enter` | Open the selected job, including a finished pane. On New session, open the chosen agent; a typed first message starts and submits it for Codex, Kimi, Claude, or OMP. In a live preview, send the typed reply. |
+| `Up` / `Down` | Select a running or finished job, New session, Help, or Leave CliLane. |
+| `Enter` | Open the selected job, including a finished pane. On New session, open the chosen agent; a typed first message starts and submits it for Codex, Kimi, Claude, OMP, or supported Kiro chat commands. In a live preview, send the typed reply. |
 | `Space` | With an empty composer, preview the selected job. Type in a live preview to reply to that job. `Space` again closes an empty preview. |
 | `Ctrl-R` | Explicitly resume or rerun the selected finished job using the action shown. See resume behavior below. The previous log becomes the new job's `.previous` log until it rotates. |
 | `Ctrl-X` | Ask to stop a running job or remove a finished one. `Enter` confirms; `Esc` cancels. The confirmation has no timer. |
-| `Esc` / `Ctrl-C` in Sessions | Close help or a preview, otherwise return to the source job or leave Sessions. Drafts are preserved until detach; leaving asks before discarding them. Replies stay with their own job when selection changes. |
-| `Ctrl-Q` in Sessions | Detach, keeping jobs running. If drafts exist, `Enter` confirms discarding them and `Esc` cancels. |
+| `Esc` / `Ctrl-C` in Sessions | Close help or a preview, otherwise return to the source job or leave Sessions. Drafts are preserved until you leave CliLane; leaving asks before discarding them. Replies stay with their own job when selection changes. |
+| `Ctrl-Q` in Sessions | Leave CliLane, keeping jobs running. If drafts exist, `Enter` confirms discarding them and `Esc` cancels. |
 | `Left` / `Right` | Move the composer cursor. With an empty composer, `Right` opens the selected pane or New session. |
 | `Ctrl-A` / `Ctrl-E`, `Home` / `End` | Move to the beginning / end of the composer. |
 | `Ctrl-Left` / `Ctrl-Right`, `Option-Left` / `Option-Right` | Move by word when the terminal forwards these keys. Option-b/f also work when Option sends Meta. |
 | `Ctrl-W` / `Option-Delete` | Erase the previous word. |
 | `Delete` (PC) / `Fn-Delete` (Mac) | Delete the next character. |
-| `Ctrl-D` in Sessions | Delete the next character; with an empty composer, request detach. |
+| `Ctrl-D` in Sessions | Delete the next character; with an empty composer, request to leave CliLane. |
 | `Ctrl-K`, `Ctrl-U`, `Ctrl-Y` | Erase to the end, clear the draft, or paste the last cut text. |
-| `Left` / `Right` in an agent | At an empty Claude, Codex, or Kimi prompt, switch running sessions. Drafts and copy mode retain ordinary arrows. For OMP, Kiro, and other agents, use `Ctrl-B` and choose a session. |
+| `Left` / `Right` in an agent | At a recognized empty Claude, Codex, Kimi, OMP, or Kiro prompt, switch running sessions. Drafts, native menus, and copy mode retain ordinary arrows. If a prompt layout is not recognized, use `Ctrl-B` or click Back to sessions. |
 
 Drafts are temporary and belong to the attached client. Reopening Sessions restores
-them; detaching discards them. Once Sessions is visible, pressing `Ctrl-B` again
-returns and sends a literal Control-B to the source agent. Use `Esc` to return
+them; leaving CliLane discards them after confirmation. Once Sessions is visible,
+pressing `Ctrl-B` again returns and sends a literal Control-B to the source agent. Use `Esc` to return
 without sending a key.
 Inside an outer tmux with its default prefix, press `Ctrl-B` twice to
 reach CLI Lane's Sessions; the first prefix is handled by the outer tmux.
+
+OMP and Kiro arrow navigation is enabled only for recognized empty-editor layouts.
+It was checked with OMP 18.16.0 and Kiro 3.1.0’s V2 and V3 interfaces on macOS.
+Kiro checks used its built-in mock responses; they do not verify account sign-in
+or production model calls. A changed layout or theme keeps arrows inside the agent.
+
+Kiro’s first message waits for a recognized empty chat editor, then pastes and
+submits once. Setup and sign-in screens keep the draft unsent. Standard chat
+commands and supported model/agent options accept this flow; resume, headless,
+pre-filled, and unrecognized command variants keep first-message entry inside Kiro.
 
 Tracked Claude jobs resume the conversation recorded at a clean native exit, using
 the original profile and launch environment. If that exit record is missing or
@@ -348,9 +360,9 @@ tasks on the current host and tmux socket. CLI Lane does not import unrelated
 processes or historical conversations from an agent's own session store.
 
 Selecting New session and pressing `Enter` with an empty composer opens any
-configured agent. Codex, Kimi, Claude, and OMP also accept a first message in the
-switcher; typing selects New session, and `Enter` starts the agent and delivers
-the message. For Kiro and the other native-launch tools, type inside the agent.
+configured agent. Codex, Kimi, Claude, OMP, and supported Kiro chat commands also
+accept a first message in the switcher; typing selects New session, and `Enter` starts the agent and delivers
+the message. For the other native-launch tools, type inside the agent.
 The message is not stored in the command arguments or task metadata. It can still
 appear in the terminal log, just as if you had typed it directly into the agent.
 

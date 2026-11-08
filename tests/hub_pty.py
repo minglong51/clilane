@@ -868,7 +868,7 @@ def _exercise_switcher_keys(environment: dict[str, str]) -> None:
             terminal.expect(expected, mark)
         mark = terminal.mark()
         terminal.send(b"\x03")
-        terminal.expect("Detach and discard drafts?", mark)
+        terminal.expect("Leave and discard drafts?", mark)
         mark = terminal.mark()
         terminal.send(b"\x1b\x1bOP")
         terminal.expect("KEYBOARD HELP", mark)
@@ -911,7 +911,7 @@ def _exercise_switcher_keys(environment: dict[str, str]) -> None:
         terminal.expect("keep this draft", mark)
         mark = terminal.mark()
         terminal.send(b"\x11")
-        terminal.expect("Detach and discard drafts?", mark)
+        terminal.expect("Leave and discard drafts?", mark)
         time.sleep(2.5)
         terminal.send(b"\r")
         assert terminal.wait() == 0
@@ -1291,7 +1291,7 @@ def _exercise_keyboard_portability(environment: dict[str, str], root: Path) -> N
         terminal.expect("This clilane server", mark)
         mark = terminal.mark()
         terminal.send(b"\x1b[B\r")
-        terminal.expect("Detach and discard drafts?", mark)
+        terminal.expect("Leave and discard drafts?", mark)
         terminal.resize(20, 4)
         mark = terminal.mark()
         terminal.send(b"\x11")
@@ -1306,7 +1306,7 @@ def _exercise_keyboard_portability(environment: dict[str, str], root: Path) -> N
         _wait_for_attached_task(environment, terminal, "portable-other")
         terminal.resize(20, 4)
         terminal.send(b"\x02")
-        terminal.expect("Ctrl-Q detach")
+        terminal.expect("Ctrl-Q leave")
         terminal.send(b"\x11")
         assert terminal.wait() == 0
         terminal.close()
@@ -1315,7 +1315,7 @@ def _exercise_keyboard_portability(environment: dict[str, str], root: Path) -> N
         _wait_for_attached_task(environment, terminal, "portable-other")
         terminal.send(b"\x02")
         terminal.expect("This clilane server")
-        for label, expected in (("?  Help", "KEYBOARD HELP"), ("Detach ·", None)):
+        for label, expected in (("?  Help", "KEYBOARD HELP"), ("Leave CliLane ·", None)):
             session = _client_sessions(environment)[0]
             frame = _tmux(environment, ["capture-pane", "-p", "-t", session]).stdout.decode().splitlines()
             row = next(index + 1 for index, line in enumerate(frame) if label in line)
@@ -1335,6 +1335,153 @@ def _exercise_keyboard_portability(environment: dict[str, str], root: Path) -> N
         if terminal is not None:
             terminal.close()
         _cleanup(environment)
+
+
+def _exercise_agent_ux(environment: dict[str, str], root: Path) -> None:
+    tool_dir = root / "agent-ux-tools"
+    tool_dir.mkdir(mode=0o700)
+    agent = tool_dir / "kiro-cli"
+    received = tool_dir / "argv.json"
+    submitted = tool_dir / "submitted.json"
+    blocked = tool_dir / "blocked"
+    unexpected = tool_dir / "unexpected-input"
+    agent.write_text(
+        f"#!{sys.executable}\nimport json,os,select,signal,sys,tty\n"
+        f"open({str(received)!r},'w').write(json.dumps(sys.argv[1:]))\n"
+        "tty.setraw(0)\npasted=False\n"
+        f"while os.path.exists({str(blocked)!r}):\n"
+        " ready,_,_=select.select([0],[],[],0.05)\n"
+        f" if ready: open({str(unexpected)!r},'ab').write(os.read(0,1024))\n"
+        "def draw(*_):\n"
+        " if pasted: return\n"
+        " screen='\\x1b[0m\\x1b[H\\x1b[2J'+'─'*os.get_terminal_size().columns\n"
+        " screen+='\\r\\nkiro_default · model · ◔ 3%\\r\\n\\r\\n'\n"
+        " screen+='›  \\x1b[38;5;247mask a question or describe a task ↵\\r\\n'\n"
+        " screen+='/copy to clipboard\\x1b[0m\\x1b[4;3H\\x1b[?25h\\x1b[?2004h'\n"
+        " os.write(1,screen.encode())\n"
+        "signal.signal(signal.SIGWINCH,draw)\ndraw()\n"
+        "data=b''\n"
+        "while not data.endswith(b'\\x1b[201~'): data+=os.read(0,1)\n"
+        "assert data.startswith(b'\\x1b[200~')\npasted=True\n"
+        "prompt=data[6:-6].decode().replace('\\r','\\n')\n"
+        "os.write(1,('\\x1b[0m\\x1b[H\\x1b[2J› '+prompt.replace('\\n','\\r\\n')).encode())\n"
+        "count=0\n"
+        "while True:\n"
+        " key=os.read(0,1)\n"
+        " if key==b'\\r':\n"
+        "  count+=1\n"
+        f"  open({str(submitted)!r},'w').write(json.dumps({{'prompt':prompt,'count':count}}))\n"
+        "  os.write(1,b'\\r\\nAGENT-UX-SUBMITTED')\n"
+    )
+    agent.chmod(0o700)
+    command = [str(agent), "chat", "--model", "auto"]
+    config = tool_dir / "hub.json"
+    config.write_text(json.dumps({"schema_version": 1, "agents": [
+        {"name": "kiro-cli", "command": command, "dir": str(tool_dir)}
+    ]}))
+    terminal: _Terminal | None = None
+    try:
+        blocked.touch()
+        terminal = _Terminal(["hub", "--config", str(config)], environment)
+        terminal.expect("This clilane server")
+        terminal.send(b"keep this draft\r")
+        deadline = time.monotonic() + 5
+        while not received.exists():
+            assert time.monotonic() < deadline, "blocked launch did not start"
+            terminal.settle(quiet=0.05, timeout=0.1)
+        terminal.settle(quiet=0.3, timeout=0.5)
+        assert not unexpected.exists(), "initial message reached an unrecognized editor"
+        mark = terminal.mark()
+        terminal.send(b"\x03")
+        terminal.expect("Launch cancelled", mark)
+        terminal.expect("keep this draft", mark)
+        assert not unexpected.exists() and not submitted.exists()
+        assert all(task["state"] != "running" for task in _tasks(environment))
+        for task in _tasks(environment):
+            _run(environment, ["rm", task["id"]])
+        blocked.unlink()
+        received.unlink()
+        terminal.send(b"\x15")
+        prompt = '--literal "quoted" $value `text`\nsecond line'
+        terminal.send(b"\x1b[200~" + prompt.encode() + b"\x1b[201~\r")
+        terminal.expect("AGENT-UX-SUBMITTED")
+        assert json.loads(received.read_text()) == command[1:]
+        assert json.loads(submitted.read_text()) == {"prompt": prompt, "count": 1}
+        task = _tasks(environment)[0]
+        assert task["command"] == command
+        assert prompt not in json.dumps(task)
+        pane = _tmux(environment, ["list-panes", "-a", "-F", "#{pane_id}|#{@agt_ready}"]).stdout.decode()
+        target = next(line.split("|")[0] for line in pane.splitlines() if line.endswith("|" + task["id"]))
+        launched = _tmux(environment, ["display-message", "-p", "-t", target, "#{pane_start_command}"]).stdout.decode()
+        assert prompt not in launched
+        mark = terminal.mark()
+        terminal.send(b"\x02")
+        terminal.expect("Leave CliLane", mark)
+        terminal.send(b"\x11")
+        assert terminal.wait() == 0
+        terminal.close()
+        terminal = None
+        _run(environment, ["stop", task["id"], "--grace", "0"])
+        received.unlink()
+        submitted.unlink()
+        _run(environment, ["run", "fresh-start", "--", *command])
+        deadline = time.monotonic() + 5
+        while not received.exists():
+            assert time.monotonic() < deadline, "fresh launch did not start"
+            time.sleep(0.05)
+        assert json.loads(received.read_text()) == command[1:]
+        time.sleep(0.3)
+        assert not submitted.exists(), "initial question was replayed on a fresh launch"
+    finally:
+        if terminal is not None:
+            terminal.close()
+        _cleanup(environment)
+
+    cases = json.loads((ROOT / "tests/fixtures/navigation/native-prompts.json").read_text())
+    for case in cases:
+        if case["state"] not in {"empty", "startup", "model-picker", "multiline"}:
+            continue
+        for hidden in ([False, True] if case["expected"] else [False]):
+            frame = tool_dir / "frame.json"
+            keys = tool_dir / "keys"
+            keys.write_bytes(b"")
+            frame.write_text(json.dumps(case))
+            agent = tool_dir / case["agent"]
+            cursor_sequence = "\x1b[?25l" if hidden else "\x1b[?25h"
+            agent.write_text(
+                f"#!{sys.executable}\nimport json,os,signal,tty\ntty.setraw(0)\n"
+                f"v=json.load(open({str(frame)!r}))\n"
+                "screen='\\x1b[0m\\x1b[H\\x1b[2J'+'\\r\\n'.join(v['rows'])\n"
+                "screen+=f\"\\x1b[{v['row']+1};{v['cursor']+1}H\"\n"
+                f"screen+={cursor_sequence!r}\n"
+                "signal.signal(signal.SIGWINCH,lambda *_: os.write(1,screen.encode()))\n"
+                "os.write(1,screen.encode())\n"
+                f"with open({str(keys)!r},'ab',buffering=0) as out:\n"
+                " while True: out.write(os.read(0,1024))\n"
+            )
+            agent.chmod(0o700)
+            terminal = None
+            try:
+                _run(environment, ["run", "arrow-source", "--", str(agent)])
+                _run(environment, ["run", "arrow-target", "--", "/bin/cat"])
+                terminal = _Terminal(["attach", "arrow-source"], environment)
+                _wait_for_attached_task(environment, terminal, "arrow-source")
+                terminal.settle(quiet=0.3, timeout=1)
+                terminal.send(b"\x1b[D")
+                if case["expected"] and not hidden:
+                    _wait_for_attached_task(environment, terminal, "arrow-target")
+                    assert not keys.read_bytes()
+                else:
+                    deadline = time.monotonic() + 5
+                    while not keys.read_bytes():
+                        assert time.monotonic() < deadline, (case["agent"], case["state"], hidden)
+                        terminal.settle(quiet=0.05, timeout=0.1)
+                    assert keys.read_bytes() == b"\x1b[D"
+                    _wait_for_attached_task(environment, terminal, "arrow-source")
+            finally:
+                if terminal is not None:
+                    terminal.close()
+                _cleanup(environment)
 
 
 def _exercise_terminfo(environment: dict[str, str], terminfo_dir: Path) -> None:
@@ -1458,6 +1605,7 @@ def main() -> int:
         keys_environment["CLILANE_TMUX_SOCKET"] = f"clp-keys-{os.getpid()}"
         _exercise_switcher_keys(keys_environment)
         _exercise_keyboard_portability(keys_environment, root)
+        _exercise_agent_ux(keys_environment, root)
         actions_environment = dict(environment)
         actions_state = root / "actions-state"
         actions_state.mkdir(mode=0o700)
