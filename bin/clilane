@@ -28,7 +28,7 @@ import tty
 import unicodedata
 import uuid
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO, Callable, Iterator, Mapping, Sequence
@@ -78,6 +78,11 @@ HUB_KEY_HELP = (
     "Up/Down choose; Enter opens.",
     "Esc goes back; drafts stay.",
     "Help and Leave CliLane are menu choices.",
+    "Shell opens a terminal in this project.",
+    "Titles follow the agent's native title.",
+    "clilane rename TARGET TITLE overrides it.",
+    "Open means the process is alive.",
+    "* marks activity observed on screen.",
     "",
     "In Sessions:",
     " Up/Down  select job or action",
@@ -349,6 +354,9 @@ class Task:
     attached: bool
     origin: str
     binding: dict[str, object] | None = None
+    display_title: str = ""
+    display_state: str = ""
+    display_session: str = ""
 
     @property
     def state(self) -> str:
@@ -4405,34 +4413,142 @@ def bind_hub_keys() -> None:
     tmux(["set-option", "-gu", "@agt_hub_config"], check=False)
 
 
+def hub_display_text(value: str, limit: int = 64) -> str:
+    value = re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))", "", value)
+    value = " ".join(fleet_display_cell(value).split())
+    value = re.sub(r"(?i)\b([\w]*(?:TOKEN|KEY|SECRET)|AWS_\w+|OAuth\w*)\s*[=:]\s*\S+", r"\1=[redacted]", value)
+    return fleet_display_cell(value, limit)
+
+
+def hub_task_title(task: Task) -> str:
+    return task.display_title or task.name
+
+
+def hub_task_state(task: Task) -> str:
+    return task.display_state or ("open" if task.state == TASK_STATE_RUNNING else task.state)
+
+
+def hub_is_shell(task: Task) -> bool:
+    return bool(task.command) and Path(task.command[0]).name in {
+        "sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh",
+    } and all(argument in {
+        "-l", "--login", "-i", "--interactive", "-il", "-li", "--noprofile", "--norc", "-f",
+    } for argument in task.command[1:])
+
+
+def hub_observed_activity(task: Task, cursor: str) -> str:
+    if task.dead or not task.command or Path(task.command[0]).name != "codex":
+        return ""
+    if not cursor.isdecimal():
+        return ""
+    try:
+        captured = tmux(["capture-pane", "-p", "-t", task.pane, "-S", "0"], check=False, timeout=1)
+    except CliLaneError:
+        return ""
+    if captured.returncode:
+        return ""
+    rows = captured.stdout.decode(errors="replace").splitlines()
+    row = int(cursor)
+    if row >= len(rows):
+        return ""
+    footer = "\n".join(rows[max(0, row - 3):]).lower()
+    if "esc to interrupt" in footer:
+        return "working*"
+    if "esc to cancel" in footer and "enter to confirm" in footer:
+        return "approval*"
+    if rows[row].lstrip().startswith("›") and "? for shortcuts" in footer:
+        return "ready*"
+    return ""
+
+
+def hub_display_tasks(tasks: Sequence[Task], *, observe: bool | str = False) -> list[Task]:
+    if not tasks:
+        return []
+    fields = ["#{pane_id}", "#{session_id}"] + [
+        "#{s|[\x01-\x1f\x7f]| |:" + value + "}"
+        for value in ("pane_title", "@agt_display_title", "@agt_prompt_title", "pane_current_path")
+    ] + ["#{cursor_y}"]
+    result = tmux(["list-panes", "-a", "-F", "\x1f".join(fields)], check=False)
+    details = {}
+    for line in result.stdout.decode(errors="replace").split("\n"):
+        values = line.split("\x1f")
+        if len(values) == len(fields) and re.fullmatch(r"%[0-9]+", values[0]):
+            details[values[0]] = values[1:]
+    displayed = []
+    for task in tasks:
+        values = details.get(task.pane, ["", "", "", "", "", ""])
+        session_id, native, manual, initial, current_cwd, cursor = values
+        executable = Path(task.command[0]).name if task.command else ""
+        project = Path(task.cwd).name or task.cwd
+        native = re.sub(r"^[\u2800-\u28ff◐◓◑◒✳✻✽✶✢·•●○]+\s+", "", native)
+        native = re.sub(r"^\[[^\]]{1,8}\]\s*(?:Action Required|Working|Ready|Idle|Done)\s*\|\s*", "", native)
+        suffix = " | " + project
+        if native.endswith(suffix):
+            native = native[:-len(suffix)]
+        native = hub_display_text(native)
+        known_agent = executable in {*HUB_PROMPT_AGENT_ORDER, *HUB_NATIVE_AGENT_COMMANDS, "kiro-cli"}
+        if not known_agent or native.casefold() in {
+            executable.casefold(), "codex", "claude code", "kimi", "kimi code", "oh my pi",
+            project.casefold(), f"π > {project}".casefold(),
+        } or native == os.uname().nodename:
+            native = ""
+        title = hub_display_text(manual) or native or hub_display_text(initial)
+        if not title and hub_is_shell(task):
+            title = "Shell · " + (Path(current_cwd or task.cwd).name or "/")
+        activity = hub_observed_activity(task, cursor) if observe is True or observe == task.session else ""
+        displayed.append(replace(
+            task, display_title=title or task.name, display_state=activity,
+            display_session=session_id if re.fullmatch(r"\$[0-9]+", session_id) else "",
+        ))
+    return displayed
+
+
+def set_hub_title(task: Task, title: str, *, initial: bool = False) -> None:
+    title = hub_display_text(title)
+    tmux(["set-option", "-p", "-t", task.pane,
+          "@agt_prompt_title" if initial else "@agt_display_title", title])
+
+
+def hub_navigation_status(source: str, columns: str) -> int:
+    if not columns.isdecimal() or not source.startswith((SESSION_PREFIX, HUB_SESSION)):
+        return 1
+    width = int(columns)
+    tasks = hub_display_tasks(list_tasks(), observe=source)
+    visible = [task for task in tasks if task.committed and (not task.dead or task.session == source)]
+    labels = {task.id: fleet_display_cell(hub_task_title(task), 28) for task in visible}
+    back = "‹ Back to sessions [Ctrl-B]" if width >= 64 else "‹ Back [Ctrl-B]"
+    status = "#[align=left range=left bold] " + back + " #[norange nobold] "
+    status += "#[list=on]#[list=left-marker range=user|previous]‹ #[list=right-marker range=user|next] ›#[norange list=on]"
+    for task in visible:
+        if not task.display_session:
+            continue
+        title = labels[task.id].replace("#", "##")
+        duplicate = sum(label == labels[task.id] for label in labels.values()) > 1
+        if duplicate:
+            title += " · " + task.id[:4]
+        selected = task.session == source
+        if selected and width >= 60:
+            title = ("BOT" if task.origin == "bot" else "LOCAL") + " · " + title
+        elif task.origin == "bot":
+            title += " · bot"
+        style = " list=focus bold reverse" if selected else ""
+        status += f"#[range=session|{task.display_session}{style}] {title}"
+        if selected and task.dead:
+            status += " · " + task.state
+        status += " #[norange nobold noreverse list=on] "
+    status += "#[nolist align=right]"
+    current = next((task for task in tasks if task.session == source), None)
+    if current is not None and width >= 95:
+        provider = Path(current.command[0]).name if current.command else ""
+        status += hub_display_text(f"{provider} · {hub_task_state(current)}", 32).replace("#", "##") + " "
+    status += "#[range=user|previous] ‹ #[range=user|next] › #[norange]"
+    print(status)
+    return 0
+
+
 def configure_hub_navigation() -> None:
-    label = "#{=24:window_name}#{?#{OPENCLAW_SESSION}, · bot,}"
-    tab = "#[range=session|#{session_id}] " + label + " #[norange] "
-    current_tab = (
-        "#[range=session|#{session_id} list=focus bold reverse] "
-        "#{?#{e|>=:#{client_width},60},#{?#{OPENCLAW_SESSION},BOT,LOCAL} · ,}"
-        "#{=24:window_name}"
-        "#{?pane_dead, · finished,}"
-        " #[norange nobold noreverse list=on] "
-    )
-    session_tabs = (
-        "#{S/i:#{?#{&&:#{@agt_committed},#{?pane_dead,0,1}},"
-        + tab
-        + ",},#{?#{@agt_meta},"
-        + current_tab
-        + ",}}"
-    )
-    status = (
-        "#[align=left range=left bold] "
-        "#{?#{e|>=:#{client_width},64},‹ Back to sessions [Ctrl-B],‹ Back [Ctrl-B]} "
-        "#[norange nobold] "
-        "#[list=on]#[list=left-marker range=user|previous]‹ "
-        "#[list=right-marker range=user|next] ›#[norange list=on]"
-        + session_tabs
-        + "#[nolist align=right]"
-        "#{?#{e|>=:#{client_width},95},#{E:status-right},}"
-        "#[range=user|previous] ‹ #[range=user|next] › #[norange]"
-    )
+    status_command = hub_helper_prefix("__hub-status") + "#{q:session_name} '#{client_width}'"
+    status = "#(" + status_command + ")"
     tmux(["set-option", "-g", "status", "on"])
     tmux(["set-option", "-g", "status-position", "top"])
     tmux(["set-option", "-g", "status-style", "fg=default,bg=default"])
@@ -5501,7 +5617,35 @@ def launch_hub_preset(
     hub_launch_created(task)
     if prompt:
         send_hub_prompt(selected, task, prompt)
+        set_hub_title(task, prompt, initial=True)
     return task
+
+
+def launch_hub_shell(context: str, directory: str) -> Task:
+    environment = hub_launch_environment(context)
+    shell = environment.get("SHELL") or pwd.getpwuid(os.getuid()).pw_shell or "/bin/sh"
+    if not Path(shell).is_absolute() or not os.access(shell, os.X_OK):
+        raise CliLaneError("the login shell is unavailable")
+    preset = {"name": "shell", "dir": directory}
+    spec = complete_launch_spec(
+        name=hub_task_name(preset, list_tasks()), cwd_value=directory,
+        command=[shell, "-l"], wait=False, timeout=None, on_exit=None,
+        environment=legacy_launch_environment(environment), profile=None, provider=None,
+    )
+    task = run_task(spec)
+    hub_launch_created(task)
+    return task
+
+
+def hub_project_shell(tasks: Sequence[Task], directory: str) -> Task | None:
+    for task in tasks:
+        if task.dead or not task.committed or not hub_is_shell(task):
+            continue
+        current = tmux(["display-message", "-p", "-t", task.pane, "#{pane_current_path}"], check=False)
+        current_directory = current.stdout.decode(errors="replace").strip()
+        if current.returncode == 0 and current_directory and Path(current_directory) == Path(directory):
+            return task
+    return None
 
 
 def hub_command_kind(command: Sequence[str]) -> str | None:
@@ -5817,6 +5961,11 @@ def resume_hub_task(
             profile=profile_name,
             provider=provider,
         )
+    manual_title = tmux(["show-options", "-pqv", "-t", task.pane, "@agt_display_title"], check=False).stdout.decode().strip()
+    prompt_title = (
+        tmux(["show-options", "-pqv", "-t", task.pane, "@agt_prompt_title"], check=False).stdout.decode().strip()
+        if task.binding is not None else ""
+    )
     old_log = validated_log_path(task)
     carried: Path | None = None
     if old_log.exists():
@@ -5840,6 +5989,10 @@ def resume_hub_task(
     if carried is not None:
         new_log = validated_log_path(resumed)
         os.replace(carried, new_log.with_suffix(new_log.suffix + ".previous"))
+    if manual_title:
+        set_hub_title(resumed, manual_title)
+    if prompt_title:
+        set_hub_title(resumed, prompt_title, initial=True)
     hub_launch_created(resumed)
     return resumed
 
@@ -6027,8 +6180,8 @@ def hub_peek_lines(task: Task) -> list[str]:
 
 def hub_peek_title(task: Task) -> str:
     if task.dead:
-        return f"{task.name} · {task.state} · last output"
-    return f"{task.name} · {task.state} · latest output"
+        return f"{hub_task_title(task)} · {hub_task_state(task)} · last output"
+    return f"{hub_task_title(task)} · {hub_task_state(task)} · latest output"
 
 
 def hub_task_line(task: Task, width: int = 80) -> str:
@@ -6043,12 +6196,14 @@ def hub_task_line(task: Task, width: int = 80) -> str:
     agent = Path(task.command[0]).name if task.command else "-"
     project = Path(task.cwd).name or task.cwd
     source = "BOT" if task.origin == "bot" else "LOCAL"
-    attached = " open" if task.attached else ""
+    attached = " attached" if task.attached else ""
     if width < 80:
-        return f"{marker} {task.state:<9} {task.name} · {agent}"
+        return f"{marker} {hub_task_state(task):<9} {hub_task_title(task)} · {agent}"
+    title_width = max(22, width - 55)
+    title = fleet_display_cell(hub_task_title(task), title_width)
     return (
-        f"{marker}  {task.name:<22.22} {agent:<12.12} "
-        f"{task.state:<12.12} {age(task.created):>4}  {source:<5} {project}{attached}"
+        f"{marker}  {title}{' ' * max(0, title_width - display_width(title))} {agent:<12.12} "
+        f"{hub_task_state(task):<12.12} {age(task.created):>4}  {source:<5} {project}{attached}"
     )
 
 
@@ -6062,7 +6217,7 @@ def hub_composer_line(
     label_width = max(1, min(width - 8, width // 2))
     if reply_to is not None:
         label = "draft" if reply_to.dead else "reply"
-        agent = fleet_display_cell(f"{label} · {reply_to.name}", label_width)
+        agent = fleet_display_cell(f"{label} · {hub_task_title(reply_to)}", label_width)
     elif preset:
         project = Path(str(preset["dir"])).name or str(preset["dir"])
         agent = fleet_display_cell(
@@ -6183,7 +6338,8 @@ def hub_draw(
     rows.append(("+  New session", len(tasks), ""))
     rows.append(("?  Help", len(tasks) + 1, ""))
     rows.append(("   Leave CliLane · jobs keep running", len(tasks) + 2, ""))
-    selected = max(0, min(selected, len(tasks) + 2))
+    rows.append((">_ Shell", len(tasks) + 3, ""))
+    selected = max(0, min(selected, len(tasks) + 3))
     selected_row = next(
         (position for position, (_, index, _) in enumerate(rows) if index == selected),
         len(rows) - 1,
@@ -6216,7 +6372,7 @@ def hub_draw(
             width,
         ),
         fleet_display_cell(
-            f"   {'JOB':<22} {'AGENT':<12} {'STATE':<12} "
+            f"   {'SESSION':<{max(22, width - 55)}} {'AGENT':<12} {'STATE':<12} "
             f"{'AGE':>4}  {'ORIGIN':<6} PROJECT",
             width,
         ),
@@ -6258,7 +6414,9 @@ def hub_draw(
         hints = ["Enter open · Space preview · " + action, "Esc back · Help and Leave below"]
     elif selected > len(tasks):
         hints = [
-            "Enter opens keyboard help" if selected == len(tasks) + 1 else "Enter leaves CliLane; jobs keep running",
+            "Enter opens a shell in this project; drafts stay" if selected == len(tasks) + 3
+            else "Enter opens keyboard help" if selected == len(tasks) + 1
+            else "Enter leaves CliLane; jobs keep running",
             "Up/Down choose · Esc back",
         ]
     else:
@@ -6298,7 +6456,8 @@ def hub_draw(
         hints = ["Enter confirm", "Esc cancel"]
     lines.extend(
         [
-            hub_composer_line(preset, prompt, cursor, width, reply_to),
+            ("Draft kept for New session" if prompt else "Shell · current project")
+            if selected == len(tasks) + 3 else hub_composer_line(preset, prompt, cursor, width, reply_to),
             fleet_display_cell(hints[0], width),
             fleet_display_cell(hints[1], width),
         ]
@@ -6482,11 +6641,11 @@ def hub_ui(
                 client, client_pid, context, popup_value
             )):
                 return 0
-            all_tasks = hub_task_order(list_tasks())
+            all_tasks = hub_task_order(hub_display_tasks(list_tasks(), observe=True))
             ongoing_count = sum(1 for task in all_tasks if not task.dead)
             hidden_history = max(0, len(all_tasks) - ongoing_count - history_limit)
             tasks = all_tasks[: len(all_tasks) - hidden_history]
-            item_keys = [task.id for task in tasks] + ["", "help", "detach"]
+            item_keys = [task.id for task in tasks] + ["", "help", "detach", "shell"]
             if selected_key not in item_keys:
                 selected_key = ""
             selected = item_keys.index(selected_key)
@@ -6614,6 +6773,22 @@ def hub_ui(
                     help_offset = 0
                     continue
                 key = "quit"
+            if key in {"enter", "open", "right"} and selected_key == "shell":
+                if not save_drafts():
+                    continue
+                shell = hub_project_shell(all_tasks, discovery_directory)
+                if shell is not None:
+                    switch_hub_popup(client, client_pid, context, popup_value, shell.session)
+                    return 0
+                redraw("Opening shell… · Ctrl-C cancel")
+                alive, error = hub_claimed_launch(
+                    client, client_pid, context, popup_value,
+                    lambda: launch_hub_shell(context, discovery_directory),
+                )
+                if not alive or error is None:
+                    return 0
+                notice = error
+                continue
             if key == "eof":
                 key = "delete" if prompt else "quit"
             if key == "escape":
@@ -7500,6 +7675,10 @@ Esc goes back and keeps drafts until you leave CliLane. Ctrl-U clears; Ctrl-Y re
 Ctrl-A/E or Home/End moves to the start/end; Ctrl-W erases the previous word.
 Ctrl-X asks before stopping/removing a job; Enter confirms and Esc cancels.
 Ctrl-Q leaves CliLane; if drafts exist, confirm discarding them. Jobs keep running.
+Select Shell to open or reuse a terminal in the current project; drafts stay.
+Titles follow the native agent title, then the first message submitted here.
+Use clilane rename TARGET TITLE to override a display title; omit TITLE to reset.
+Open means process alive. A * marks activity observed on the native screen.
 
 Without hub.json, Sessions discovers installed Codex, Kimi, Claude, OMP,
 Kiro CLI, Gemini, OpenCode, Copilot, Aider, Amp, Goose, Pi, Cursor Agent,
@@ -7591,6 +7770,10 @@ commands also accept a first message in the Sessions composer.""",
 
     attach = commands.add_parser("attach", help="attach to a task interactively")
     attach.add_argument("target", help="task name or ID prefix; click Back to sessions for the list")
+
+    rename = commands.add_parser("rename", help="set a display title without changing the task name")
+    rename.add_argument("target", help="task name or ID prefix")
+    rename.add_argument("title", nargs="*", help="display title; omit to follow the native title again")
 
     hub = commands.add_parser("hub", help="open the native session switcher")
     hub.add_argument(
@@ -7745,6 +7928,11 @@ def execute(arguments: argparse.Namespace) -> int:
         return 0
     if arguments.action == "attach":
         return attach_task(resolve_task(arguments.target))
+    if arguments.action == "rename":
+        task = resolve_task(arguments.target)
+        set_hub_title(task, " ".join(arguments.title))
+        print(f"updated display title for {task.name}")
+        return 0
     if arguments.action == "hub":
         return hub_command(arguments.config)
     if arguments.action == "read":
@@ -7786,6 +7974,9 @@ def execute(arguments: argparse.Namespace) -> int:
 
 def main() -> int:
     try:
+        if len(sys.argv) == 6 and sys.argv[1] == "__hub-status":
+            configure_tmux_control(sys.argv[2], sys.argv[3])
+            return hub_navigation_status(sys.argv[4], sys.argv[5])
         if len(sys.argv) == 7 and sys.argv[1] == "__claude-event":
             configure_tmux_control(sys.argv[2], sys.argv[3])
             return claude_event(sys.argv[4], sys.argv[5], sys.argv[6])
