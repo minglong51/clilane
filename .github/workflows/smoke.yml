@@ -117,6 +117,9 @@ jobs:
       - name: Exercise release workflow contract
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v tests.test_release
 
+      - name: Exercise job history and launch retry reliability
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v tests.test_job_reliability
+
       - name: Exercise provider evidence contracts
         run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v tests.test_provider_evidence
 

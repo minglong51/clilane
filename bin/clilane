@@ -300,6 +300,13 @@ class CliLaneError(Exception):
     pass
 
 
+class LaunchRequestError(CliLaneError):
+    def __init__(self, code: str, message: str, task_id: str | None = None) -> None:
+        self.code = code
+        self.task_id = task_id
+        super().__init__(f"{message} (original job {task_id})" if task_id else message)
+
+
 class HubLaunchCancelled(CliLaneError):
     pass
 
@@ -358,12 +365,14 @@ class Task:
     display_title: str = ""
     display_state: str = ""
     display_session: str = ""
+    observed_program: str = ""
     archived: bool = False
     result_recorded: bool = False
     terminal_complete: bool = False
     resumed_from: str = ""
     manual_title: str = ""
     prompt_title: str = ""
+    launch_reused: bool = False
 
     @property
     def recovery_receipt(self) -> bool:
@@ -423,6 +432,8 @@ class RunRequest:
     on_exit: str | None
     profile: str | None
     command: tuple[str, ...] | None
+    request_id: str | None = None
+    json: bool = False
 
 
 @dataclass(frozen=True)
@@ -2829,16 +2840,16 @@ def collect_fleet(hosts: Sequence[FleetHost], timeout: float) -> list[FleetResul
     return [results[host.name] for host in hosts]
 
 
-def resolve_task(target: str, *, include_history: bool = False) -> Task:
+def resolve_task(target: str, *, include_history: bool = False, exact_id: bool = False) -> Task:
     tasks = list_tasks()
     archived = [task for task in saved_tasks() if task.id not in {item.id for item in tasks}] if include_history else []
-    exact = [task for task in tasks if target in {task.name, task.id, task.session}]
+    exact = [task for task in tasks if target == task.id or not exact_id and target in {task.name, task.session}]
     exact.extend(task for task in archived if task.id == target)
     if len(exact) == 1:
         return exact[0]
     if len(exact) > 1:
         raise CliLaneError(f"ambiguous task name: {target}")
-    prefixed = [task for task in [*tasks, *archived] if task.id.startswith(target)]
+    prefixed = [] if exact_id else [task for task in [*tasks, *archived] if task.id.startswith(target)]
     if len(prefixed) == 1:
         return prefixed[0]
     if len(prefixed) > 1:
@@ -2917,10 +2928,34 @@ def parse_run_request(parts: Sequence[str]) -> RunRequest:
     timeout: float | None = None
     on_exit: str | None = None
     profile: str | None = None
+    request_id: str | None = None
+    as_json = False
     seen: set[str] = set()
     index = 0
     while index < len(prefix):
         token = prefix[index]
+        if token == "--json":
+            if "json" in seen:
+                raise CliLaneError("--json may be supplied only once")
+            seen.add("json")
+            as_json = True
+            index += 1
+            continue
+        if token == "--request-id" or token.startswith("--request-id="):
+            if "request_id" in seen:
+                raise CliLaneError("--request-id may be supplied only once")
+            seen.add("request_id")
+            if token == "--request-id":
+                if index + 1 >= len(prefix):
+                    raise CliLaneError("--request-id requires a key")
+                request_id = prefix[index + 1]
+                index += 2
+            else:
+                request_id = token.split("=", 1)[1]
+                index += 1
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", request_id) is None:
+                raise CliLaneError("--request-id requires 1–128 letters, digits, or . _ : / -; start with a letter or digit")
+            continue
         if token in {"-C", "--cwd"}:
             if "cwd" in seen:
                 raise CliLaneError("-C/--cwd may be supplied only once")
@@ -3028,6 +3063,8 @@ def parse_run_request(parts: Sequence[str]) -> RunRequest:
         on_exit=on_exit,
         profile=profile,
         command=command,
+        request_id=request_id,
+        json=as_json,
     )
 
 
@@ -3170,6 +3207,94 @@ def resolve_run_request(
         profile=profile.name,
         provider=profile.provider,
     )
+
+
+def launch_request_intent(request: RunRequest, default_cwd: str) -> dict[str, object]:
+    directory = request.cwd if request.cwd_explicit else default_cwd if request.profile is None else None
+    return {
+        "name": request.name, "command": request.command, "profile": request.profile,
+        "cwd": str(Path(directory).expanduser().resolve()) if directory is not None else None,
+        "on_exit": request.on_exit,
+    }
+
+
+@contextmanager
+def launch_request_lock(key: str) -> Iterator[Path]:
+    root = state_root_path() / "requests"
+    missing: list[Path] = []
+    ancestor = root
+    while not ancestor.exists():
+        missing.append(ancestor)
+        ancestor = ancestor.parent
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700, exist_ok=True)
+        sync_directory(directory.parent)
+    os.chmod(root, 0o700)
+    for directory in (root, *root.parents):
+        sync_directory(directory)
+    path = root / f"{hashlib.sha256(key.encode()).hexdigest()}.json"
+    with path.with_suffix(".lock").open("a+b") as handle:
+        os.chmod(handle.name, 0o600)
+        os.fsync(handle.fileno())
+        sync_directory(root)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield path
+
+
+def read_launch_request(path: Path) -> dict[str, object]:
+    try:
+        if path.stat().st_size > 8192:
+            raise ValueError("oversized claim")
+        value = json.loads(
+            path.read_text(encoding="utf-8"), parse_constant=reject_json_constant,
+            parse_int=bounded_json_int, parse_float=finite_json_float,
+        )
+        if not isinstance(value, dict) or set(value) != {"schema_version", "task_id", "fingerprint", "socket", "created"}:
+            raise ValueError("invalid claim")
+        if type(value["schema_version"]) is not int or value["schema_version"] != 1:
+            raise ValueError("unsupported claim schema")
+        if any(not isinstance(value[field], str) for field in ("task_id", "fingerprint", "socket", "created")):
+            raise ValueError("invalid claim fields")
+        if str(uuid.UUID(value["task_id"])) != value["task_id"] or re.fullmatch(r"[0-9a-f]{64}", value["fingerprint"]) is None:
+            raise ValueError("invalid claim identity")
+        return value
+    except (OSError, ValueError, KeyError, RecursionError) as error:
+        raise LaunchRequestError("request_corrupt", "Request record cannot be verified; no replacement was launched") from error
+
+
+def run_requested_task(
+    request: RunRequest, environment: Mapping[str, str], default_cwd: str,
+) -> Task:
+    if request.request_id is None:
+        return run_task(resolve_run_request(request, environment, default_cwd))
+    intent = launch_request_intent(request, default_cwd)
+    fingerprint = selection_digest(intent)
+    with launch_request_lock(request.request_id) as path:
+        if path.exists():
+            claim = read_launch_request(path)
+            original_id = str(claim["task_id"])
+            if claim["socket"] != socket_identity():
+                raise LaunchRequestError("request_socket_conflict", "Request belongs to a different tmux socket selection", original_id)
+            if claim["fingerprint"] != fingerprint:
+                raise LaunchRequestError("request_conflict", "Request ID is already bound to different launch arguments", original_id)
+            try:
+                task = resolve_task(original_id, include_history=True, exact_id=True)
+            except CliLaneError as error:
+                raise LaunchRequestError(
+                    "request_unavailable", "Original job is unavailable or its launch is unconfirmed; inspect before starting new work", original_id,
+                ) from error
+            return replace(task, launch_reused=True)
+        normalized = replace(request, cwd=str(intent["cwd"]), cwd_explicit=True) if intent["cwd"] is not None else request
+        spec = resolve_run_request(normalized, environment, default_cwd)
+        try:
+            return run_task(spec, launch_request=(path, fingerprint))
+        except (CliLaneError, OSError) as error:
+            if path.exists():
+                claim = read_launch_request(path)
+                raise LaunchRequestError(
+                    "launch_unconfirmed", f"Launch was not confirmed: {error}; inspect original job before starting new work", str(claim["task_id"]),
+                ) from error
+            raise
 
 
 def native_process_bytes(value: str, label: str) -> int:
@@ -3521,6 +3646,7 @@ def respawn_task_arguments(
 def run_task(
     spec: LaunchSpec, *, require_claude_tracking: bool = False,
     resume_from: Task | None = None,
+    launch_request: tuple[Path, str] | None = None,
 ) -> Task:
     spec = complete_launch_spec(
         name=spec.name,
@@ -3570,6 +3696,14 @@ def run_task(
         command = list(spec.command)
         task_id = str(uuid.uuid4())
         session = f"{SESSION_PREFIX}{task_id.replace('-', '')[:12]}"
+        if launch_request is not None:
+            path, fingerprint = launch_request
+            if path.exists():
+                raise CliLaneError("launch request was already claimed")
+            atomic_json(path, {
+                "schema_version": 1, "task_id": task_id, "fingerprint": fingerprint,
+                "socket": socket_identity(), "created": datetime.now(timezone.utc).isoformat(),
+            })
         runtime_state_root = state_root()
         log_dir = runtime_state_root / "logs"
         log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -4721,7 +4855,7 @@ def hub_display_tasks(tasks: Sequence[Task], *, observe: bool | str = False) -> 
         return []
     fields = ["#{pane_id}", "#{session_id}"] + [
         "#{s|[\x01-\x1f\x7f]| |:" + value + "}"
-        for value in ("pane_title", "@agt_display_title", "@agt_prompt_title", "pane_current_path")
+        for value in ("pane_title", "@agt_display_title", "@agt_prompt_title", "pane_current_path", "pane_current_command")
     ] + ["#{cursor_y}"]
     result = tmux(["list-panes", "-a", "-F", "\x1f".join(fields)], check=False)
     details = {}
@@ -4734,8 +4868,8 @@ def hub_display_tasks(tasks: Sequence[Task], *, observe: bool | str = False) -> 
         if task.archived:
             displayed.append(task)
             continue
-        values = details.get(task.pane, ["", "", "", "", "", ""])
-        session_id, native, manual, initial, current_cwd, cursor = values
+        values = details.get(task.pane, [""] * 7)
+        session_id, native, manual, initial, current_cwd, foreground, cursor = values
         executable = Path(task.command[0]).name if task.command else ""
         project = Path(task.cwd).name or task.cwd
         native = re.sub(r"^[\u2800-\u28ff◐◓◑◒✳✻✽✶✢·•●○]+\s+", "", native)
@@ -4754,12 +4888,17 @@ def hub_display_tasks(tasks: Sequence[Task], *, observe: bool | str = False) -> 
         if not title and hub_is_shell(task):
             title = "Shell · " + (Path(current_cwd or task.cwd).name or "/")
         activity = hub_observed_activity(task, cursor) if observe is True or observe == task.session else ""
+        program = Path(foreground).name.lower()
+        observed_program = program if not task.dead and hub_is_shell(task) and program in {
+            *HUB_PROMPT_AGENT_ORDER, *HUB_NATIVE_AGENT_COMMANDS, "kiro-cli",
+        } else ""
         update_history(task.id, task.log, {"display_title": title or task.name})
         if task.dead:
             snapshot_history(task)
         displayed.append(replace(
             task, display_title=title or task.name, display_state=activity,
             display_session=session_id if re.fullmatch(r"\$[0-9]+", session_id) else "",
+            observed_program=observed_program,
         ))
     return displayed
 
@@ -4785,7 +4924,11 @@ def hub_navigation_status(source: str, columns: str) -> int:
     width = int(columns)
     tasks = hub_display_tasks(list_tasks(), observe=source)
     visible = [task for task in tasks if task.committed and (not task.dead or task.session == source)]
-    labels = {task.id: fleet_display_cell(hub_task_title(task), 28) for task in visible}
+    labels = {
+        task.id: fleet_display_cell(hub_task_title(task), 28)
+        + (f" · {task.observed_program}*" if task.observed_program else "")
+        for task in visible
+    }
     back = "‹ Back to sessions [Ctrl-B]" if width >= 64 else "‹ Back [Ctrl-B]"
     status = "#[align=left range=left bold] " + back + " #[norange nobold] "
     status += "#[list=on]#[list=left-marker range=user|previous]‹ #[list=right-marker range=user|next] ›#[norange list=on]"
@@ -4810,6 +4953,8 @@ def hub_navigation_status(source: str, columns: str) -> int:
     current = next((task for task in tasks if task.session == source), None)
     if current is not None and width >= 95:
         provider = Path(current.command[0]).name if current.command else ""
+        if current.observed_program:
+            provider = f"{current.observed_program}*"
         status += hub_display_text(f"{provider} · {hub_task_state(current)}", 32).replace("#", "##") + " "
     status += "#[range=user|previous] ‹ #[range=user|next] › #[norange]"
     print(status)
@@ -5907,17 +6052,6 @@ def launch_hub_shell(context: str, directory: str) -> Task:
     return task
 
 
-def hub_project_shell(tasks: Sequence[Task], directory: str) -> Task | None:
-    for task in tasks:
-        if task.dead or not task.committed or not hub_is_shell(task):
-            continue
-        current = tmux(["display-message", "-p", "-t", task.pane, "#{pane_current_path}"], check=False)
-        current_directory = current.stdout.decode(errors="replace").strip()
-        if current.returncode == 0 and current_directory and Path(current_directory) == Path(directory):
-            return task
-    return None
-
-
 def hub_command_kind(command: Sequence[str]) -> str | None:
     return hub_preset_kind({"name": "", "command": list(command)})
 
@@ -6463,6 +6597,8 @@ def hub_task_line(task: Task, width: int = 80) -> str:
     }
     marker = markers.get(task.state, "·")
     agent = Path(task.command[0]).name if task.command else "-"
+    if task.observed_program:
+        agent = f"{task.observed_program}*"
     project = Path(task.cwd).name or task.cwd
     source = "BOT" if task.origin == "bot" else "LOCAL"
     attached = " attached" if task.attached else ""
@@ -6610,7 +6746,7 @@ def hub_draw(
     rows.append(("+  New session", len(tasks), ""))
     rows.append(("?  Help", len(tasks) + 1, ""))
     rows.append(("   Leave CliLane · jobs keep running", len(tasks) + 2, ""))
-    rows.append((">_ Shell", len(tasks) + 3, ""))
+    rows.append((">_ New shell", len(tasks) + 3, ""))
     selected = max(0, min(selected, len(tasks) + 3))
     selected_row = next(
         (position for position, (_, index, _) in enumerate(rows) if index == selected),
@@ -6690,7 +6826,7 @@ def hub_draw(
             hints[1] = "No exit receipt · outcome unknown · inspect saved output before starting new work"
     elif selected > len(tasks):
         hints = [
-            "Enter opens a shell in this project; drafts stay" if selected == len(tasks) + 3
+            "Enter opens a new shell in this project; drafts stay" if selected == len(tasks) + 3
             else "Enter opens keyboard help" if selected == len(tasks) + 1
             else "Enter leaves CliLane; jobs keep running",
             "Up/Down choose · Esc back",
@@ -7054,10 +7190,6 @@ def hub_ui(
             if key in {"enter", "open", "right"} and selected_key == "shell":
                 if not save_drafts():
                     continue
-                shell = hub_project_shell(all_tasks, discovery_directory)
-                if shell is not None:
-                    switch_hub_popup(client, client_pid, context, popup_value, shell.session)
-                    return 0
                 redraw("Opening shell… · Ctrl-C cancel")
                 alive, error = hub_claimed_launch(
                     client, client_pid, context, popup_value,
@@ -7559,9 +7691,11 @@ def key_task(target: str, keys: Sequence[str]) -> int:
     return 0
 
 
-def wait_task(target: str, timeout: float | None) -> int:
+def wait_task_result(
+    target: str, timeout: float | None, *, exact_id: bool = False,
+) -> tuple[Task, bool]:
     with registry_lock():
-        task = resolve_task(target, include_history=True)
+        task = resolve_task(target, include_history=True, exact_id=exact_id)
         if not task.committed:
             raise CliLaneError(f"task initialization is incomplete: {task.name}")
         lock_handle = acquire_task_lock(task.id, exclusive=False)
@@ -7569,17 +7703,24 @@ def wait_task(target: str, timeout: float | None) -> int:
     started = time.monotonic()
     try:
         while True:
-            task = resolve_task(task_id, include_history=True)
+            task = resolve_task(task_id, include_history=True, exact_id=True)
             if task.state == TASK_STATE_UNKNOWN:
                 raise CliLaneError("job outcome is unknown; no command exit receipt survived")
             if task.dead:
-                return task.result_code
+                return task, False
             if timeout is not None and time.monotonic() - started >= timeout:
-                print(f"{PROGRAM}: timeout waiting for {task.name}", file=sys.stderr)
-                return 124
+                return task, True
             time.sleep(0.2)
     finally:
         release_task_lock(lock_handle)
+
+
+def wait_task(target: str, timeout: float | None) -> int:
+    task, timed_out = wait_task_result(target, timeout)
+    if timed_out:
+        print(f"{PROGRAM}: timeout waiting for {task.name}", file=sys.stderr)
+        return 124
+    return task.result_code
 
 
 def validated_supervisor(task: Task) -> int:
@@ -7996,10 +8137,11 @@ Esc goes back and keeps drafts until you leave CliLane. Ctrl-U clears; Ctrl-Y re
 Ctrl-A/E or Home/End moves to the start/end; Ctrl-W erases the previous word.
 Ctrl-X asks before stopping/removing a job; Enter confirms and Esc cancels.
 Ctrl-Q leaves CliLane; if drafts exist, confirm discarding them. Jobs keep running.
-Select Shell to open or reuse a terminal in the current project; drafts stay.
+Select New shell to open a fresh terminal in the current project; drafts stay.
+Use its tab to return to an existing shell. Observed nested agents keep pinned names.
 Titles follow the native agent title, then the first message submitted here.
 Use clilane rename TARGET TITLE to override a display title; omit TITLE to reset.
-Open means process alive. A * marks activity observed on the native screen.
+Open means process alive. A * marks observed screen activity or foreground program.
 History keeps job records and saved logs after terminal loss. Enter opens saved output.
 Ctrl-R creates a new attempt and keeps the original. Unknown outcomes cannot be resumed.
 Use clilane history to find saved IDs, then clilane status ID or clilane log ID.
@@ -8029,6 +8171,15 @@ commands also accept a first message in the Sessions composer.""",
     run.add_argument("--wait", action="store_true", help="wait for the command to exit")
     run.add_argument("--timeout", metavar="SECONDS", help="timeout used with --wait")
     run.add_argument("--on-exit", metavar="COMMAND", help="shell command run after exit")
+    run.add_argument("--request-id", metavar="KEY", help="reuse the original launch for this occurrence; retained through cleanup")
+    run.add_argument("--json", action="store_true", help="emit one task receipt; with --wait, emit after exit or timeout")
+    run.epilog = (
+        "Use one key per occurrence, for example report:2026-11-08, and reuse it only for retries. "
+        "A key remains bound to its original job in this state directory, even after rm/clean. "
+        "Name, command/profile, directory, hook, and socket selection must match. "
+        "Replays keep the first launch's environment and profile settings; changed settings need a new key. "
+        "An unavailable original is never relaunched automatically."
+    )
     run.add_argument(
         "run_arguments",
         metavar="ARG",
@@ -8204,6 +8355,37 @@ def parse_cli_arguments(parts: Sequence[str] | None = None) -> argparse.Namespac
     return parser().parse_args(arguments)
 
 
+def execute_run(parts: Sequence[str]) -> int:
+    prefix = list(parts[:parts.index("--")]) if "--" in parts else list(parts)
+    as_json = "--json" in prefix
+    task: Task | None = None
+    try:
+        request = parse_run_request(parts)
+        as_json = request.json
+        task = run_requested_task(request, os.environ, os.getcwd())
+        reused = task.launch_reused
+        if not as_json:
+            identifier = task.id if request.request_id else task.id[:8]
+            print(f"{'existing' if reused else 'created'} {task.name} {identifier}", flush=True)
+        timed_out = False
+        if request.wait:
+            task, timed_out = wait_task_result(task.id, request.timeout, exact_id=True)
+        if as_json:
+            print(json.dumps({**task.as_dict(), "reused": reused, "timed_out": timed_out}, indent=2), flush=True)
+        elif timed_out:
+            print(f"{PROGRAM}: timeout waiting for {task.name}", file=sys.stderr)
+        return 124 if timed_out else task.result_code if request.wait else 0
+    except (CliLaneError, OSError) as error:
+        task_id = error.task_id if isinstance(error, LaunchRequestError) else task.id if task is not None else None
+        code = error.code if isinstance(error, LaunchRequestError) else "wait_failed" if task is not None else "run_failed"
+        if not as_json:
+            if task_id and not isinstance(error, LaunchRequestError):
+                raise LaunchRequestError(code, str(error), task_id) from error
+            raise
+        print(json.dumps({"error": {"code": code, "message": str(error)}, "task_id": task_id}, indent=2), flush=True)
+        return 1
+
+
 def execute(arguments: argparse.Namespace) -> int:
     if arguments.action in {None, "hub", "list", "ls", "ps", "history", "status", "read", "log", "rename"}:
         with registry_lock():
@@ -8211,13 +8393,7 @@ def execute(arguments: argparse.Namespace) -> int:
     if arguments.action is None:
         return hub_command(None)
     if arguments.action == "run":
-        request = parse_run_request(arguments.run_arguments)
-        spec = resolve_run_request(request, os.environ, os.getcwd())
-        task = run_task(spec)
-        print(f"created {task.name} {task.id[:8]}")
-        if spec.wait:
-            return wait_task(task.id, spec.timeout)
-        return 0
+        return execute_run(arguments.run_arguments)
     if arguments.action in {"list", "ls", "ps"}:
         print_tasks(list_tasks(), arguments.json)
         return 0

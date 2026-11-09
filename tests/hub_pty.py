@@ -965,7 +965,7 @@ def _exercise_switcher_actions(environment: dict[str, str]) -> None:
         terminal.expect("reply · act-job", mark)
         terminal.settle()
         frame = _last_frame(terminal, mark)
-        assert "act-job · running · latest output" in frame, frame
+        assert "act-job · open · latest output" in frame, frame
         assert "Enter open · type to reply" in frame, frame
 
         terminal.send(b"ping-from-switcher")
@@ -1082,16 +1082,20 @@ def _exercise_switcher_resume(environment: dict[str, str]) -> None:
         deadline = time.monotonic() + 15.0
         while True:
             tasks = _tasks(environment)
-            if len(tasks) == 1 and tasks[0]["id"] != first_id:
+            if len(tasks) == 2 and any(task["id"] != first_id for task in tasks):
                 break
             assert time.monotonic() < deadline, tasks
             time.sleep(0.2)
-        resumed = tasks[0]
-        assert resumed["name"] == "res-job", resumed
+        resumed = next(task for task in tasks if task["id"] != first_id)
+        assert resumed["name"] == "res-job-2", resumed
         assert resumed["command"] == ["/bin/sh", "-c", "echo first-run-output; exit 0"], resumed
-        _wait_for_state(environment, "res-job", "succeeded")
-        logged = _run(environment, ["log", "res-job", "--lines", "50"]).stdout
-        assert logged.count("first-run-output") >= 2, logged
+        _wait_for_state(environment, resumed["name"], "succeeded")
+        original_log = _run(environment, ["log", first_id, "--lines", "50"]).stdout
+        resumed_log = _run(environment, ["log", resumed["id"], "--lines", "50"]).stdout
+        assert original_log.count("first-run-output") == 1, original_log
+        assert resumed_log.count("first-run-output") == 1, resumed_log
+        history = json.loads(_run(environment, ["history", "--json"]).stdout)
+        assert next(task for task in history if task["id"] == resumed["id"])["resumed_from"] == first_id
         terminal.close()
         terminal = None
 
@@ -1113,6 +1117,127 @@ def _exercise_switcher_resume(environment: dict[str, str]) -> None:
         if terminal is not None:
             terminal.close()
         _cleanup(environment)
+
+
+def _exercise_shell_access(environment: dict[str, str], root: Path) -> None:
+    environment = dict(environment, SHELL="/bin/sh")
+    tool_dir = root / "shell-agent"
+    tool_dir.mkdir()
+    provider = tool_dir / "codex"
+    shutil.copyfile(shutil.which("cat"), provider)
+    provider.chmod(0o700)
+    if sys.platform == "darwin":
+        subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", str(provider)], check=True, capture_output=True)
+    terminal: _Terminal | None = None
+    try:
+        _run(environment, ["run", "busy-shell", "-C", str(root), "--", "/bin/sh", "-i"])
+        original = _tasks(environment)[0]
+        original_session = "agt_" + str(original["id"]).replace("-", "")[:12]
+        _run(environment, ["rename", str(original["id"]), "Pinned shell"])
+        terminal = _Terminal(["attach", str(original["id"])], environment)
+        terminal.expect("LOCAL · Pinned shell")
+        mark = terminal.mark()
+        terminal.send(shlex.quote(str(provider)).encode() + b"\r")
+        terminal.expect("codex*", mark)
+        terminal.expect("codex* · open", mark)
+        mark = terminal.mark()
+        terminal.send(b"\x02")
+        terminal.expect("This clilane server", mark)
+        terminal.expect("New shell", mark)
+        terminal.send(b"\x1b[A\r")
+        terminal.expect("LOCAL · Shell ·", mark)
+        tasks = _tasks(environment)
+        assert len(tasks) == 2, tasks
+        fresh = next(task for task in tasks if task["id"] != original["id"])
+        assert fresh["cwd"] == str(root.resolve()), fresh
+        assert next(task for task in tasks if task["id"] == original["id"])["pid"] == original["pid"]
+        foreground = _tmux(environment, ["display-message", "-p", "-t", original_session, "#{pane_current_command}"]).stdout.decode().strip()
+        assert foreground == "codex", foreground
+        mark = terminal.mark()
+        terminal.send(b"printf 'fresh-shell-marker\\n'\r")
+        terminal.expect("fresh-shell-marker", mark)
+        old_output = _tmux(environment, ["capture-pane", "-p", "-t", original_session]).stdout.decode()
+        assert "fresh-shell-marker" not in old_output, old_output
+        mark = terminal.mark()
+        terminal.send(b"\x02")
+        terminal.expect("This clilane server", mark)
+        terminal.send(b"\x1b[A\r")
+        deadline = time.monotonic() + 10
+        while len(_tasks(environment)) != 3:
+            assert time.monotonic() < deadline
+            time.sleep(0.1)
+        terminal.settle()
+        mark = terminal.mark()
+        terminal.send(b"\x02")
+        terminal.expect("This clilane server", mark)
+        terminal.send(b"\x1b[B\x1b[B\r")
+        terminal.expect("LOCAL · Pinned shell", mark)
+        terminal.expect("codex*", mark)
+        terminal.send(b"\x03")
+        deadline = time.monotonic() + 5
+        while _tmux(environment, ["display-message", "-p", "-t", original_session, "#{pane_current_command}"]).stdout.decode().strip() == "codex":
+            assert time.monotonic() < deadline
+            time.sleep(0.1)
+        socket = _tmux(environment, ["display-message", "-p", "#{socket_path}"]).stdout.decode().strip()
+        status = _run(environment, ["__hub-status", str(Path(shutil.which("tmux")).resolve()), socket, original_session, "180"]).stdout
+        assert "Pinned shell" in status and "codex*" not in status, status
+        mark = terminal.mark()
+        terminal.send(b"\x02")
+        terminal.expect("This clilane server", mark)
+        terminal.send(b"\x11")
+        assert terminal.wait() == 0
+    finally:
+        if terminal is not None:
+            terminal.close()
+        _cleanup(environment)
+
+
+def _exercise_saved_history(environment: dict[str, str]) -> None:
+    terminal: _Terminal | None = None
+    original_id = ""
+    try:
+        _run(environment, ["run", "saved-job", "--wait", "--", "/bin/echo", "saved-output-preview"])
+        original_id = str(_tasks(environment)[0]["id"])
+        session = "agt_" + original_id.replace("-", "")[:12]
+        _tmux(environment, ["kill-session", "-t", session])
+        terminal = _Terminal([], environment)
+        terminal.expect("This clilane server")
+        terminal.expect(original_id[:8])
+        clients = _tmux(environment, ["list-clients", "-F", "#{client_session}"]).stdout
+        mark = terminal.mark()
+        terminal.send(b"\r")
+        terminal.expect("saved-output-preview", mark)
+        terminal.expect("saved log", mark)
+        assert _tmux(environment, ["list-clients", "-F", "#{client_session}"]).stdout == clients
+        mark = terminal.mark()
+        terminal.send(b"\x12")
+        terminal.expect("saved-output-preview", mark)
+        history = json.loads(_run(environment, ["history", "--json"]).stdout)
+        assert any(task["resumed_from"] == original_id for task in history), history
+        assert any(task["id"] == original_id and not task["terminal_available"] for task in history), history
+        terminal.close()
+        terminal = None
+        _cleanup(environment)
+        (Path(environment["CLILANE_STATE_HOME"]) / "history" / f"{original_id}.json").unlink()
+        terminal = _Terminal([], environment)
+        terminal.expect("This clilane server")
+        terminal.expect("unknown")
+        mark = terminal.mark()
+        terminal.send(b"\x12")
+        terminal.expect("Recovery unavailable: job outcome or cleanup unknown", mark)
+        terminal.settle()
+        assert not _tasks(environment)
+        mark = terminal.mark()
+        terminal.send(b"\r")
+        terminal.expect("saved-output-preview", mark)
+        terminal.send(b"\x11")
+        assert terminal.wait() == 0
+    finally:
+        if terminal is not None:
+            terminal.close()
+        _cleanup(environment)
+        if original_id:
+            _run(environment, ["rm", original_id], check=False)
 
 
 def _exercise_switcher_sections(environment: dict[str, str], tool_bin: Path) -> None:
@@ -1200,14 +1325,14 @@ def _exercise_switcher_sections(environment: dict[str, str], tool_bin: Path) -> 
         deadline = time.monotonic() + 15.0
         while True:
             entries = {task["name"]: task for task in _tasks(environment)}
-            resumed = entries.get("agent-job")
-            if resumed is not None and resumed["id"] != agent_id:
+            resumed = entries.get("agent-job-2")
+            if resumed is not None and entries["agent-job"]["id"] == agent_id:
                 break
             assert time.monotonic() < deadline, entries
             time.sleep(0.2)
         assert resumed["command"] == [str(fake_claude), "--continue"], resumed
-        _wait_for_state(environment, "agent-job", "succeeded")
-        logged = _run(environment, ["log", "agent-job", "--lines", "50"]).stdout
+        _wait_for_state(environment, resumed["name"], "succeeded")
+        logged = _run(environment, ["log", resumed["id"], "--lines", "50"]).stdout
         assert "fake-claude args:--continue" in logged, logged
         terminal.close()
         terminal = None
@@ -1618,6 +1743,14 @@ def main() -> int:
         resume_environment["CLILANE_STATE_HOME"] = str(resume_state)
         resume_environment["CLILANE_TMUX_SOCKET"] = f"clp-resume-{os.getpid()}"
         _exercise_switcher_resume(resume_environment)
+        shell_environment = dict(environment)
+        shell_environment["CLILANE_STATE_HOME"] = str(root / "shell-state")
+        shell_environment["CLILANE_TMUX_SOCKET"] = f"clp-shell-{os.getpid()}"
+        _exercise_shell_access(shell_environment, root)
+        history_environment = dict(environment)
+        history_environment["CLILANE_STATE_HOME"] = str(root / "saved-history-state")
+        history_environment["CLILANE_TMUX_SOCKET"] = f"clp-saved-history-{os.getpid()}"
+        _exercise_saved_history(history_environment)
         sections_environment = dict(environment)
         sections_state = root / "sections-state"
         sections_state.mkdir(mode=0o700)
@@ -1683,11 +1816,11 @@ def main() -> int:
             _wait_for_attached_task(
                 discovery_environment, discovery_terminal, "codex-launch-project"
             )
-            discovery_terminal.expect("LOCAL · codex-launch-project", mark)
+            discovery_terminal.expect(f"LOCAL · zero config {os.getpid()}", mark)
             mark = discovery_terminal.mark()
             discovery_terminal.send(b"\x02")
             discovery_terminal.expect("This clilane server", mark)
-            discovery_terminal.expect("codex-launch-project", mark)
+            discovery_terminal.expect(launch_prompt, mark)
             discovery_terminal.expect("Enter open · Space preview", mark)
             handshake_mark = discovery_terminal.mark()
             discovery_terminal.send(b"\x15")
@@ -1738,11 +1871,11 @@ def main() -> int:
             _wait_for_attached_task(
                 discovery_environment, discovery_terminal, "kimi-source-project"
             )
-            discovery_terminal.expect("LOCAL · kimi-source-project", mark)
+            discovery_terminal.expect(f"LOCAL · {source_prompt}", mark)
             mark = discovery_terminal.mark()
             discovery_terminal.send(b"\x02")
             discovery_terminal.expect("This clilane server", mark)
-            discovery_terminal.expect("kimi-source-project", mark)
+            discovery_terminal.expect(source_prompt, mark)
             discovery_terminal.expect("Enter open · Space preview", mark)
             handshake_mark = discovery_terminal.mark()
             discovery_terminal.send(b"\x15")
@@ -1996,7 +2129,7 @@ def main() -> int:
             mark = terminal.mark()
             terminal.send(b"\x02")
             terminal.expect("This clilane server", mark)
-            terminal.expect("kimi-", mark)
+            terminal.expect(prompt.replace("\n", " "), mark)
             terminal.expect("[kimi ·", mark)
             terminal.expect("Enter open · Space preview", mark)
             time.sleep(0.25)

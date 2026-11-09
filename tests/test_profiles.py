@@ -143,6 +143,22 @@ class RunParserTests(unittest.TestCase):
         self.assertEqual(request.profile, "Claude.Main")
         self.assertIsNone(request.command)
 
+    def test_request_id_and_json_options_are_explicit_and_bounded(self) -> None:
+        request = clilane.parse_run_request(["job", "--request-id=report:2026-11-08", "--json", "--", "echo", "--request-id", "child"])
+        self.assertEqual(request.request_id, "report:2026-11-08")
+        self.assertTrue(request.json)
+        self.assertEqual(request.command, ("echo", "--request-id", "child"))
+        for key in ("", "has spaces", "-leading", "x" * 129, "bad\nkey"):
+            with self.subTest(key=key), self.assertRaises(clilane.CliLaneError):
+                clilane.parse_run_request(["job", "--request-id", key, "--", "echo"])
+        for parts in (
+            ["job", "--request-id"],
+            ["job", "--request-id", "one", "--request-id=two", "--", "echo"],
+            ["job", "--json", "--json", "--", "echo"],
+        ):
+            with self.subTest(parts=parts), self.assertRaises(clilane.CliLaneError):
+                clilane.parse_run_request(parts)
+
     def test_parser_rejects_invalid_combinations(self) -> None:
         cases = {
             "missing mode": ["job"],
