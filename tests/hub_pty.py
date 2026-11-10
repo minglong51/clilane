@@ -1221,8 +1221,8 @@ def _exercise_saved_history(environment: dict[str, str]) -> None:
                 task["id"] == resumed["id"] and task["attached"] for task in _tasks(environment)
             ):
                 break
-            assert time.monotonic() < deadline, history
-            time.sleep(0.1)
+            assert time.monotonic() < deadline, (history, _last_frame(terminal, mark))
+            terminal.settle(quiet=0.1, timeout=0.5)
         assert any(task["id"] == original_id and not task["terminal_available"] for task in history), history
         terminal.close()
         terminal = None
