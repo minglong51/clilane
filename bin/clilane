@@ -35,7 +35,7 @@ from typing import BinaryIO, Callable, Iterator, Mapping, Sequence
 
 
 PROGRAM = "clilane"
-VERSION = "0.20.0"
+VERSION = "0.21.0"
 TASK_STATE_INITIALIZING = "initializing"
 TASK_STATE_RUNNING = "running"
 TASK_STATE_STOPPED = "stopped"
@@ -3511,33 +3511,15 @@ def configure_task_status(session: str, command: Sequence[str]) -> None:
         else hub_command_kind(command)
     )
     agent = kind in HUB_LEFT_AGENT_KINDS
-    tmux(
-        [
-            "set-option",
-            "-t",
-            session,
-            "status-left",
-            " #{?#{OPENCLAW_SESSION},BOT,LOCAL} · #{window_name} ",
-        ],
-        check=False,
-    )
-    tmux(["set-option", "-t", session, "status-left-length", "50"], check=False)
-    tmux(
-        [
-            "set-option",
-            "-t",
-            session,
-            "status-right",
-            " ←/→ empty · Ctrl-B back " if agent else " Ctrl-B back to sessions ",
-        ],
-        check=False,
-    )
-    tmux(
-        ["set-option", "-t", session, "@agt_agent", kind]
-        if agent
-        else ["set-option", "-u", "-t", session, "@agt_agent"],
-        check=False,
-    )
+    tmux([
+        "set-option", "-t", session, "status-left",
+        " #{?#{OPENCLAW_SESSION},BOT,LOCAL} · #{window_name} ",
+        ";", "set-option", "-t", session, "status-left-length", "50",
+        ";", "set-option", "-t", session, "status-right",
+        " ←/→ empty · Ctrl-B back " if agent else " Ctrl-B back to sessions ",
+        ";", *(["set-option", "-t", session, "@agt_agent", kind] if agent else
+                ["set-option", "-u", "-t", session, "@agt_agent"]),
+    ], check=False)
 
 
 def kill_managed_session(session: str) -> None:
@@ -5394,13 +5376,14 @@ def create_hub_pane(
         if created.returncode != 0:
             detail = created.stderr.decode(errors="replace").strip()
             raise CliLaneError(detail or "could not create the session switcher")
+        setup: list[str] = []
         for option, setting in (
             ("history-limit", "0"), ("status", "off"),
             ("prefix", "None"), ("prefix2", "None"),
             ("key-table", HUB_PANE_KEY_TABLE), ("destroy-unattached", "off"),
             ("detach-on-destroy", "on"),
         ):
-            tmux(["set-option", "-t", session, option, setting])
+            setup.extend(["set-option", "-t", session, option, setting, ";"])
         tmux(["unbind-key", "-T", HUB_PANE_KEY_TABLE, "Any"], check=False)
         for key in (
             "C-q", "C-c", "C-d", "C-r", "C-u", "C-x", "C-b",
@@ -5409,24 +5392,29 @@ def create_hub_pane(
             "Home", "End", "DC", "F1", "C-Left", "C-Right", "C-DC",
             "M-Left", "M-Right", "M-b", "M-f", "M-d", "M-BSpace",
         ):
-            tmux(["bind-key", "-T", HUB_PANE_KEY_TABLE, key, "send-keys", key])
+            setup.extend(["bind-key", "-T", HUB_PANE_KEY_TABLE, key, "send-keys", key, ";"])
         for key in (
             "MouseDown1Pane", "MouseUp1Pane", "SecondClick1Pane", "TripleClick1Pane",
             "WheelUpPane", "WheelDownPane",
         ):
-            tmux(["bind-key", "-T", HUB_PANE_KEY_TABLE, key, "send-keys", "-M"])
+            setup.extend(["bind-key", "-T", HUB_PANE_KEY_TABLE, key, "send-keys", "-M", ";"])
         created = tmux([
+            *setup,
             "new-window", "-d", "-P", "-F", "#{pane_id}", "-t", session + ":",
             "-c", str(state_root()), "--", "/bin/sleep", "2147483647",
         ])
         pane = created.stdout.decode().strip()
-        tmux(["set-option", "-t", session, HUB_PANE_ID_OPTION, pane])
-        tmux(["set-option", "-w", "-t", pane, "window-size", "latest"])
-        tmux(["set-option", "-w", "-t", pane, "remain-on-exit", "off"])
-        tmux(["set-option", "-w", "-t", pane, "automatic-rename", "off"])
-        tmux(["rename-window", "-t", pane, "Sessions"])
-        tmux(["select-window", "-t", pane])
-        tmux(["kill-window", "-t", bootstrap])
+        if re.fullmatch(r"%[0-9]+", pane) is None:
+            raise CliLaneError("could not identify the session switcher pane")
+        tmux([
+            "set-option", "-t", session, HUB_PANE_ID_OPTION, pane,
+            ";", "set-option", "-w", "-t", pane, "window-size", "latest",
+            ";", "set-option", "-w", "-t", pane, "remain-on-exit", "off",
+            ";", "set-option", "-w", "-t", pane, "automatic-rename", "off",
+            ";", "rename-window", "-t", pane, "Sessions",
+            ";", "select-window", "-t", pane,
+            ";", "kill-window", "-t", bootstrap,
+        ])
         return pane
     except BaseException:
         identity = tmux_all([
