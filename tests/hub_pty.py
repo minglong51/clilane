@@ -1124,10 +1124,11 @@ def _exercise_shell_access(environment: dict[str, str], root: Path) -> None:
     tool_dir = root / "shell-agent"
     tool_dir.mkdir()
     provider = tool_dir / "codex"
-    shutil.copyfile(shutil.which("cat"), provider)
-    provider.chmod(0o700)
-    if sys.platform == "darwin":
-        subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", str(provider)], check=True, capture_output=True)
+    subprocess.run(
+        ["cc", "-x", "c", "-o", str(provider), "-"],
+        input="#include <unistd.h>\nint main(void) { for (;;) pause(); }\n",
+        text=True, check=True, capture_output=True,
+    )
     terminal: _Terminal | None = None
     try:
         _run(environment, ["run", "busy-shell", "-C", str(root), "--", "/bin/sh", "-i"])

@@ -4837,7 +4837,7 @@ def hub_display_tasks(tasks: Sequence[Task], *, observe: bool | str = False) -> 
         return []
     fields = ["#{pane_id}", "#{session_id}"] + [
         "#{s|[\x01-\x1f\x7f]| |:" + value + "}"
-        for value in ("pane_title", "@agt_display_title", "@agt_prompt_title", "pane_current_path", "pane_current_command")
+        for value in ("pane_title", "@agt_display_title", "@agt_prompt_title", "pane_current_path", "pane_current_command", "host", "host_short")
     ] + ["#{cursor_y}"]
     result = tmux(["list-panes", "-a", "-F", "\x1f".join(fields)], check=False)
     details = {}
@@ -4850,8 +4850,8 @@ def hub_display_tasks(tasks: Sequence[Task], *, observe: bool | str = False) -> 
         if task.archived:
             displayed.append(task)
             continue
-        values = details.get(task.pane, [""] * 7)
-        session_id, native, manual, initial, current_cwd, foreground, cursor = values
+        values = details.get(task.pane, [""] * 9)
+        session_id, native, manual, initial, current_cwd, foreground, host, short_host, cursor = values
         executable = Path(task.command[0]).name if task.command else ""
         project = Path(task.cwd).name or task.cwd
         native = re.sub(r"^[\u2800-\u28ff◐◓◑◒✳✻✽✶✢·•●○]+\s+", "", native)
@@ -4859,12 +4859,14 @@ def hub_display_tasks(tasks: Sequence[Task], *, observe: bool | str = False) -> 
         suffix = " | " + project
         if native.endswith(suffix):
             native = native[:-len(suffix)]
+        if native.casefold() in {host.casefold(), short_host.casefold(), os.uname().nodename.casefold()}:
+            native = ""
         native = hub_display_text(native)
         known_agent = executable in {*HUB_PROMPT_AGENT_ORDER, *HUB_NATIVE_AGENT_COMMANDS, "kiro-cli"}
         if not known_agent or native.casefold() in {
             executable.casefold(), "codex", "claude code", "kimi", "kimi code", "oh my pi",
             project.casefold(), f"π > {project}".casefold(),
-        } or native == os.uname().nodename:
+        }:
             native = ""
         title = hub_display_text(manual) or native or hub_display_text(initial)
         if not title and hub_is_shell(task):
