@@ -1213,8 +1213,16 @@ def _exercise_saved_history(environment: dict[str, str]) -> None:
         mark = terminal.mark()
         terminal.send(b"\x12")
         terminal.expect("saved-output-preview", mark)
-        history = json.loads(_run(environment, ["history", "--json"]).stdout)
-        assert any(task["resumed_from"] == original_id for task in history), history
+        deadline = time.monotonic() + 10
+        while True:
+            history = json.loads(_run(environment, ["history", "--json"]).stdout)
+            resumed = next((task for task in history if task["resumed_from"] == original_id), None)
+            if resumed is not None and resumed["terminal_available"] and resumed["state"] == "succeeded" and any(
+                task["id"] == resumed["id"] and task["attached"] for task in _tasks(environment)
+            ):
+                break
+            assert time.monotonic() < deadline, history
+            time.sleep(0.1)
         assert any(task["id"] == original_id and not task["terminal_available"] for task in history), history
         terminal.close()
         terminal = None

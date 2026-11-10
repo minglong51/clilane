@@ -92,6 +92,7 @@ HUB_KEY_HELP = (
     " New session + Enter opens any agent",
     " Space  preview / reply",
     " Ctrl-R  resume / rerun",
+    " OMP recovery opens its session picker",
     " Ctrl-X  stop / remove",
     " Enter confirms; Esc cancels",
     " Esc / Ctrl-C  back",
@@ -130,6 +131,7 @@ HUB_RESUME_ARGUMENTS: dict[str, tuple[list[str], frozenset[str], frozenset[str]]
         frozenset({"--continue", "-c", "--session", "-S"}),
         frozenset({"--agent", "--agent-file"}),
     ),
+    "omp": (["--resume"], frozenset(), frozenset()),
 }
 HUB_AGENT_READY_TIMEOUT_SECONDS = 10.0
 HUB_AGENT_READY_POLL_SECONDS = 0.05
@@ -4665,16 +4667,28 @@ def omp_empty_prompt(rows, row, cursor, columns):
     status = plain(rows[row - 1])
     prompt = plain(rows[row])
     hint = "⇧⇥ to change thinking effort"
+    framed = status.startswith("╭── π > ") and status.endswith("╮")
+    suffix = " ─╯" if framed else ""
+    padding = len(suffix)
     return (
-        status.startswith(" π > ")
-        and status.endswith("─")
+        (framed or (status.startswith(" π > ") and status.endswith("─")))
         and prompt.startswith("╰─ ")
-        and prompt[3:].strip() == hint
-        and columns - len(hint) - 1 <= prompt.index("⇧⇥") <= columns - len(hint)
-        and re.search(
-            r"\x1b\[3m(?:\x1b\[[0-9;:]*m)*to change thinking effort(?:\x1b\[[0-9;:]*m)*$",
-            rows[row],
-        ) is not None
+        and prompt[3:].strip() == hint + suffix
+        and columns - len(hint) - padding - 1 <= prompt.index("⇧⇥") <= columns - len(hint) - padding
+        and (
+            re.search(
+                r"\x1b\[3m(?:\x1b\[[0-9;:]*m)*to change thinking effort(?:\x1b\[[0-9;:]*m|[ ─╯])*$",
+                rows[row],
+            ) is not None
+            or (
+                framed and re.search(
+                    r"⇧⇥(?:\x1b\[[0-9;:]*m)+ (?:\x1b\[[0-9;:]*m)+"
+                    r"to change thinking effort(?:\x1b\[[0-9;:]*m)+ ─╯"
+                    r"(?:\x1b\[[0-9;:]*m)*$",
+                    rows[row],
+                ) is not None
+            )
+        )
         and all(not plain(value).strip() for value in rows[row + 1:])
     )
 
@@ -5825,9 +5839,11 @@ def hub_agent_composer_ready(task: Task, kind: str) -> bool:
     rows = captured.stdout.decode(errors="replace").splitlines()
     if captured.returncode != 0 or row >= len(rows):
         return False
-    if kind == "kiro-cli":
+    if kind in {"omp", "kiro-cli"}:
         probe = {"__name__": "clilane_prompt_probe"}
         exec(HUB_LEFT_PROBE_SOURCE, probe)
+        if kind == "omp":
+            return bool(probe["omp_empty_prompt"](rows, row, column, columns))
         return bool(cursor_visible and probe["kiro_empty_prompt"](rows, row, column, columns))
     faint = False
     visible: list[str] = []
@@ -5892,8 +5908,6 @@ def wait_for_hub_agent_ready(preset: dict[str, object], task: Task) -> None:
                     f"could not inspect {task.name}; open it to finish startup"
                 ) from error
             if not attributes[3] & termios.ICANON:
-                if kind == "omp":
-                    return
                 if hub_agent_composer_ready(task, kind):
                     return
             time.sleep(HUB_AGENT_READY_POLL_SECONDS)
@@ -6115,9 +6129,64 @@ def hub_claude_session_id(command: Sequence[str], option: str) -> str | None:
     return None
 
 
+def hub_omp_resume_command(command: Sequence[str], name: str) -> list[str]:
+    values = {
+        "--model", "--smol", "--slow", "--plan", "--provider", "--api-key",
+        "--system-prompt", "--system-prompt-template", "--append-system-prompt",
+        "--profile", "--cwd", "--config", "--add-dir", "--session-dir",
+        "--models", "--tools", "--thinking", "--service-tier", "--mode",
+        "--hook", "--extension", "-e", "--trusted-extension", "--plugin-dir",
+        "--skills", "--spinner-interval", "--max-fps", "--motion",
+        "--max-time", "--warn-cost", "--max-cost", "--approval-mode",
+        "--provider-session-id", "--prompt-cache-key",
+    }
+    flags = {
+        "--allow-home", "--no-tools", "--no-lsp", "--no-pty", "--hide-thinking",
+        "--advisor", "--external-thinking", "--no-extensions", "--no-skills",
+        "--no-rules", "--no-context-files", "--no-title", "--auto-approve", "--yolo",
+        "--no-prewalk",
+    }
+    result = [command[0]]
+    error = CliLaneError(
+        f"cannot resume {name}: these OMP launch arguments need manual recovery; "
+        "open omp --resume with the original project and profile"
+    )
+    index = 1
+    while index < len(command):
+        argument = command[index]
+        option, equals, value = argument.partition("=")
+        if argument == "--":
+            if index != len(command) - 1:
+                raise error
+            break
+        if argument in {"--continue", "-c"}:
+            index += 1
+            continue
+        if option in {"--resume", "-r", "--session"}:
+            index += 1
+            if not equals and index < len(command) and not command[index].startswith("-"):
+                index += 1
+            continue
+        if argument in flags:
+            result.append(argument)
+        elif option in values:
+            if not equals:
+                index += 1
+                value = command[index] if index < len(command) else ""
+            if not value or value.startswith("-") or (option == "--mode" and value != "text"):
+                raise error
+            result.extend([argument] if equals else [argument, value])
+        else:
+            raise error
+        index += 1
+    return [*result, "--resume"]
+
+
 def hub_resume_command(command: Sequence[str], kind: str | None, name: str) -> list[str]:
     if kind is None:
         return list(command)
+    if kind == "omp":
+        return hub_omp_resume_command(command, name)
     entry = HUB_RESUME_ARGUMENTS.get(kind)
     if entry is None:
         raise CliLaneError(f"resume is not supported for {kind}: {name}")
@@ -6153,6 +6222,11 @@ def hub_resume_command(command: Sequence[str], kind: str | None, name: str) -> l
 
 
 def hub_base_command(command: Sequence[str], kind: str | None) -> list[str]:
+    if kind == "omp":
+        try:
+            return hub_omp_resume_command(command, "OMP")[:-1]
+        except CliLaneError:
+            return list(command)
     if kind == "claude":
         for option in ("--session-id", "--resume", "-r"):
             session_id = hub_claude_session_id(command, option)
@@ -6412,8 +6486,10 @@ def hub_resume_action(task: Task, presets: Sequence[dict[str, object]]) -> str:
     kind = hub_resume_kind(task, presets)
     if task.binding is not None:
         return "resume recorded ID" if kind == "claude" else "resume unavailable"
+    if kind == "omp":
+        return "choose saved session"
     if kind is None:
-        return "rerun"
+        return "resume unavailable" if hub_command_kind(task.command) == "omp" else "rerun"
     command = hub_resume_command(task.command, kind, task.name)
     if kind == "claude" and any(
         hub_claude_session_id(command, option) is not None
