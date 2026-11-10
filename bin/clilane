@@ -1276,6 +1276,9 @@ def update_history(
                 raise CliLaneError("job history disappeared before execution")
             return
         updated = {**old, **changes}
+        if old.get("pid") is not None and old["pid"] > 0 and old.get("process_started"):
+            for field in ("pid", "process_started"):
+                updated[field] = old[field]
         if old.get("exit_code") is not None:
             for field in ("exit_code", "signal_name", "finished"):
                 updated[field] = old.get(field)

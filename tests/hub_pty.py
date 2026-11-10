@@ -1221,7 +1221,10 @@ def _exercise_saved_history(environment: dict[str, str]) -> None:
                 task["id"] == resumed["id"] and task["attached"] for task in _tasks(environment)
             ):
                 break
-            assert time.monotonic() < deadline, (history, _last_frame(terminal, mark))
+            assert time.monotonic() < deadline, (
+                history, _last_frame(terminal, mark),
+                json.loads((Path(environment["CLILANE_STATE_HOME"]) / "history" / f"{original_id}.json").read_text()),
+            )
             terminal.settle(quiet=0.1, timeout=0.5)
         assert any(task["id"] == original_id and not task["terminal_available"] for task in history), history
         terminal.close()
