@@ -55,6 +55,7 @@ class _Terminal:
         self.pid = pid
         self.descriptor = descriptor
         self.output = bytearray()
+        self.environment = dict(environment)
         self.exit_code: int | None = None
         fcntl.ioctl(
             descriptor,
@@ -803,8 +804,11 @@ def _exercise_hub_launch_loss(environment: dict[str, str]) -> None:
 
 
 def _last_frame(terminal: _Terminal, since: int) -> str:
-    frames = bytes(terminal.output[since:]).split(b"\x1b[H\x1b[J")
-    return frames[-1].decode(errors="replace")
+    sessions = _client_sessions(terminal.environment)
+    assert len(sessions) == 1, sessions
+    return _tmux(
+        terminal.environment, ["capture-pane", "-p", "-t", sessions[0]]
+    ).stdout.decode(errors="replace")
 
 
 def _client_sessions(environment: dict[str, str]) -> list[str]:

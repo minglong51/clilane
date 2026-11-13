@@ -35,7 +35,7 @@ from typing import BinaryIO, Callable, Iterator, Mapping, Sequence
 
 
 PROGRAM = "clilane"
-VERSION = "0.21.0"
+VERSION = "0.21.1"
 TASK_STATE_INITIALIZING = "initializing"
 TASK_STATE_RUNNING = "running"
 TASK_STATE_STOPPED = "stopped"
@@ -6753,7 +6753,27 @@ def hub_help_lines(columns: int) -> list[str]:
     ]
 
 
+@dataclass
+class HubScreen:
+    size: tuple[int, int] | None = None
+    lines: tuple[str, ...] = ()
+
+    def draw(self, lines: Sequence[str], columns: int, height: int) -> None:
+        frame = tuple(lines[:height]) + ("",) * max(0, height - len(lines))
+        resized = self.size != (columns, height)
+        output = ["\033[H\033[2J"] if resized else []
+        for index, line in enumerate(frame):
+            if resized or line != self.lines[index]:
+                output.append(f"\033[{index + 1};1H\033[0m{line}\033[0m\033[K")
+        if output:
+            sys.stdout.write("".join(output))
+            sys.stdout.flush()
+        self.size = (columns, height)
+        self.lines = frame
+
+
 def hub_draw(
+    screen: HubScreen,
     tasks: Sequence[Task],
     selected: int,
     presets: Sequence[dict[str, object]],
@@ -6774,10 +6794,7 @@ def hub_draw(
         count = max(1, height - 2)
         offset = min(help_offset, max(0, len(help_lines) - count))
         lines = ["KEYBOARD HELP", *help_lines[offset:offset + count], "↑↓ scroll · Esc back"]
-        sys.stdout.write("\033[H\033[2J" + "\r\n".join(
-            fleet_display_cell(line, width) for line in lines[:height]
-        ))
-        sys.stdout.flush()
+        screen.draw([fleet_display_cell(line, width) for line in lines], columns, height)
         return {}
     if columns < 24 or height < 8:
         lines = ["Ctrl-Q leave", "Resize to at least 24×8", "Draft kept"]
@@ -6785,11 +6802,7 @@ def hub_draw(
             lines = ["Discard drafts?", "Enter yes · Esc no", "Jobs keep running"]
         elif notice:
             lines.insert(1, notice)
-        sys.stdout.write(
-            "\033[H\033[2J"
-            + "\r\n".join(fleet_display_cell(line, width) for line in lines[:height])
-        )
-        sys.stdout.flush()
+        screen.draw([fleet_display_cell(line, width) for line in lines], columns, height)
         return {}
     compact = width < 80 or height < 16
     preset = presets[agent_index] if presets else None
@@ -6943,8 +6956,7 @@ def hub_draw(
             fleet_display_cell(hints[1], width),
         ]
     )
-    sys.stdout.write("\033[H\033[2J" + "\r\n".join(lines[:height]))
-    sys.stdout.flush()
+    screen.draw(lines, columns, height)
     return mouse_rows
 
 
@@ -7081,6 +7093,7 @@ def hub_ui(
         )
     descriptor = sys.stdin.fileno()
     previous = termios.tcgetattr(descriptor)
+    screen = HubScreen()
     def save_drafts(*, clear_current: bool = False) -> bool:
         nonlocal notice
         drafts[draft_key] = [prompt, cursor]
@@ -7106,6 +7119,7 @@ def hub_ui(
         sys.stdout.flush()
         def redraw(text: str) -> None:
             hub_draw(
+                screen,
                 tasks,
                 selected,
                 presets,
@@ -7160,6 +7174,7 @@ def hub_ui(
                 draft_key = next_draft_key
                 prompt, cursor = drafts.get(draft_key, ["", 0])
             mouse_rows = hub_draw(
+                screen,
                 tasks,
                 selected,
                 presets,
