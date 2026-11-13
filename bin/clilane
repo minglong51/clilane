@@ -28,19 +28,20 @@ import tty
 import unicodedata
 import uuid
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO, Callable, Iterator, Mapping, Sequence
 
 
 PROGRAM = "clilane"
-VERSION = "0.20.0"
+VERSION = "0.21.0"
 TASK_STATE_INITIALIZING = "initializing"
 TASK_STATE_RUNNING = "running"
 TASK_STATE_STOPPED = "stopped"
 TASK_STATE_SUCCEEDED = "succeeded"
 TASK_STATE_FAILED = "failed"
+TASK_STATE_UNKNOWN = "unknown"
 SOCKET = os.environ.get("CLILANE_TMUX_SOCKET") or os.environ.get(
     "AGT_TMUX_SOCKET", "agt"
 )
@@ -78,6 +79,11 @@ HUB_KEY_HELP = (
     "Up/Down choose; Enter opens.",
     "Esc goes back; drafts stay.",
     "Help and Leave CliLane are menu choices.",
+    "Shell opens a terminal in this project.",
+    "Titles follow the agent's native title.",
+    "clilane rename TARGET TITLE overrides it.",
+    "Open means the process is alive.",
+    "* marks activity observed on screen.",
     "",
     "In Sessions:",
     " Up/Down  select job or action",
@@ -86,6 +92,7 @@ HUB_KEY_HELP = (
     " New session + Enter opens any agent",
     " Space  preview / reply",
     " Ctrl-R  resume / rerun",
+    " OMP recovery opens its session picker",
     " Ctrl-X  stop / remove",
     " Enter confirms; Esc cancels",
     " Esc / Ctrl-C  back",
@@ -124,6 +131,7 @@ HUB_RESUME_ARGUMENTS: dict[str, tuple[list[str], frozenset[str], frozenset[str]]
         frozenset({"--continue", "-c", "--session", "-S"}),
         frozenset({"--agent", "--agent-file"}),
     ),
+    "omp": (["--resume"], frozenset(), frozenset()),
 }
 HUB_AGENT_READY_TIMEOUT_SECONDS = 10.0
 HUB_AGENT_READY_POLL_SECONDS = 0.05
@@ -294,6 +302,13 @@ class CliLaneError(Exception):
     pass
 
 
+class LaunchRequestError(CliLaneError):
+    def __init__(self, code: str, message: str, task_id: str | None = None) -> None:
+        self.code = code
+        self.task_id = task_id
+        super().__init__(f"{message} (original job {task_id})" if task_id else message)
+
+
 class HubLaunchCancelled(CliLaneError):
     pass
 
@@ -349,10 +364,30 @@ class Task:
     attached: bool
     origin: str
     binding: dict[str, object] | None = None
+    display_title: str = ""
+    display_state: str = ""
+    display_session: str = ""
+    observed_program: str = ""
+    archived: bool = False
+    result_recorded: bool = False
+    terminal_complete: bool = False
+    resumed_from: str = ""
+    manual_title: str = ""
+    prompt_title: str = ""
+    launch_reused: bool = False
+
+    @property
+    def recovery_receipt(self) -> bool:
+        return self.result_recorded and (
+            not self.archived
+            or (self.terminal_complete and self.pid is not None and bool(self.process_started))
+        )
 
     @property
     def state(self) -> str:
-        if not self.committed:
+        if self.archived and not self.result_recorded:
+            return TASK_STATE_UNKNOWN
+        if not self.committed and not self.archived:
             return TASK_STATE_INITIALIZING
         if not self.dead:
             return TASK_STATE_RUNNING
@@ -399,6 +434,8 @@ class RunRequest:
     on_exit: str | None
     profile: str | None
     command: tuple[str, ...] | None
+    request_id: str | None = None
+    json: bool = False
 
 
 @dataclass(frozen=True)
@@ -1033,9 +1070,12 @@ def write_record(
         "log": log,
         "phase": phase,
     }
-    root = registry_root()
-    final = root / f"{task_id}.json"
-    temp = root / f".{task_id}.{uuid.uuid4().hex}.tmp"
+    atomic_json(registry_root() / f"{task_id}.json", payload)
+
+
+def atomic_json(final: Path, payload: Mapping[str, object]) -> None:
+    root = final.parent
+    temp = root / f".{final.stem}.{uuid.uuid4().hex}.tmp"
     descriptor = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
@@ -1045,6 +1085,10 @@ def write_record(
         os.replace(temp, final)
     finally:
         temp.unlink(missing_ok=True)
+    sync_directory(root)
+
+
+def sync_directory(root: Path) -> None:
     directory = os.open(root, os.O_RDONLY)
     try:
         os.fsync(directory)
@@ -1057,6 +1101,7 @@ def delete_record(task_id: str) -> None:
     (root / f"{task_id}.json").unlink(missing_ok=True)
     for leftover in root.glob(f".{task_id}.*.tmp"):
         leftover.unlink(missing_ok=True)
+    sync_directory(root)
 
 
 def read_record(path: Path) -> TaskRecord:
@@ -1119,8 +1164,6 @@ def read_records() -> tuple[list[TaskRecord], list[Path]]:
 def claimed_log_paths() -> set[Path]:
     claimed: set[Path] = set()
     registry = (state_root() / "registry").resolve()
-    if not registry.is_dir():
-        return claimed
     for path in registry.glob("*/*.json"):
         try:
             decoded = json.loads(path.read_text(encoding="utf-8"))
@@ -1128,6 +1171,10 @@ def claimed_log_paths() -> set[Path]:
             continue
         if isinstance(decoded, dict) and isinstance(decoded.get("log"), str):
             claimed.add(Path(decoded["log"]).expanduser().resolve())
+    for root in (state_root(), *legacy_state_roots()):
+        for path in (root / "history").glob("*.json"):
+            value = read_history(path)
+            claimed.add(Path(value["log"]).expanduser().resolve())
     return claimed
 
 
@@ -1152,6 +1199,168 @@ def backfill_records(tasks: Sequence[Task]) -> None:
         existing = on_disk.get(task.id)
         if existing is None or existing.phase == RECORD_PHASE_PENDING:
             record_from_task(task, RECORD_PHASE_LIVE)
+        snapshot_history(task, create=True)
+
+
+def history_path(task_id: str, log: str) -> Path:
+    if re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", task_id) is None:
+        raise CliLaneError("invalid history task ID")
+    log_path = Path(log)
+    if not log_path.is_absolute() or log_path.name != f"{task_id}.log" or log_path.parent.name != "logs":
+        raise CliLaneError("invalid history log path")
+    root = log_path.parent.parent / "history"
+    return root / f"{task_id}.json"
+
+
+def read_history(path: Path) -> dict[str, object]:
+    try:
+        if path.stat().st_size > 1024 * 1024:
+            raise ValueError("history is too large")
+        value = json.loads(
+            path.read_text(encoding="utf-8"), parse_constant=reject_json_constant,
+            parse_float=finite_json_float, parse_int=bounded_json_int,
+        )
+        if not isinstance(value, dict) or type(value.get("schema_version")) is not int or value["schema_version"] != 1:
+            raise ValueError("unsupported history schema")
+        for field in ("id", "name", "command", "cwd", "created", "log", "session", "socket"):
+            item = value[field]
+            if field == "command":
+                if not isinstance(item, list) or not item or not all(isinstance(part, str) for part in item):
+                    raise ValueError("invalid command")
+            elif not isinstance(item, str):
+                raise ValueError("invalid metadata")
+        if value["id"] != path.stem or value["session"] != f"{SESSION_PREFIX}{path.stem.replace('-', '')[:12]}":
+            raise ValueError("identity mismatch")
+        for field in ("committed", "stop_requested", "terminal_complete"):
+            if type(value.get(field)) is not bool:
+                raise ValueError("invalid lifecycle")
+        for field in ("exit_code", "pid"):
+            if value.get(field) is not None and type(value[field]) is not int:
+                raise ValueError("invalid result")
+        for field in ("signal_name", "process_started"):
+            if value.get(field) is not None and not isinstance(value[field], str):
+                raise ValueError("invalid process identity")
+        for field in ("origin", "resumed_from", "manual_title", "prompt_title", "display_title"):
+            if not isinstance(value.get(field, ""), str):
+                raise ValueError("invalid presentation")
+        if value.get("binding") is not None and not isinstance(value["binding"], dict):
+            raise ValueError("invalid binding")
+        if isinstance(value.get("binding"), dict) and type(value["binding"].get("revision", 0)) is not int:
+            raise ValueError("invalid binding revision")
+        return value
+    except (OSError, ValueError, KeyError, RecursionError) as error:
+        raise CliLaneError(f"damaged job history: {str(path)!r}") from error
+
+
+def update_history(
+    task_id: str, log: str, changes: Mapping[str, object],
+    *, initial: Mapping[str, object] | None = None, delete: bool = False,
+    required: bool = False,
+) -> None:
+    path = history_path(task_id, log)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    with path.with_suffix(".lock").open("a+b") as handle:
+        os.chmod(handle.name, 0o600)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        if delete:
+            path.unlink(missing_ok=True)
+            sync_directory(path.parent)
+            return
+        if path.exists():
+            old = read_history(path)
+        elif initial is not None:
+            old = dict(initial)
+        else:
+            if required:
+                raise CliLaneError("job history disappeared before execution")
+            return
+        updated = {**old, **changes}
+        if old.get("pid") is not None and old["pid"] > 0 and old.get("process_started"):
+            for field in ("pid", "process_started"):
+                updated[field] = old[field]
+        if old.get("exit_code") is not None:
+            for field in ("exit_code", "signal_name", "finished"):
+                updated[field] = old.get(field)
+        if old.get("terminal_complete"):
+            updated["terminal_complete"] = True
+        if old.get("stop_requested"):
+            updated["stop_requested"] = True
+        if old.get("committed"):
+            updated["committed"] = True
+        previous_binding, binding = old.get("binding"), updated.get("binding")
+        if isinstance(previous_binding, dict) and isinstance(binding, dict):
+            if previous_binding.get("revision", 0) > binding.get("revision", 0):
+                updated["binding"] = previous_binding
+        if updated != old or not path.exists():
+            atomic_json(path, updated)
+
+
+def snapshot_history(task: Task, *, create: bool = False) -> None:
+    if task.archived:
+        return
+    initial: dict[str, object] = {
+        "schema_version": 1, "socket": socket_identity(), "session": task.session,
+        "id": task.id, "name": task.name, "command": task.command, "cwd": task.cwd,
+        "created": task.created, "log": task.log, "origin": task.origin,
+        "committed": task.committed, "process_started": task.process_started,
+        "pid": task.pid, "stop_requested": task.stop_requested,
+        "exit_code": None, "signal_name": None, "finished": None,
+        "terminal_complete": False, "binding": task.binding,
+        "resumed_from": task.resumed_from, "manual_title": task.manual_title,
+        "prompt_title": task.prompt_title, "display_title": task.display_title,
+    }
+    if create and task.pane:
+        for field, option in (("manual_title", "@agt_display_title"), ("prompt_title", "@agt_prompt_title")):
+            initial[field] = hub_display_text(tmux(
+                ["show-options", "-pqv", "-t", task.pane, option], check=False,
+            ).stdout.decode().strip())
+    changes: dict[str, object] = {"committed": task.committed, "stop_requested": task.stop_requested}
+    if task.process_started:
+        changes.update(process_started=task.process_started, pid=task.pid)
+    if task.dead and task.result_recorded:
+        changes.update(exit_code=task.exit_code, signal_name=task.signal_name,
+                       binding=task.binding, terminal_complete=managed_session_empty(task))
+    update_history(task.id, task.log, changes, initial=initial if create else None)
+
+
+def saved_tasks() -> list[Task]:
+    tasks: dict[str, Task] = {}
+    for root in (state_root(), *legacy_state_roots()):
+        for path in sorted((root / "history").glob("*.json")):
+            value = read_history(path)
+            if value["socket"] != socket_identity() or value["id"] in tasks:
+                continue
+            task = Task(
+                session=value["session"], pane="", id=value["id"], name=value["name"],
+                command=value["command"], cwd=value["cwd"], created=value["created"],
+                log=value["log"], committed=value["committed"],
+                process_started=value.get("process_started"), stop_requested=value["stop_requested"],
+                dead=True, exit_code=value.get("exit_code"), signal_name=value.get("signal_name"),
+                pid=value.get("pid"), attached=False, origin=value.get("origin", "local"),
+                binding=value.get("binding"), display_title=value.get("manual_title") or value.get("display_title") or value.get("prompt_title", ""),
+                archived=True, result_recorded=value.get("exit_code") is not None,
+                terminal_complete=value["terminal_complete"], resumed_from=value.get("resumed_from", ""),
+                manual_title=value.get("manual_title", ""), prompt_title=value.get("prompt_title", ""),
+            )
+            validated_log_path(task)
+            tasks[task.id] = task
+    for record in read_records()[0]:
+        if record.id not in tasks and record.phase == RECORD_PHASE_LIVE:
+            tasks[record.id] = Task(
+                session=record.session, pane="", id=record.id, name=record.name, command=record.command,
+                cwd=record.cwd, created=record.created, log=record.log, committed=True,
+                process_started=None, stop_requested=False, dead=True, exit_code=None,
+                signal_name=None, pid=None, attached=False, origin="local", archived=True,
+            )
+    return list(tasks.values())
+
+
+def history_tasks(live: Sequence[Task] | None = None) -> list[Task]:
+    current = list_tasks() if live is None else live
+    combined = {task.id: task for task in saved_tasks()}
+    combined.update((task.id, task) for task in current)
+    return sorted(combined.values(), key=lambda task: task.created)
 
 
 @contextmanager
@@ -1408,6 +1617,7 @@ def prepare_claude_tracking(
     nonce = uuid.uuid4().hex
     binding: dict[str, object] = {
         "schema_version": 1,
+        "revision": 0,
         "task_id": task_id,
         "nonce": nonce,
         "profile": spec.profile,
@@ -1470,8 +1680,10 @@ def claude_tracking_started(task_id: str, nonce: str) -> None:
     started = process_start_time(os.getpid())
     if started is None:
         raise CliLaneError("could not identify the Claude provider process")
-    binding.update(provider_pid=os.getpid(), provider_started=started)
+    binding.update(provider_pid=os.getpid(), provider_started=started,
+                   revision=binding.get("revision", 0) + 1)
     tmux(["set-option", "-t", pane, "@agt_claude_binding", encode_meta(binding)])
+    update_history(task_id, os.environ["CLILANE_LOG"], {"binding": binding})
 
 
 def claude_event(session: str, task_id: str, nonce: str) -> int:
@@ -1518,6 +1730,7 @@ def claude_event(session: str, task_id: str, nonce: str) -> int:
         ):
             return 0
         updated = dict(binding)
+        updated["revision"] = binding.get("revision", 0) + 1
         observed = binding.get("observed_ids")
         if not isinstance(observed, list) or not all(isinstance(value, str) for value in observed):
             return 0
@@ -1555,6 +1768,7 @@ def claude_event(session: str, task_id: str, nonce: str) -> int:
             check=False,
         )
         if current.stdout.decode().strip() == encoded:
+            update_history(task.id, task.log, {"binding": updated})
             return 0
     return 0
 
@@ -1871,6 +2085,14 @@ def supervise(encoded_command: str) -> int:
     forwarded = (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)
     for sent_signal in forwarded:
         signal.signal(sent_signal, remember)
+    started = process_start_time(os.getpid())
+    if started is None or os.getsid(0) != os.getpid():
+        raise CliLaneError("could not verify the supervisor identity before execution")
+    update_history(str(launcher["id"]), str(launcher["log"]), {
+        "pid": os.getpid(), "process_started": started,
+    }, required=True)
+    if pending:
+        raise CliLaneError("launch interrupted before execution")
     child = os.fork()
     if child == 0:
         for sent_signal in forwarded:
@@ -1912,9 +2134,13 @@ def supervise(encoded_command: str) -> int:
             signal_name = signal.Signals(-result).name
         except ValueError:
             signal_name = f"SIG{-result}"
-    record_result(exit_code, signal_name)
-    terminate_session_descendants(os.getpid(), 0.2)
+    persist_supervisor_history(launcher, {
+        "exit_code": exit_code, "signal_name": signal_name or None,
+        "finished": datetime.now(timezone.utc).isoformat(),
+    })
     try:
+        record_result(exit_code, signal_name)
+        terminate_session_descendants(os.getpid(), 0.2)
         if shutdown_deadline is None:
             run_exit_hook(
                 launcher,
@@ -1925,7 +2151,15 @@ def supervise(encoded_command: str) -> int:
             )
     finally:
         terminate_session_descendants(os.getpid(), 0.2)
+        persist_supervisor_history(launcher, {"terminal_complete": True})
     return exit_code
+
+
+def persist_supervisor_history(launcher: Mapping[str, object], changes: Mapping[str, object]) -> None:
+    try:
+        update_history(str(launcher["id"]), str(launcher["log"]), changes)
+    except (OSError, CliLaneError) as error:
+        report_hook(f"could not save job history: {error}")
 
 
 def record_result(exit_code: int, signal_name: str) -> None:
@@ -2137,6 +2371,8 @@ def list_tasks(timeout: float | None = None) -> list[Task]:
             origin=origin if origin in {"bot", "local"} else "local",
             binding=(decode_meta(encoded_binding) if encoded_binding else {})
             if meta.get("claude_tracking") is True else None,
+            result_recorded=recorded_code is not None,
+            resumed_from=str(meta.get("resumed_from", "")),
         )
         candidates.setdefault(session, []).append((task, canonical_pane, ready))
     tasks: list[Task] = []
@@ -2609,20 +2845,22 @@ def collect_fleet(hosts: Sequence[FleetHost], timeout: float) -> list[FleetResul
     return [results[host.name] for host in hosts]
 
 
-def resolve_task(target: str) -> Task:
+def resolve_task(target: str, *, include_history: bool = False, exact_id: bool = False) -> Task:
     tasks = list_tasks()
-    exact = [task for task in tasks if target in {task.name, task.id, task.session}]
+    archived = [task for task in saved_tasks() if task.id not in {item.id for item in tasks}] if include_history else []
+    exact = [task for task in tasks if target == task.id or not exact_id and target in {task.name, task.session}]
+    exact.extend(task for task in archived if task.id == target)
     if len(exact) == 1:
         return exact[0]
     if len(exact) > 1:
         raise CliLaneError(f"ambiguous task name: {target}")
-    prefixed = [task for task in tasks if task.id.startswith(target)]
+    prefixed = [] if exact_id else [task for task in [*tasks, *archived] if task.id.startswith(target)]
     if len(prefixed) == 1:
         return prefixed[0]
     if len(prefixed) > 1:
         raise CliLaneError(f"ambiguous task id: {target}")
     raise CliLaneError(
-        f"task not found: {target}; run '{PROGRAM} list' to see managed tasks"
+        f"task not found: {target}; run '{PROGRAM} list' or '{PROGRAM} history' to see jobs"
     )
 
 
@@ -2695,10 +2933,34 @@ def parse_run_request(parts: Sequence[str]) -> RunRequest:
     timeout: float | None = None
     on_exit: str | None = None
     profile: str | None = None
+    request_id: str | None = None
+    as_json = False
     seen: set[str] = set()
     index = 0
     while index < len(prefix):
         token = prefix[index]
+        if token == "--json":
+            if "json" in seen:
+                raise CliLaneError("--json may be supplied only once")
+            seen.add("json")
+            as_json = True
+            index += 1
+            continue
+        if token == "--request-id" or token.startswith("--request-id="):
+            if "request_id" in seen:
+                raise CliLaneError("--request-id may be supplied only once")
+            seen.add("request_id")
+            if token == "--request-id":
+                if index + 1 >= len(prefix):
+                    raise CliLaneError("--request-id requires a key")
+                request_id = prefix[index + 1]
+                index += 2
+            else:
+                request_id = token.split("=", 1)[1]
+                index += 1
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", request_id) is None:
+                raise CliLaneError("--request-id requires 1–128 letters, digits, or . _ : / -; start with a letter or digit")
+            continue
         if token in {"-C", "--cwd"}:
             if "cwd" in seen:
                 raise CliLaneError("-C/--cwd may be supplied only once")
@@ -2806,6 +3068,8 @@ def parse_run_request(parts: Sequence[str]) -> RunRequest:
         on_exit=on_exit,
         profile=profile,
         command=command,
+        request_id=request_id,
+        json=as_json,
     )
 
 
@@ -2948,6 +3212,94 @@ def resolve_run_request(
         profile=profile.name,
         provider=profile.provider,
     )
+
+
+def launch_request_intent(request: RunRequest, default_cwd: str) -> dict[str, object]:
+    directory = request.cwd if request.cwd_explicit else default_cwd if request.profile is None else None
+    return {
+        "name": request.name, "command": request.command, "profile": request.profile,
+        "cwd": str(Path(directory).expanduser().resolve()) if directory is not None else None,
+        "on_exit": request.on_exit,
+    }
+
+
+@contextmanager
+def launch_request_lock(key: str) -> Iterator[Path]:
+    root = state_root_path() / "requests"
+    missing: list[Path] = []
+    ancestor = root
+    while not ancestor.exists():
+        missing.append(ancestor)
+        ancestor = ancestor.parent
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700, exist_ok=True)
+        sync_directory(directory.parent)
+    os.chmod(root, 0o700)
+    for directory in (root, *root.parents):
+        sync_directory(directory)
+    path = root / f"{hashlib.sha256(key.encode()).hexdigest()}.json"
+    with path.with_suffix(".lock").open("a+b") as handle:
+        os.chmod(handle.name, 0o600)
+        os.fsync(handle.fileno())
+        sync_directory(root)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield path
+
+
+def read_launch_request(path: Path) -> dict[str, object]:
+    try:
+        if path.stat().st_size > 8192:
+            raise ValueError("oversized claim")
+        value = json.loads(
+            path.read_text(encoding="utf-8"), parse_constant=reject_json_constant,
+            parse_int=bounded_json_int, parse_float=finite_json_float,
+        )
+        if not isinstance(value, dict) or set(value) != {"schema_version", "task_id", "fingerprint", "socket", "created"}:
+            raise ValueError("invalid claim")
+        if type(value["schema_version"]) is not int or value["schema_version"] != 1:
+            raise ValueError("unsupported claim schema")
+        if any(not isinstance(value[field], str) for field in ("task_id", "fingerprint", "socket", "created")):
+            raise ValueError("invalid claim fields")
+        if str(uuid.UUID(value["task_id"])) != value["task_id"] or re.fullmatch(r"[0-9a-f]{64}", value["fingerprint"]) is None:
+            raise ValueError("invalid claim identity")
+        return value
+    except (OSError, ValueError, KeyError, RecursionError) as error:
+        raise LaunchRequestError("request_corrupt", "Request record cannot be verified; no replacement was launched") from error
+
+
+def run_requested_task(
+    request: RunRequest, environment: Mapping[str, str], default_cwd: str,
+) -> Task:
+    if request.request_id is None:
+        return run_task(resolve_run_request(request, environment, default_cwd))
+    intent = launch_request_intent(request, default_cwd)
+    fingerprint = selection_digest(intent)
+    with launch_request_lock(request.request_id) as path:
+        if path.exists():
+            claim = read_launch_request(path)
+            original_id = str(claim["task_id"])
+            if claim["socket"] != socket_identity():
+                raise LaunchRequestError("request_socket_conflict", "Request belongs to a different tmux socket selection", original_id)
+            if claim["fingerprint"] != fingerprint:
+                raise LaunchRequestError("request_conflict", "Request ID is already bound to different launch arguments", original_id)
+            try:
+                task = resolve_task(original_id, include_history=True, exact_id=True)
+            except CliLaneError as error:
+                raise LaunchRequestError(
+                    "request_unavailable", "Original job is unavailable or its launch is unconfirmed; inspect before starting new work", original_id,
+                ) from error
+            return replace(task, launch_reused=True)
+        normalized = replace(request, cwd=str(intent["cwd"]), cwd_explicit=True) if intent["cwd"] is not None else request
+        spec = resolve_run_request(normalized, environment, default_cwd)
+        try:
+            return run_task(spec, launch_request=(path, fingerprint))
+        except (CliLaneError, OSError) as error:
+            if path.exists():
+                claim = read_launch_request(path)
+                raise LaunchRequestError(
+                    "launch_unconfirmed", f"Launch was not confirmed: {error}; inspect original job before starting new work", str(claim["task_id"]),
+                ) from error
+            raise
 
 
 def native_process_bytes(value: str, label: str) -> int:
@@ -3164,33 +3516,15 @@ def configure_task_status(session: str, command: Sequence[str]) -> None:
         else hub_command_kind(command)
     )
     agent = kind in HUB_LEFT_AGENT_KINDS
-    tmux(
-        [
-            "set-option",
-            "-t",
-            session,
-            "status-left",
-            " #{?#{OPENCLAW_SESSION},BOT,LOCAL} · #{window_name} ",
-        ],
-        check=False,
-    )
-    tmux(["set-option", "-t", session, "status-left-length", "50"], check=False)
-    tmux(
-        [
-            "set-option",
-            "-t",
-            session,
-            "status-right",
-            " ←/→ empty · Ctrl-B back " if agent else " Ctrl-B back to sessions ",
-        ],
-        check=False,
-    )
-    tmux(
-        ["set-option", "-t", session, "@agt_agent", kind]
-        if agent
-        else ["set-option", "-u", "-t", session, "@agt_agent"],
-        check=False,
-    )
+    tmux([
+        "set-option", "-t", session, "status-left",
+        " #{?#{OPENCLAW_SESSION},BOT,LOCAL} · #{window_name} ",
+        ";", "set-option", "-t", session, "status-left-length", "50",
+        ";", "set-option", "-t", session, "status-right",
+        " ←/→ empty · Ctrl-B back " if agent else " Ctrl-B back to sessions ",
+        ";", *(["set-option", "-t", session, "@agt_agent", kind] if agent else
+                ["set-option", "-u", "-t", session, "@agt_agent"]),
+    ], check=False)
 
 
 def kill_managed_session(session: str) -> None:
@@ -3296,7 +3630,11 @@ def respawn_task_arguments(
     ]
 
 
-def run_task(spec: LaunchSpec, *, require_claude_tracking: bool = False) -> Task:
+def run_task(
+    spec: LaunchSpec, *, require_claude_tracking: bool = False,
+    resume_from: Task | None = None,
+    launch_request: tuple[Path, str] | None = None,
+) -> Task:
     spec = complete_launch_spec(
         name=spec.name,
         cwd_value=spec.cwd,
@@ -3319,6 +3657,24 @@ def run_task(spec: LaunchSpec, *, require_claude_tracking: bool = False) -> Task
         existing_environment = preflight_launch(spec)
         existing = list_tasks()
         backfill_records(existing)
+        if resume_from is not None:
+            source = resolve_task(resume_from.id, include_history=True)
+            if source.binding != resume_from.binding:
+                raise CliLaneError("original conversation binding changed; reopen history before recovering")
+            if not source.dead or not source.committed:
+                raise CliLaneError("the original job has not finished")
+            if not source.recovery_receipt:
+                raise CliLaneError("Recovery unavailable: job outcome or cleanup unknown. Inspect saved logs first.")
+            if not managed_session_empty(source):
+                raise CliLaneError("the original job still has live descendants")
+            attempts = history_tasks(existing)
+            for attempt in attempts:
+                if attempt.resumed_from == source.id and (
+                    not attempt.dead or attempt.state == TASK_STATE_UNKNOWN
+                    or (attempt.archived and not attempt.terminal_complete)
+                ):
+                    raise CliLaneError(f"recovery already exists or is unresolved: {attempt.name} {attempt.id[:8]}")
+            spec = replace(spec, name=next_hub_task_name(source.name, attempts))
         if any(task.name == spec.name for task in existing):
             raise CliLaneError(f"task already exists: {spec.name}")
         if tracking:
@@ -3327,6 +3683,14 @@ def run_task(spec: LaunchSpec, *, require_claude_tracking: bool = False) -> Task
         command = list(spec.command)
         task_id = str(uuid.uuid4())
         session = f"{SESSION_PREFIX}{task_id.replace('-', '')[:12]}"
+        if launch_request is not None:
+            path, fingerprint = launch_request
+            if path.exists():
+                raise CliLaneError("launch request was already claimed")
+            atomic_json(path, {
+                "schema_version": 1, "task_id": task_id, "fingerprint": fingerprint,
+                "socket": socket_identity(), "created": datetime.now(timezone.utc).isoformat(),
+            })
         runtime_state_root = state_root()
         log_dir = runtime_state_root / "logs"
         log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -3351,12 +3715,21 @@ def run_task(spec: LaunchSpec, *, require_claude_tracking: bool = False) -> Task
             session,
             RECORD_PHASE_PENDING,
         )
+        snapshot_history(Task(
+            session=session, pane="", id=task_id, name=spec.name, command=command,
+            cwd=str(cwd), created=created_stamp, log=str(log_path), committed=False,
+            process_started=None, stop_requested=False, dead=False, exit_code=None,
+            signal_name=None, pid=None, attached=False,
+            origin="bot" if environment.get("OPENCLAW_SESSION") else "local",
+            resumed_from=resume_from.id if resume_from is not None else "",
+        ), create=True)
         log_created = False
         try:
             log_path.touch(mode=0o600, exist_ok=False)
             log_created = True
         except OSError:
             delete_record(task_id)
+            update_history(task_id, str(log_path), {}, delete=True)
             raise
         meta: dict[str, object] = {
             "id": task_id,
@@ -3367,6 +3740,7 @@ def run_task(spec: LaunchSpec, *, require_claude_tracking: bool = False) -> Task
             "log": str(log_path),
             "on_exit": spec.on_exit,
             "claude_tracking": tracking,
+            "resumed_from": resume_from.id if resume_from is not None else "",
         }
         script = Path(__file__).resolve()
         python_binary = str(Path(sys.executable).resolve())
@@ -3375,6 +3749,7 @@ def run_task(spec: LaunchSpec, *, require_claude_tracking: bool = False) -> Task
         pane = ""
         started: str | None = None
         settings_path: Path | None = None
+        spawned = False
         try:
             created = tmux(initial_task_queue(session, str(cwd), meta))
             pane = created.stdout.decode().strip()
@@ -3393,6 +3768,7 @@ def run_task(spec: LaunchSpec, *, require_claude_tracking: bool = False) -> Task
                 settings_path = claude_settings_path(task_id, str(log_path))
                 require_portable_footprint("Claude provider launch", execution_command, environment)
                 tmux(["set-option", "-t", session, "@agt_claude_binding", encode_meta(binding)])
+                update_history(task_id, str(log_path), {"binding": binding})
             placeholder_pane = pane
             set_task_environment(session, environment, existing_environment)
             replacement = tmux(
@@ -3441,6 +3817,7 @@ def run_task(spec: LaunchSpec, *, require_claude_tracking: bool = False) -> Task
                  str(script), control_binary, control_socket, launcher)],
                 tmux_client_environment(),
             )
+            spawned = True
             tmux(
                 respawn_task_arguments(
                     pane,
@@ -3488,18 +3865,23 @@ def run_task(spec: LaunchSpec, *, require_claude_tracking: bool = False) -> Task
                 session,
                 RECORD_PHASE_LIVE,
             )
+            update_history(task_id, str(log_path), {"committed": True})
             committed = True
             return resolve_task(task_id)
         finally:
             if not committed:
                 terminate_incomplete_session(session, pane, 0.5, started)
                 kill_managed_session(session)
-                if log_created:
+                if log_created and not spawned:
                     log_path.unlink(missing_ok=True)
                     log_path.with_suffix(log_path.suffix + ".previous").unlink(missing_ok=True)
                 if settings_path is not None:
                     settings_path.unlink(missing_ok=True)
-                delete_record(task_id)
+                if spawned:
+                    update_history(task_id, str(log_path), {"terminal_complete": True})
+                else:
+                    delete_record(task_id)
+                    update_history(task_id, str(log_path), {}, delete=True)
 
 
 def age(created: str) -> str:
@@ -3812,6 +4194,8 @@ def attach_client(arguments: Sequence[str]) -> int:
 
 
 def attach_task(task: Task) -> int:
+    if task.archived:
+        raise CliLaneError(f"terminal is gone; use '{PROGRAM} log {task.id[:8]}' or open its saved log in Sessions")
     require_attach_terminal()
     configure_task_status(task.session, task.command)
     context = create_hub_context(None)
@@ -4286,16 +4670,28 @@ def omp_empty_prompt(rows, row, cursor, columns):
     status = plain(rows[row - 1])
     prompt = plain(rows[row])
     hint = "⇧⇥ to change thinking effort"
+    framed = status.startswith("╭── π > ") and status.endswith("╮")
+    suffix = " ─╯" if framed else ""
+    padding = len(suffix)
     return (
-        status.startswith(" π > ")
-        and status.endswith("─")
+        (framed or (status.startswith(" π > ") and status.endswith("─")))
         and prompt.startswith("╰─ ")
-        and prompt[3:].strip() == hint
-        and columns - len(hint) - 1 <= prompt.index("⇧⇥") <= columns - len(hint)
-        and re.search(
-            r"\x1b\[3m(?:\x1b\[[0-9;:]*m)*to change thinking effort(?:\x1b\[[0-9;:]*m)*$",
-            rows[row],
-        ) is not None
+        and prompt[3:].strip() == hint + suffix
+        and columns - len(hint) - padding - 1 <= prompt.index("⇧⇥") <= columns - len(hint) - padding
+        and (
+            re.search(
+                r"\x1b\[3m(?:\x1b\[[0-9;:]*m)*to change thinking effort(?:\x1b\[[0-9;:]*m|[ ─╯])*$",
+                rows[row],
+            ) is not None
+            or (
+                framed and re.search(
+                    r"⇧⇥(?:\x1b\[[0-9;:]*m)+ (?:\x1b\[[0-9;:]*m)+"
+                    r"to change thinking effort(?:\x1b\[[0-9;:]*m)+ ─╯"
+                    r"(?:\x1b\[[0-9;:]*m)*$",
+                    rows[row],
+                ) is not None
+            )
+        )
         and all(not plain(value).strip() for value in rows[row + 1:])
     )
 
@@ -4405,34 +4801,170 @@ def bind_hub_keys() -> None:
     tmux(["set-option", "-gu", "@agt_hub_config"], check=False)
 
 
+def hub_display_text(value: str, limit: int = 64) -> str:
+    value = re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))", "", value)
+    value = " ".join(fleet_display_cell(value).split())
+    value = re.sub(r"(?i)\b([\w]*(?:TOKEN|KEY|SECRET)|AWS_\w+|OAuth\w*)\s*[=:]\s*\S+", r"\1=[redacted]", value)
+    return fleet_display_cell(value, limit)
+
+
+def hub_task_title(task: Task) -> str:
+    return task.display_title or task.name
+
+
+def hub_task_state(task: Task) -> str:
+    return task.display_state or ("open" if task.state == TASK_STATE_RUNNING else task.state)
+
+
+def hub_is_shell(task: Task) -> bool:
+    return bool(task.command) and Path(task.command[0]).name in {
+        "sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh",
+    } and all(argument in {
+        "-l", "--login", "-i", "--interactive", "-il", "-li", "--noprofile", "--norc", "-f",
+    } for argument in task.command[1:])
+
+
+def hub_observed_activity(task: Task, cursor: str) -> str:
+    if task.dead or not task.command or Path(task.command[0]).name != "codex":
+        return ""
+    if not cursor.isdecimal():
+        return ""
+    try:
+        captured = tmux(["capture-pane", "-p", "-t", task.pane, "-S", "0"], check=False, timeout=1)
+    except CliLaneError:
+        return ""
+    if captured.returncode:
+        return ""
+    rows = captured.stdout.decode(errors="replace").splitlines()
+    row = int(cursor)
+    if row >= len(rows):
+        return ""
+    footer = "\n".join(rows[max(0, row - 3):]).lower()
+    if "esc to interrupt" in footer:
+        return "working*"
+    if "esc to cancel" in footer and "enter to confirm" in footer:
+        return "approval*"
+    if rows[row].lstrip().startswith("›") and "? for shortcuts" in footer:
+        return "ready*"
+    return ""
+
+
+def hub_display_tasks(tasks: Sequence[Task], *, observe: bool | str = False) -> list[Task]:
+    if not tasks:
+        return []
+    fields = ["#{pane_id}", "#{session_id}"] + [
+        "#{s|[\x01-\x1f\x7f]| |:" + value + "}"
+        for value in ("pane_title", "@agt_display_title", "@agt_prompt_title", "pane_current_path", "pane_current_command", "host", "host_short")
+    ] + ["#{cursor_y}"]
+    result = tmux(["list-panes", "-a", "-F", "\x1f".join(fields)], check=False)
+    details = {}
+    for line in result.stdout.decode(errors="replace").split("\n"):
+        values = line.split("\x1f")
+        if len(values) == len(fields) and re.fullmatch(r"%[0-9]+", values[0]):
+            details[values[0]] = values[1:]
+    displayed = []
+    for task in tasks:
+        if task.archived:
+            displayed.append(task)
+            continue
+        values = details.get(task.pane, [""] * 9)
+        session_id, native, manual, initial, current_cwd, foreground, host, short_host, cursor = values
+        executable = Path(task.command[0]).name if task.command else ""
+        project = Path(task.cwd).name or task.cwd
+        native = re.sub(r"^[\u2800-\u28ff◐◓◑◒✳✻✽✶✢·•●○]+\s+", "", native)
+        native = re.sub(r"^\[[^\]]{1,8}\]\s*(?:Action Required|Working|Ready|Idle|Done)\s*\|\s*", "", native)
+        suffix = " | " + project
+        if native.endswith(suffix):
+            native = native[:-len(suffix)]
+        if native.casefold() in {host.casefold(), short_host.casefold(), os.uname().nodename.casefold()}:
+            native = ""
+        native = hub_display_text(native)
+        known_agent = executable in {*HUB_PROMPT_AGENT_ORDER, *HUB_NATIVE_AGENT_COMMANDS, "kiro-cli"}
+        if not known_agent or native.casefold() in {
+            executable.casefold(), "codex", "claude code", "kimi", "kimi code", "oh my pi",
+            project.casefold(), f"π > {project}".casefold(),
+        }:
+            native = ""
+        title = hub_display_text(manual) or native or hub_display_text(initial)
+        if not title and hub_is_shell(task):
+            title = "Shell · " + (Path(current_cwd or task.cwd).name or "/")
+        activity = hub_observed_activity(task, cursor) if observe is True or observe == task.session else ""
+        program = Path(foreground).name.lower()
+        observed_program = program if not task.dead and hub_is_shell(task) and program in {
+            *HUB_PROMPT_AGENT_ORDER, *HUB_NATIVE_AGENT_COMMANDS, "kiro-cli",
+        } else ""
+        update_history(task.id, task.log, {"display_title": title or task.name})
+        if task.dead:
+            snapshot_history(task)
+        displayed.append(replace(
+            task, display_title=title or task.name, display_state=activity,
+            display_session=session_id if re.fullmatch(r"\$[0-9]+", session_id) else "",
+            observed_program=observed_program,
+        ))
+    return displayed
+
+
+def set_hub_title(task: Task, title: str, *, initial: bool = False) -> None:
+    title = hub_display_text(title)
+    if task.archived:
+        update_history(task.id, task.log, {
+            "prompt_title" if initial else "manual_title": title,
+            "display_title": title or task.prompt_title or task.name,
+        })
+        return
+    tmux(["set-option", "-p", "-t", task.pane,
+          "@agt_prompt_title" if initial else "@agt_display_title", title])
+    update_history(task.id, task.log, {
+        "prompt_title" if initial else "manual_title": title, "display_title": title,
+    })
+
+
+def hub_navigation_status(source: str, columns: str) -> int:
+    if not columns.isdecimal() or not source.startswith((SESSION_PREFIX, HUB_SESSION)):
+        return 1
+    width = int(columns)
+    tasks = hub_display_tasks(list_tasks(), observe=source)
+    visible = [task for task in tasks if task.committed and (not task.dead or task.session == source)]
+    labels = {
+        task.id: fleet_display_cell(hub_task_title(task), 28)
+        + (f" · {task.observed_program}*" if task.observed_program else "")
+        for task in visible
+    }
+    back = "‹ Back to sessions [Ctrl-B]" if width >= 64 else "‹ Back [Ctrl-B]"
+    status = "#[align=left range=left bold] " + back + " #[norange nobold] "
+    status += "#[list=on]#[list=left-marker range=user|previous]‹ #[list=right-marker range=user|next] ›#[norange list=on]"
+    for task in visible:
+        if not task.display_session:
+            continue
+        title = labels[task.id].replace("#", "##")
+        duplicate = sum(label == labels[task.id] for label in labels.values()) > 1
+        if duplicate:
+            title += " · " + task.id[:4]
+        selected = task.session == source
+        if selected and width >= 60:
+            title = ("BOT" if task.origin == "bot" else "LOCAL") + " · " + title
+        elif task.origin == "bot":
+            title += " · bot"
+        style = " list=focus bold reverse" if selected else ""
+        status += f"#[range=session|{task.display_session}{style}] {title}"
+        if selected and task.dead:
+            status += " · " + task.state
+        status += " #[norange nobold noreverse list=on] "
+    status += "#[nolist align=right]"
+    current = next((task for task in tasks if task.session == source), None)
+    if current is not None and width >= 95:
+        provider = Path(current.command[0]).name if current.command else ""
+        if current.observed_program:
+            provider = f"{current.observed_program}*"
+        status += hub_display_text(f"{provider} · {hub_task_state(current)}", 32).replace("#", "##") + " "
+    status += "#[range=user|previous] ‹ #[range=user|next] › #[norange]"
+    print(status)
+    return 0
+
+
 def configure_hub_navigation() -> None:
-    label = "#{=24:window_name}#{?#{OPENCLAW_SESSION}, · bot,}"
-    tab = "#[range=session|#{session_id}] " + label + " #[norange] "
-    current_tab = (
-        "#[range=session|#{session_id} list=focus bold reverse] "
-        "#{?#{e|>=:#{client_width},60},#{?#{OPENCLAW_SESSION},BOT,LOCAL} · ,}"
-        "#{=24:window_name}"
-        "#{?pane_dead, · finished,}"
-        " #[norange nobold noreverse list=on] "
-    )
-    session_tabs = (
-        "#{S/i:#{?#{&&:#{@agt_committed},#{?pane_dead,0,1}},"
-        + tab
-        + ",},#{?#{@agt_meta},"
-        + current_tab
-        + ",}}"
-    )
-    status = (
-        "#[align=left range=left bold] "
-        "#{?#{e|>=:#{client_width},64},‹ Back to sessions [Ctrl-B],‹ Back [Ctrl-B]} "
-        "#[norange nobold] "
-        "#[list=on]#[list=left-marker range=user|previous]‹ "
-        "#[list=right-marker range=user|next] ›#[norange list=on]"
-        + session_tabs
-        + "#[nolist align=right]"
-        "#{?#{e|>=:#{client_width},95},#{E:status-right},}"
-        "#[range=user|previous] ‹ #[range=user|next] › #[norange]"
-    )
+    status_command = hub_helper_prefix("__hub-status") + "#{q:session_name} '#{client_width}'"
+    status = "#(" + status_command + ")"
     tmux(["set-option", "-g", "status", "on"])
     tmux(["set-option", "-g", "status-position", "top"])
     tmux(["set-option", "-g", "status-style", "fg=default,bg=default"])
@@ -4863,13 +5395,14 @@ def create_hub_pane(
         if created.returncode != 0:
             detail = created.stderr.decode(errors="replace").strip()
             raise CliLaneError(detail or "could not create the session switcher")
+        setup: list[str] = []
         for option, setting in (
             ("history-limit", "0"), ("status", "off"),
             ("prefix", "None"), ("prefix2", "None"),
             ("key-table", HUB_PANE_KEY_TABLE), ("destroy-unattached", "off"),
             ("detach-on-destroy", "on"),
         ):
-            tmux(["set-option", "-t", session, option, setting])
+            setup.extend(["set-option", "-t", session, option, setting, ";"])
         tmux(["unbind-key", "-T", HUB_PANE_KEY_TABLE, "Any"], check=False)
         for key in (
             "C-q", "C-c", "C-d", "C-r", "C-u", "C-x", "C-b",
@@ -4878,24 +5411,29 @@ def create_hub_pane(
             "Home", "End", "DC", "F1", "C-Left", "C-Right", "C-DC",
             "M-Left", "M-Right", "M-b", "M-f", "M-d", "M-BSpace",
         ):
-            tmux(["bind-key", "-T", HUB_PANE_KEY_TABLE, key, "send-keys", key])
+            setup.extend(["bind-key", "-T", HUB_PANE_KEY_TABLE, key, "send-keys", key, ";"])
         for key in (
             "MouseDown1Pane", "MouseUp1Pane", "SecondClick1Pane", "TripleClick1Pane",
             "WheelUpPane", "WheelDownPane",
         ):
-            tmux(["bind-key", "-T", HUB_PANE_KEY_TABLE, key, "send-keys", "-M"])
+            setup.extend(["bind-key", "-T", HUB_PANE_KEY_TABLE, key, "send-keys", "-M", ";"])
         created = tmux([
+            *setup,
             "new-window", "-d", "-P", "-F", "#{pane_id}", "-t", session + ":",
             "-c", str(state_root()), "--", "/bin/sleep", "2147483647",
         ])
         pane = created.stdout.decode().strip()
-        tmux(["set-option", "-t", session, HUB_PANE_ID_OPTION, pane])
-        tmux(["set-option", "-w", "-t", pane, "window-size", "latest"])
-        tmux(["set-option", "-w", "-t", pane, "remain-on-exit", "off"])
-        tmux(["set-option", "-w", "-t", pane, "automatic-rename", "off"])
-        tmux(["rename-window", "-t", pane, "Sessions"])
-        tmux(["select-window", "-t", pane])
-        tmux(["kill-window", "-t", bootstrap])
+        if re.fullmatch(r"%[0-9]+", pane) is None:
+            raise CliLaneError("could not identify the session switcher pane")
+        tmux([
+            "set-option", "-t", session, HUB_PANE_ID_OPTION, pane,
+            ";", "set-option", "-w", "-t", pane, "window-size", "latest",
+            ";", "set-option", "-w", "-t", pane, "remain-on-exit", "off",
+            ";", "set-option", "-w", "-t", pane, "automatic-rename", "off",
+            ";", "rename-window", "-t", pane, "Sessions",
+            ";", "select-window", "-t", pane,
+            ";", "kill-window", "-t", bootstrap,
+        ])
         return pane
     except BaseException:
         identity = tmux_all([
@@ -5304,9 +5842,11 @@ def hub_agent_composer_ready(task: Task, kind: str) -> bool:
     rows = captured.stdout.decode(errors="replace").splitlines()
     if captured.returncode != 0 or row >= len(rows):
         return False
-    if kind == "kiro-cli":
+    if kind in {"omp", "kiro-cli"}:
         probe = {"__name__": "clilane_prompt_probe"}
         exec(HUB_LEFT_PROBE_SOURCE, probe)
+        if kind == "omp":
+            return bool(probe["omp_empty_prompt"](rows, row, column, columns))
         return bool(cursor_visible and probe["kiro_empty_prompt"](rows, row, column, columns))
     faint = False
     visible: list[str] = []
@@ -5371,8 +5911,6 @@ def wait_for_hub_agent_ready(preset: dict[str, object], task: Task) -> None:
                     f"could not inspect {task.name}; open it to finish startup"
                 ) from error
             if not attributes[3] & termios.ICANON:
-                if kind == "omp":
-                    return
                 if hub_agent_composer_ready(task, kind):
                     return
             time.sleep(HUB_AGENT_READY_POLL_SECONDS)
@@ -5501,6 +6039,23 @@ def launch_hub_preset(
     hub_launch_created(task)
     if prompt:
         send_hub_prompt(selected, task, prompt)
+        set_hub_title(task, prompt, initial=True)
+    return task
+
+
+def launch_hub_shell(context: str, directory: str) -> Task:
+    environment = hub_launch_environment(context)
+    shell = environment.get("SHELL") or pwd.getpwuid(os.getuid()).pw_shell or "/bin/sh"
+    if not Path(shell).is_absolute() or not os.access(shell, os.X_OK):
+        raise CliLaneError("the login shell is unavailable")
+    preset = {"name": "shell", "dir": directory}
+    spec = complete_launch_spec(
+        name=hub_task_name(preset, list_tasks()), cwd_value=directory,
+        command=[shell, "-l"], wait=False, timeout=None, on_exit=None,
+        environment=legacy_launch_environment(environment), profile=None, provider=None,
+    )
+    task = run_task(spec)
+    hub_launch_created(task)
     return task
 
 
@@ -5577,9 +6132,64 @@ def hub_claude_session_id(command: Sequence[str], option: str) -> str | None:
     return None
 
 
+def hub_omp_resume_command(command: Sequence[str], name: str) -> list[str]:
+    values = {
+        "--model", "--smol", "--slow", "--plan", "--provider", "--api-key",
+        "--system-prompt", "--system-prompt-template", "--append-system-prompt",
+        "--profile", "--cwd", "--config", "--add-dir", "--session-dir",
+        "--models", "--tools", "--thinking", "--service-tier", "--mode",
+        "--hook", "--extension", "-e", "--trusted-extension", "--plugin-dir",
+        "--skills", "--spinner-interval", "--max-fps", "--motion",
+        "--max-time", "--warn-cost", "--max-cost", "--approval-mode",
+        "--provider-session-id", "--prompt-cache-key",
+    }
+    flags = {
+        "--allow-home", "--no-tools", "--no-lsp", "--no-pty", "--hide-thinking",
+        "--advisor", "--external-thinking", "--no-extensions", "--no-skills",
+        "--no-rules", "--no-context-files", "--no-title", "--auto-approve", "--yolo",
+        "--no-prewalk",
+    }
+    result = [command[0]]
+    error = CliLaneError(
+        f"cannot resume {name}: these OMP launch arguments need manual recovery; "
+        "open omp --resume with the original project and profile"
+    )
+    index = 1
+    while index < len(command):
+        argument = command[index]
+        option, equals, value = argument.partition("=")
+        if argument == "--":
+            if index != len(command) - 1:
+                raise error
+            break
+        if argument in {"--continue", "-c"}:
+            index += 1
+            continue
+        if option in {"--resume", "-r", "--session"}:
+            index += 1
+            if not equals and index < len(command) and not command[index].startswith("-"):
+                index += 1
+            continue
+        if argument in flags:
+            result.append(argument)
+        elif option in values:
+            if not equals:
+                index += 1
+                value = command[index] if index < len(command) else ""
+            if not value or value.startswith("-") or (option == "--mode" and value != "text"):
+                raise error
+            result.extend([argument] if equals else [argument, value])
+        else:
+            raise error
+        index += 1
+    return [*result, "--resume"]
+
+
 def hub_resume_command(command: Sequence[str], kind: str | None, name: str) -> list[str]:
     if kind is None:
         return list(command)
+    if kind == "omp":
+        return hub_omp_resume_command(command, name)
     entry = HUB_RESUME_ARGUMENTS.get(kind)
     if entry is None:
         raise CliLaneError(f"resume is not supported for {kind}: {name}")
@@ -5615,6 +6225,11 @@ def hub_resume_command(command: Sequence[str], kind: str | None, name: str) -> l
 
 
 def hub_base_command(command: Sequence[str], kind: str | None) -> list[str]:
+    if kind == "omp":
+        try:
+            return hub_omp_resume_command(command, "OMP")[:-1]
+        except CliLaneError:
+            return list(command)
     if kind == "claude":
         for option in ("--session-id", "--resume", "-r"):
             session_id = hub_claude_session_id(command, option)
@@ -5793,6 +6408,8 @@ def resume_hub_task(
         raise CliLaneError(f"task is still initializing: {task.name}")
     if not task.dead:
         raise CliLaneError(f"task is still running: {task.name}")
+    if not task.recovery_receipt:
+        raise CliLaneError("Recovery unavailable: job outcome or cleanup unknown. Inspect saved logs first.")
     if task.binding is not None:
         spec = claude_resume_spec(task, context)
     else:
@@ -5817,30 +6434,20 @@ def resume_hub_task(
             profile=profile_name,
             provider=provider,
         )
-    old_log = validated_log_path(task)
-    carried: Path | None = None
-    if old_log.exists():
-        carried = state_root() / f"resume-{uuid.uuid4().hex}.log"
-        os.replace(old_log, carried)
-    try:
-        remove_task(task.id, False, HUB_ACTION_GRACE_SECONDS)
-    except CliLaneError:
-        if carried is not None:
-            os.replace(carried, old_log)
-        raise
-    try:
-        resumed = run_task(spec, require_claude_tracking=task.binding is not None)
-    except CliLaneError as error:
-        if carried is not None:
-            os.replace(carried, old_log)
-            raise CliLaneError(
-                f"{error}; previous log kept as an orphan, see '{PROGRAM} orphans'"
-            ) from error
-        raise
-    if carried is not None:
-        new_log = validated_log_path(resumed)
-        os.replace(carried, new_log.with_suffix(new_log.suffix + ".previous"))
+    manual_title = task.manual_title if task.archived else tmux(
+        ["show-options", "-pqv", "-t", task.pane, "@agt_display_title"], check=False,
+    ).stdout.decode().strip()
+    prompt_title = ""
+    if task.binding is not None:
+        prompt_title = task.prompt_title if task.archived else tmux(
+            ["show-options", "-pqv", "-t", task.pane, "@agt_prompt_title"], check=False,
+        ).stdout.decode().strip()
+    resumed = run_task(spec, require_claude_tracking=task.binding is not None, resume_from=task)
     hub_launch_created(resumed)
+    if manual_title:
+        set_hub_title(resumed, manual_title)
+    if prompt_title:
+        set_hub_title(resumed, prompt_title, initial=True)
     return resumed
 
 
@@ -5860,6 +6467,8 @@ def hub_history_batch(environment: Mapping[str, object]) -> int:
 
 
 def hub_resume_kind(task: Task, presets: Sequence[dict[str, object]]) -> str | None:
+    if not task.recovery_receipt:
+        return None
     try:
         if task.binding is not None:
             claude_resume_id(task)
@@ -5875,11 +6484,15 @@ def hub_resume_kind(task: Task, presets: Sequence[dict[str, object]]) -> str | N
 
 
 def hub_resume_action(task: Task, presets: Sequence[dict[str, object]]) -> str:
+    if not task.recovery_receipt:
+        return "recovery unavailable"
     kind = hub_resume_kind(task, presets)
     if task.binding is not None:
         return "resume recorded ID" if kind == "claude" else "resume unavailable"
+    if kind == "omp":
+        return "choose saved session"
     if kind is None:
-        return "rerun"
+        return "resume unavailable" if hub_command_kind(task.command) == "omp" else "rerun"
     command = hub_resume_command(task.command, kind, task.name)
     if kind == "claude" and any(
         hub_claude_session_id(command, option) is not None
@@ -6005,6 +6618,16 @@ def hub_claimed_launch(
 
 
 def hub_peek_lines(task: Task) -> list[str]:
+    if task.archived:
+        path = validated_log_path(task)
+        output = bytearray()
+        for log in (path.with_suffix(path.suffix + ".previous"), path):
+            if not log.is_file():
+                continue
+            with log.open("rb") as handle:
+                handle.seek(max(0, log.stat().st_size - 65536))
+                output.extend(handle.read(65536))
+        return [sanitized_log_text(line).rstrip() for line in output.decode(errors="replace").splitlines()][-HUB_PEEK_CAPTURE_LINES:] or ["no saved output available"]
     try:
         captured = tmux(
             ["capture-pane", "-p", "-J", "-S", f"-{HUB_PEEK_CAPTURE_LINES}", "-t", task.pane],
@@ -6026,9 +6649,11 @@ def hub_peek_lines(task: Task) -> list[str]:
 
 
 def hub_peek_title(task: Task) -> str:
+    if task.archived:
+        return f"{hub_task_title(task)} · {task.id[:8]} · {hub_task_state(task)} · saved log"
     if task.dead:
-        return f"{task.name} · {task.state} · last output"
-    return f"{task.name} · {task.state} · latest output"
+        return f"{hub_task_title(task)} · {hub_task_state(task)} · last output"
+    return f"{hub_task_title(task)} · {hub_task_state(task)} · latest output"
 
 
 def hub_task_line(task: Task, width: int = 80) -> str:
@@ -6041,14 +6666,21 @@ def hub_task_line(task: Task, width: int = 80) -> str:
     }
     marker = markers.get(task.state, "·")
     agent = Path(task.command[0]).name if task.command else "-"
+    if task.observed_program:
+        agent = f"{task.observed_program}*"
     project = Path(task.cwd).name or task.cwd
     source = "BOT" if task.origin == "bot" else "LOCAL"
-    attached = " open" if task.attached else ""
+    attached = " attached" if task.attached else ""
+    label = hub_task_title(task)
+    if task.archived or task.resumed_from:
+        label = f"{task.id[:8]} · {label}"
     if width < 80:
-        return f"{marker} {task.state:<9} {task.name} · {agent}"
+        return f"{marker} {hub_task_state(task):<9} {label} · {agent}"
+    title_width = max(22, width - 55)
+    title = fleet_display_cell(label, title_width)
     return (
-        f"{marker}  {task.name:<22.22} {agent:<12.12} "
-        f"{task.state:<12.12} {age(task.created):>4}  {source:<5} {project}{attached}"
+        f"{marker}  {title}{' ' * max(0, title_width - display_width(title))} {agent:<12.12} "
+        f"{hub_task_state(task):<12.12} {age(task.created):>4}  {source:<5} {project}{attached}"
     )
 
 
@@ -6062,7 +6694,7 @@ def hub_composer_line(
     label_width = max(1, min(width - 8, width // 2))
     if reply_to is not None:
         label = "draft" if reply_to.dead else "reply"
-        agent = fleet_display_cell(f"{label} · {reply_to.name}", label_width)
+        agent = fleet_display_cell(f"{label} · {hub_task_title(reply_to)}", label_width)
     elif preset:
         project = Path(str(preset["dir"])).name or str(preset["dir"])
         agent = fleet_display_cell(
@@ -6183,7 +6815,8 @@ def hub_draw(
     rows.append(("+  New session", len(tasks), ""))
     rows.append(("?  Help", len(tasks) + 1, ""))
     rows.append(("   Leave CliLane · jobs keep running", len(tasks) + 2, ""))
-    selected = max(0, min(selected, len(tasks) + 2))
+    rows.append((">_ New shell", len(tasks) + 3, ""))
+    selected = max(0, min(selected, len(tasks) + 3))
     selected_row = next(
         (position for position, (_, index, _) in enumerate(rows) if index == selected),
         len(rows) - 1,
@@ -6216,7 +6849,7 @@ def hub_draw(
             width,
         ),
         fleet_display_cell(
-            f"   {'JOB':<22} {'AGENT':<12} {'STATE':<12} "
+            f"   {'SESSION':<{max(22, width - 55)}} {'AGENT':<12} {'STATE':<12} "
             f"{'AGE':>4}  {'ORIGIN':<6} PROJECT",
             width,
         ),
@@ -6255,10 +6888,16 @@ def hub_draw(
             if target.dead and (hub_resume_kind(target, presets) or hub_command_kind(target.command) is None)
             else "Ctrl-X remove" if target.dead else "Ctrl-X stop"
         )
-        hints = ["Enter open · Space preview · " + action, "Esc back · Help and Leave below"]
+        opening = "Enter saved log" if target.archived else "Enter open · Space preview"
+        detail = f"Attempt {target.id[:8]} · from {target.resumed_from[:8]}" if target.resumed_from else "Esc back · Help and Leave below"
+        hints = [opening + " · " + action, detail]
+        if target.state == TASK_STATE_UNKNOWN:
+            hints[1] = "No exit receipt · outcome unknown · inspect saved output before starting new work"
     elif selected > len(tasks):
         hints = [
-            "Enter opens keyboard help" if selected == len(tasks) + 1 else "Enter leaves CliLane; jobs keep running",
+            "Enter opens a new shell in this project; drafts stay" if selected == len(tasks) + 3
+            else "Enter opens keyboard help" if selected == len(tasks) + 1
+            else "Enter leaves CliLane; jobs keep running",
             "Up/Down choose · Esc back",
         ]
     else:
@@ -6293,12 +6932,13 @@ def hub_draw(
                 hints[0] = "Ctrl-U clear to open"
         hints[1] = "Esc back · Ctrl-Q leave"
         if target is not None and target.dead:
-            hints[1] = "Enter open · Ctrl-Q out"
+            hints[1] = "Enter saved log · Ctrl-Q out" if target.archived else "Enter open · Ctrl-Q out"
     if confirmation:
         hints = ["Enter confirm", "Esc cancel"]
     lines.extend(
         [
-            hub_composer_line(preset, prompt, cursor, width, reply_to),
+            ("Draft kept for New session" if prompt else "Shell · current project")
+            if selected == len(tasks) + 3 else hub_composer_line(preset, prompt, cursor, width, reply_to),
             fleet_display_cell(hints[0], width),
             fleet_display_cell(hints[1], width),
         ]
@@ -6331,7 +6971,9 @@ def hub_ui(
     config = str(data["config"])
     config_present = Path(config).exists()
     config_required = bool(data["config_required"])
-    tasks = hub_task_order(list_tasks())
+    with registry_lock():
+        backfill_records(list_tasks())
+    tasks = hub_task_order(history_tasks())
     source_task = next((task for task in tasks if task.session == source), None)
     configured_directory = data.get("launch_cwd")
     discovery_directory = (
@@ -6482,11 +7124,11 @@ def hub_ui(
                 client, client_pid, context, popup_value
             )):
                 return 0
-            all_tasks = hub_task_order(list_tasks())
+            all_tasks = hub_task_order(hub_display_tasks(history_tasks(), observe=True))
             ongoing_count = sum(1 for task in all_tasks if not task.dead)
             hidden_history = max(0, len(all_tasks) - ongoing_count - history_limit)
             tasks = all_tasks[: len(all_tasks) - hidden_history]
-            item_keys = [task.id for task in tasks] + ["", "help", "detach"]
+            item_keys = [task.id for task in tasks] + ["", "help", "detach", "shell"]
             if selected_key not in item_keys:
                 selected_key = ""
             selected = item_keys.index(selected_key)
@@ -6614,6 +7256,18 @@ def hub_ui(
                     help_offset = 0
                     continue
                 key = "quit"
+            if key in {"enter", "open", "right"} and selected_key == "shell":
+                if not save_drafts():
+                    continue
+                redraw("Opening shell… · Ctrl-C cancel")
+                alive, error = hub_claimed_launch(
+                    client, client_pid, context, popup_value,
+                    lambda: launch_hub_shell(context, discovery_directory),
+                )
+                if not alive or error is None:
+                    return 0
+                notice = error
+                continue
             if key == "eof":
                 key = "delete" if prompt else "quit"
             if key == "escape":
@@ -6787,6 +7441,10 @@ def hub_ui(
             if selected < len(tasks) and (
                 key == "open" or not prompt or not peek_key or tasks[selected].dead
             ):
+                if tasks[selected].archived:
+                    peek_key = tasks[selected].id
+                    peek_cache = None
+                    continue
                 if not save_drafts():
                     continue
                 switch_hub_popup(client, client_pid, context, popup_value, tasks[selected].session)
@@ -6979,6 +7637,19 @@ def hub_command(configured: str | None) -> int:
 
 
 def read_task(task: Task, all_history: bool) -> int:
+    if task.archived:
+        if not all_history:
+            return log_task(task, 200, False)
+        path = validated_log_path(task)
+        found = False
+        for log in (path.with_suffix(path.suffix + ".previous"), path):
+            if log.is_file():
+                found = True
+                with log.open("rb") as handle:
+                    shutil.copyfileobj(handle, sys.stdout.buffer)
+        if not found:
+            raise CliLaneError("no saved output available")
+        return 0
     start = "-" if all_history else "-200"
     captured = tmux(["capture-pane", "-p", "-J", "-S", start, "-t", task.pane])
     sys.stdout.buffer.write(captured.stdout)
@@ -7089,9 +7760,11 @@ def key_task(target: str, keys: Sequence[str]) -> int:
     return 0
 
 
-def wait_task(target: str, timeout: float | None) -> int:
+def wait_task_result(
+    target: str, timeout: float | None, *, exact_id: bool = False,
+) -> tuple[Task, bool]:
     with registry_lock():
-        task = resolve_task(target)
+        task = resolve_task(target, include_history=True, exact_id=exact_id)
         if not task.committed:
             raise CliLaneError(f"task initialization is incomplete: {task.name}")
         lock_handle = acquire_task_lock(task.id, exclusive=False)
@@ -7099,15 +7772,24 @@ def wait_task(target: str, timeout: float | None) -> int:
     started = time.monotonic()
     try:
         while True:
-            task = resolve_task(task_id)
+            task = resolve_task(task_id, include_history=True, exact_id=True)
+            if task.state == TASK_STATE_UNKNOWN:
+                raise CliLaneError("job outcome is unknown; no command exit receipt survived")
             if task.dead:
-                return task.result_code
+                return task, False
             if timeout is not None and time.monotonic() - started >= timeout:
-                print(f"{PROGRAM}: timeout waiting for {task.name}", file=sys.stderr)
-                return 124
+                return task, True
             time.sleep(0.2)
     finally:
         release_task_lock(lock_handle)
+
+
+def wait_task(target: str, timeout: float | None) -> int:
+    task, timed_out = wait_task_result(target, timeout)
+    if timed_out:
+        print(f"{PROGRAM}: timeout waiting for {task.name}", file=sys.stderr)
+        return 124
+    return task.result_code
 
 
 def validated_supervisor(task: Task) -> int:
@@ -7161,6 +7843,7 @@ def stop_task_locked(task: Task, grace: float) -> Task:
         return task
     if not task.committed:
         raise CliLaneError(f"task is still initializing: {task.name}")
+    update_history(task.id, task.log, {"stop_requested": True})
     tmux(["set-option", "-t", task.session, "@agt_stop_requested", "1"])
     current = resolve_task(task.id)
     if current.dead:
@@ -7212,6 +7895,16 @@ def stop_task(target: str, grace: float) -> Task:
 
 def remove_task_locked(task: Task, force: bool, grace: float) -> None:
     current = task
+    if current.archived:
+        if current.process_started and not managed_session_empty(current):
+            raise CliLaneError("historical job still has live processes; refusing to discard its record")
+        log_path = validated_log_path(current)
+        update_history(current.id, current.log, {}, delete=True)
+        log_path.unlink(missing_ok=True)
+        log_path.with_suffix(log_path.suffix + ".previous").unlink(missing_ok=True)
+        remove_claude_settings(current.id, str(log_path))
+        delete_record(current.id)
+        return
     if not current.committed:
         if not force:
             raise CliLaneError(f"task initialization is incomplete; use --force: {task.name}")
@@ -7231,6 +7924,8 @@ def remove_task_locked(task: Task, force: bool, grace: float) -> None:
             if current.binding is not None:
                 remove_claude_settings(current.id, str(log_path))
         if current.id:
+            if current.log:
+                update_history(current.id, current.log, {}, delete=True)
             delete_record(current.id)
         return
     if not current.dead:
@@ -7251,12 +7946,14 @@ def remove_task_locked(task: Task, force: bool, grace: float) -> None:
         if current.binding is not None:
             remove_claude_settings(current.id, str(log_path))
     if current.id:
+        if current.log:
+            update_history(current.id, current.log, {}, delete=True)
         delete_record(current.id)
 
 
 def remove_task(target: str, force: bool, grace: float) -> Task:
     with registry_lock():
-        task = resolve_task(target)
+        task = resolve_task(target, include_history=True)
         current = task
         if current.committed and not current.dead:
             if not force:
@@ -7284,6 +7981,8 @@ def classify_records(
     for record in records:
         if record.id in live_ids:
             classified["live"].append(record)
+        elif record.phase != RECORD_PHASE_REMOVING and history_path(record.id, record.log).is_file():
+            classified["orphan"].append(record)
         elif record.phase == RECORD_PHASE_PENDING:
             classified["aborted"].append(record)
         elif record.phase == RECORD_PHASE_REMOVING:
@@ -7312,10 +8011,17 @@ def confirm_server_absent(tasks: Sequence[Task], records: Sequence[TaskRecord]) 
 def reap_record(record: TaskRecord, live_sessions: frozenset[str]) -> None:
     if record.session in live_sessions:
         raise CliLaneError(f"record session belongs to a live task: {record.name}")
+    if history_path(record.id, record.log).is_file():
+        if not tmux_session_absent(record.session):
+            raise CliLaneError(f"historical session still exists; inspect before removal: {record.name}")
+        archived = next(task for task in saved_tasks() if task.id == record.id)
+        remove_task_locked(archived, False, 0)
+        return
     log_path = validated_record_log_path(record)
     kill_managed_session(record.session)
     log_path.unlink(missing_ok=True)
     log_path.with_suffix(log_path.suffix + ".previous").unlink(missing_ok=True)
+    update_history(record.id, record.log, {}, delete=True)
     remove_claude_settings(record.id, str(log_path))
     delete_record(record.id)
 
@@ -7500,6 +8206,14 @@ Esc goes back and keeps drafts until you leave CliLane. Ctrl-U clears; Ctrl-Y re
 Ctrl-A/E or Home/End moves to the start/end; Ctrl-W erases the previous word.
 Ctrl-X asks before stopping/removing a job; Enter confirms and Esc cancels.
 Ctrl-Q leaves CliLane; if drafts exist, confirm discarding them. Jobs keep running.
+Select New shell to open a fresh terminal in the current project; drafts stay.
+Use its tab to return to an existing shell. Observed nested agents keep pinned names.
+Titles follow the native agent title, then the first message submitted here.
+Use clilane rename TARGET TITLE to override a display title; omit TITLE to reset.
+Open means process alive. A * marks observed screen activity or foreground program.
+History keeps job records and saved logs after terminal loss. Enter opens saved output.
+Ctrl-R creates a new attempt and keeps the original. Unknown outcomes cannot be resumed.
+Use clilane history to find saved IDs, then clilane status ID or clilane log ID.
 
 Without hub.json, Sessions discovers installed Codex, Kimi, Claude, OMP,
 Kiro CLI, Gemini, OpenCode, Copilot, Aider, Amp, Goose, Pi, Cursor Agent,
@@ -7526,6 +8240,15 @@ commands also accept a first message in the Sessions composer.""",
     run.add_argument("--wait", action="store_true", help="wait for the command to exit")
     run.add_argument("--timeout", metavar="SECONDS", help="timeout used with --wait")
     run.add_argument("--on-exit", metavar="COMMAND", help="shell command run after exit")
+    run.add_argument("--request-id", metavar="KEY", help="reuse the original launch for this occurrence; retained through cleanup")
+    run.add_argument("--json", action="store_true", help="emit one task receipt; with --wait, emit after exit or timeout")
+    run.epilog = (
+        "Use one key per occurrence, for example report:2026-11-08, and reuse it only for retries. "
+        "A key remains bound to its original job in this state directory, even after rm/clean. "
+        "Name, command/profile, directory, hook, and socket selection must match. "
+        "Replays keep the first launch's environment and profile settings; changed settings need a new key. "
+        "An unavailable original is never relaunched automatically."
+    )
     run.add_argument(
         "run_arguments",
         metavar="ARG",
@@ -7537,6 +8260,9 @@ commands also accept a first message in the Sessions composer.""",
         "list", aliases=["ls", "ps"], help="list all managed tasks"
     )
     listing.add_argument("--json", action="store_true", help="emit JSON")
+
+    history = commands.add_parser("history", help="show retained jobs, including lost terminals")
+    history.add_argument("--json", action="store_true", help="emit JSON with attempt IDs and recovery links")
 
     fleet = commands.add_parser(
         "fleet",
@@ -7591,6 +8317,10 @@ commands also accept a first message in the Sessions composer.""",
 
     attach = commands.add_parser("attach", help="attach to a task interactively")
     attach.add_argument("target", help="task name or ID prefix; click Back to sessions for the list")
+
+    rename = commands.add_parser("rename", help="set a display title without changing the task name")
+    rename.add_argument("target", help="task name or ID prefix")
+    rename.add_argument("title", nargs="*", help="display title; omit to follow the native title again")
 
     hub = commands.add_parser("hub", help="open the native session switcher")
     hub.add_argument(
@@ -7694,19 +8424,63 @@ def parse_cli_arguments(parts: Sequence[str] | None = None) -> argparse.Namespac
     return parser().parse_args(arguments)
 
 
+def execute_run(parts: Sequence[str]) -> int:
+    prefix = list(parts[:parts.index("--")]) if "--" in parts else list(parts)
+    as_json = "--json" in prefix
+    task: Task | None = None
+    try:
+        request = parse_run_request(parts)
+        as_json = request.json
+        task = run_requested_task(request, os.environ, os.getcwd())
+        reused = task.launch_reused
+        if not as_json:
+            identifier = task.id if request.request_id else task.id[:8]
+            print(f"{'existing' if reused else 'created'} {task.name} {identifier}", flush=True)
+        timed_out = False
+        if request.wait:
+            task, timed_out = wait_task_result(task.id, request.timeout, exact_id=True)
+        if as_json:
+            print(json.dumps({**task.as_dict(), "reused": reused, "timed_out": timed_out}, indent=2), flush=True)
+        elif timed_out:
+            print(f"{PROGRAM}: timeout waiting for {task.name}", file=sys.stderr)
+        return 124 if timed_out else task.result_code if request.wait else 0
+    except (CliLaneError, OSError) as error:
+        task_id = error.task_id if isinstance(error, LaunchRequestError) else task.id if task is not None else None
+        code = error.code if isinstance(error, LaunchRequestError) else "wait_failed" if task is not None else "run_failed"
+        if not as_json:
+            if task_id and not isinstance(error, LaunchRequestError):
+                raise LaunchRequestError(code, str(error), task_id) from error
+            raise
+        print(json.dumps({"error": {"code": code, "message": str(error)}, "task_id": task_id}, indent=2), flush=True)
+        return 1
+
+
 def execute(arguments: argparse.Namespace) -> int:
+    if arguments.action in {None, "hub", "list", "ls", "ps", "history", "status", "read", "log", "rename"}:
+        with registry_lock():
+            backfill_records(list_tasks())
     if arguments.action is None:
         return hub_command(None)
     if arguments.action == "run":
-        request = parse_run_request(arguments.run_arguments)
-        spec = resolve_run_request(request, os.environ, os.getcwd())
-        task = run_task(spec)
-        print(f"created {task.name} {task.id[:8]}")
-        if spec.wait:
-            return wait_task(task.id, spec.timeout)
-        return 0
+        return execute_run(arguments.run_arguments)
     if arguments.action in {"list", "ls", "ps"}:
         print_tasks(list_tasks(), arguments.json)
+        return 0
+    if arguments.action == "history":
+        tasks = hub_display_tasks(history_tasks())
+        if arguments.json:
+            print(json.dumps([
+                {**task.as_dict(), "terminal_available": not task.archived,
+                 "resumed_from": task.resumed_from or None, "title": hub_task_title(task)}
+                for task in tasks
+            ], indent=2))
+        else:
+            for task in tasks:
+                parent = f" · from {task.resumed_from[:8]}" if task.resumed_from else ""
+                terminal = "saved log" if task.archived else "terminal"
+                print(f"{task.id[:8]}  {task.state:<10} {task.name} · {terminal}{parent}")
+            if not tasks:
+                print("no retained jobs")
         return 0
     if arguments.action == "fleet":
         if arguments.interval is not None and not arguments.watch:
@@ -7741,16 +8515,24 @@ def execute(arguments: argparse.Namespace) -> int:
             collect_fleet(hosts, arguments.timeout), arguments.json
         )
     if arguments.action == "status":
-        print_status(resolve_task(arguments.target), arguments.json)
+        print_status(resolve_task(arguments.target, include_history=True), arguments.json)
         return 0
     if arguments.action == "attach":
-        return attach_task(resolve_task(arguments.target))
+        return attach_task(resolve_task(arguments.target, include_history=True))
+    if arguments.action == "rename":
+        with registry_lock():
+            task = resolve_task(arguments.target, include_history=True)
+            if task.archived:
+                snapshot_history(replace(task, archived=False), create=True)
+            set_hub_title(task, " ".join(arguments.title))
+        print(f"updated display title for {task.name}")
+        return 0
     if arguments.action == "hub":
         return hub_command(arguments.config)
     if arguments.action == "read":
-        return read_task(resolve_task(arguments.target), arguments.all)
+        return read_task(resolve_task(arguments.target, include_history=True), arguments.all)
     if arguments.action == "log":
-        return log_task(resolve_task(arguments.target), arguments.lines, arguments.follow)
+        return log_task(resolve_task(arguments.target, include_history=True), arguments.lines, arguments.follow)
     if arguments.action == "send":
         return send_task(arguments.target, arguments.message, not arguments.no_enter)
     if arguments.action == "key":
@@ -7786,6 +8568,9 @@ def execute(arguments: argparse.Namespace) -> int:
 
 def main() -> int:
     try:
+        if len(sys.argv) == 6 and sys.argv[1] == "__hub-status":
+            configure_tmux_control(sys.argv[2], sys.argv[3])
+            return hub_navigation_status(sys.argv[4], sys.argv[5])
         if len(sys.argv) == 7 and sys.argv[1] == "__claude-event":
             configure_tmux_control(sys.argv[2], sys.argv[3])
             return claude_event(sys.argv[4], sys.argv[5], sys.argv[6])
