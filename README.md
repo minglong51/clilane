@@ -2,26 +2,59 @@
 
 [![Smoke](https://github.com/minglong51/clilane/actions/workflows/smoke.yml/badge.svg)](https://github.com/minglong51/clilane/actions/workflows/smoke.yml)
 
-CLI Lane runs interactive CLI agents — Codex, Claude Code, Kimi, or any other
-long-running command — in the background, each in its own lane with an identity
-you can still trust days later. Reconnect through SSH, Mosh, or Termius to
-inspect, attach, send input, press keys, stop, or remove a task, or read task
-state across a fleet of hosts.
+CLI Lane is a background manager for CLI agents and other long-running
+commands, built on an isolated tmux server rather than a new multiplexer. Each
+task gets a named lane. `stop` and `rm` re-check the recorded process start
+time and session before they signal anything, so a reused pid is refused
+instead of being treated as the original task. If that tmux server dies, the
+lane is not reattached; the log stays on disk and `orphans` lists it. `ps`
+drops the lane. `history` still has the id, and `log` reads that id. Reconnect
+over SSH, Mosh, or Termius to inspect, attach, send input, or stop a task.
+`fleet` is a read-only view across an explicit list of hosts.
+
+It is process-agnostic: it manages only commands you launch through `clilane`
+(Codex, Claude Code, Kimi, or any command). It does not replace tmux and does
+not discover unrelated processes. `ps` and `status` report process lifecycle,
+not whether an agent is blocked or idle. The session switcher can mark a Codex
+pane `working*`, `approval*`, or `ready*` from text on that pane; other
+commands are not classified that way. Python 3.10 or newer, tmux 3.6 or newer,
+the Python standard library only, MIT, macOS and Linux.
 
 ![clilane list — three agent CLIs running in their lanes and a finished batch job](docs/list.png)
 
-Plenty of tools keep a process alive; CLI Lane exists for what happens at the
-edges. A task keeps its identity even after its pid is reused, so `stop` and
-`rm` can never touch an innocent process. Logs survive the tmux server dying
-and come back as recoverable orphans, not silent losses. `send` refuses input
-an agent would receive as garbage bytes and `key` presses real keys instead.
-Exit statuses distinguish signals from exit codes, and `--on-exit` reports a
-finished task instead of making you poll. Every destructive path re-verifies
-what it is about to touch before touching it.
+![Start a lane, attach, keep the log after the isolated tmux server dies, then stop and remove a named task](docs/demo.gif)
 
-CLI Lane is process-agnostic. It manages commands that you launch through
-`clilane`; it does not depend on an agent framework or discover unrelated
-processes.
+## How is this different from herdr / tmux / nohup / pueue?
+
+**herdr** is an agent-native multiplexer: it owns the terminal, marks panes
+working, blocked, or idle, and can control agents across machines in one
+window. clilane does not do that. It sits on a dedicated tmux server started
+with `-f /dev/null`, nests inside the tmux you already use, and reports process
+lifecycle. The switcher can add a Codex-only screen marker from text in that
+pane; that is not control of working, blocked, and idle agents. Choose herdr
+if you want a new runtime. Choose clilane if you want named lanes, with
+`stop` and `rm` re-checking process identity, without switching multiplexers.
+
+**tmux** already keeps processes alive after detach. clilane adds named tasks,
+a switcher (`clilane` / `clilane hub`), `send` / `key`, `--on-exit`, persistent
+logs, `orphans` after the isolated server dies, and a read-only SSH fleet.
+`send` pastes text and rejects control characters; `key` presses named keys.
+Your outer tmux prefix and config are left alone.
+
+**nohup** (or a raw `tmux new-session`) will run a command in the background,
+but it will not give you a recorded process identity for `stop` and `rm`, logs
+that `orphans` still lists after the server dies, or a fleet snapshot.
+
+**pueue** is a queue for non-interactive shell commands. clilane starts a task
+immediately or not at all, and it is built for interactive TTYs you can attach
+to. It is not a scheduler.
+
+## See also
+
+For host-level CPU/RAM/GPU pressure and a guarded kill switch on discovered
+process trees (not token cost), see
+[agent-usage-manager](https://github.com/minglong51/agent-usage-manager). It is
+a companion, not part of clilane.
 
 ```text
 Laptop / Termius / another node
@@ -49,10 +82,20 @@ CLI Lane uses only the Python standard library. The lifecycle, fleet, and
 interactive switcher paths are verified on macOS and Ubuntu in CI, both on
 tmux 3.7. tmux 3.6 is required because the 3.4 and 3.5 servers can crash while
 the switcher opens and closes its popup, which ends every lane on that server
-at once; Ubuntu 24.04's packaged tmux is 3.4, so build a newer release or use
-Homebrew there. `run` refuses to start on anything older than 3.6. Releases
-older than 3.3 also do not report the signal that ended a task, which would
-silently corrupt exit statuses.
+at once. `run` refuses to start on anything older than 3.6. The session
+switcher and `clean` use the same check. Releases older than 3.3 also do not
+report the signal that ended a task, which would silently corrupt exit
+statuses.
+
+### Ubuntu 24.04
+
+Ubuntu 24.04 ships tmux 3.4 in apt. `clilane run` refuses 3.4 and 3.5. Install
+3.6 or newer and put that binary ahead of `/usr/bin` on `PATH`:
+
+- Homebrew on Linux: `brew install tmux`
+- Or build a release from <https://github.com/tmux/tmux>
+
+Check with `tmux -V` before `clilane run`.
 
 ## Install
 
@@ -451,7 +494,7 @@ named `agt` for compatibility with tasks created before the project was renamed.
 | `stop TARGET` | Send TERM, then KILL after `--grace` seconds. The default grace is 3 seconds. |
 | `rm`, `remove TARGET` | Remove a finished task and its logs. `--force` stops a running task first. |
 | `clean` | Remove completed, stopped, incomplete, and lost tasks. Running tasks and orphaned logs remain. `--dry-run` reports only; `--orphans` also deletes orphaned logs. |
-| `orphans` | List tasks whose tmux server died but whose logs survive. Supports `--json`. |
+| `orphans` | List tasks whose tmux server died but whose logs survive. Supports `--json`. `log` and `status` then use the id from `history`, not the task name. |
 | `watch` | Refresh the current-host task list. `--interval` defaults to 1 second. |
 
 The `--on-exit` hook runs through `/bin/sh -c` in the task's working directory
@@ -479,8 +522,11 @@ CLI Lane reports process lifecycle rather than semantic agent state:
 - `succeeded`
 - `failed`
 
-It cannot determine whether an agent is waiting for input, blocked on approval,
-or idle at a prompt. Use `read`, `attach`, or `send` to inspect that condition.
+Those states do not say whether an agent is waiting for input, blocked on
+approval, or idle. The switcher can mark a Codex pane `working*`, `approval*`,
+or `ready*` from text currently on that pane. It does not do this for other
+commands, and it does not change `ps` or `status`. Use `read`, `attach`, or
+`send` to inspect a session.
 
 `list --json` returns an array and `status --json` returns one object. A task has:
 
@@ -562,8 +608,12 @@ logs under `~/.local/state/agt` remain readable for compatibility.
 
 - Only tasks started through CLI Lane are visible.
 - Each host exposes one Unix user's selected CLI Lane tmux socket.
-- No reboot or CLI Lane tmux-server-crash adoption of running tasks; their exit
-  status is lost, though their logs survive and are listed by `orphans`.
+- A dead tmux server is not brought back with the old lane attached, and a
+  reboot does not adopt a running task. `ps` stops listing it. The log stays
+  on disk and `orphans` lists it. `log` and `status` then need the id from
+  `history`, not the task name. If the supervisor is still able to wait for
+  the child, it stores that exit in history. If it dies first, the saved
+  outcome stays `unknown`.
 - A descendant that creates a new POSIX session can escape lifecycle control.
 - No queueing, by design: a task starts immediately or not at all. Sequential
   workflows compose from `run --wait` and `--on-exit`; anything beyond that
