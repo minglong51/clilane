@@ -55,6 +55,7 @@ class _Terminal:
         self.pid = pid
         self.descriptor = descriptor
         self.output = bytearray()
+        self.environment = dict(environment)
         self.exit_code: int | None = None
         fcntl.ioctl(
             descriptor,
@@ -373,7 +374,7 @@ def _exercise_hub_lifecycle(environment: dict[str, str]) -> None:
         terminal.expect("This clilane server")
         handshake_mark = terminal.mark()
         terminal.send(b"\x15")
-        terminal.expect("> ▏", handshake_mark)
+        _expect_frame(terminal, "> ▏")
         clients = _tmux(
             environment,
             ["list-clients", "-F", "#{client_name}|#{client_pid}"],
@@ -442,7 +443,7 @@ def _exercise_hub_lifecycle(environment: dict[str, str]) -> None:
         terminal.expect("This clilane server", redraw_mark)
         handshake_mark = terminal.mark()
         terminal.send(b"\x15")
-        terminal.expect("> ▏", handshake_mark)
+        _expect_frame(terminal, "> ▏")
         for callback in ("finish_hub_popup", "finish_hub_pane"):
             _call_clilane_function(
                 environment, callback,
@@ -526,7 +527,7 @@ def _exercise_hub_lifecycle(environment: dict[str, str]) -> None:
         assert "__hub-standby" in start_command, pane
         handshake_mark = terminal.mark()
         terminal.send(b"\x15")
-        terminal.expect("> ▏", handshake_mark)
+        _expect_frame(terminal, "> ▏")
         terminal.send(b"\x11")
         assert terminal.wait() == 0
         terminal.close()
@@ -647,7 +648,7 @@ def _exercise_hub_lifecycle(environment: dict[str, str]) -> None:
         outer_terminal.expect("This clilane server")
         handshake_mark = outer_terminal.mark()
         outer_terminal.send(b"\x15")
-        outer_terminal.expect("> ▏", handshake_mark)
+        _expect_frame(outer_terminal, "> ▏")
         clients = _tmux(
             environment,
             ["list-clients", "-F", "#{client_name}|#{client_pid}"],
@@ -803,8 +804,21 @@ def _exercise_hub_launch_loss(environment: dict[str, str]) -> None:
 
 
 def _last_frame(terminal: _Terminal, since: int) -> str:
-    frames = bytes(terminal.output[since:]).split(b"\x1b[H\x1b[J")
-    return frames[-1].decode(errors="replace")
+    sessions = _client_sessions(terminal.environment)
+    assert len(sessions) == 1, sessions
+    return _tmux(
+        terminal.environment, ["capture-pane", "-p", "-t", sessions[0]]
+    ).stdout.decode(errors="replace")
+
+
+def _expect_frame(terminal: _Terminal, value: str, timeout: float = 15.0) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        terminal.settle(quiet=0.05, timeout=0.1)
+        frame = _last_frame(terminal, 0)
+        if value in frame:
+            return
+        assert time.monotonic() < deadline, frame
 
 
 def _client_sessions(environment: dict[str, str]) -> list[str]:
@@ -846,7 +860,7 @@ def _exercise_switcher_keys(environment: dict[str, str]) -> None:
         terminal.expect("This clilane server")
         mark = terminal.mark()
         terminal.send(b"\x15")
-        terminal.expect("> ▏", mark)
+        _expect_frame(terminal, "> ▏")
         terminal.send(b"\x1b[D")
         terminal.settle()
         assert terminal.running(), "Left on an empty composer detached the client"
@@ -882,7 +896,7 @@ def _exercise_switcher_keys(environment: dict[str, str]) -> None:
         terminal.resize(100, 24)
         mark = terminal.mark()
         terminal.send(b"\x15")
-        terminal.expect("> ▏", mark)
+        _expect_frame(terminal, "> ▏")
         terminal.send(b"\x04")
         assert terminal.wait() == 0
         terminal.close()
@@ -958,7 +972,7 @@ def _exercise_switcher_actions(environment: dict[str, str]) -> None:
         terminal.expect("This clilane server")
         mark = terminal.mark()
         terminal.send(b"\x15")
-        terminal.expect("> ▏", mark)
+        _expect_frame(terminal, "> ▏")
 
         mark = terminal.mark()
         terminal.send(b" ")
@@ -1065,7 +1079,7 @@ def _exercise_switcher_resume(environment: dict[str, str]) -> None:
         terminal.expect("This clilane server")
         mark = terminal.mark()
         terminal.send(b"\x15")
-        terminal.expect("> ▏", mark)
+        _expect_frame(terminal, "> ▏")
 
         mark = terminal.mark()
         terminal.send(b" ")
@@ -1105,7 +1119,7 @@ def _exercise_switcher_resume(environment: dict[str, str]) -> None:
         terminal.expect("This clilane server")
         mark = terminal.mark()
         terminal.send(b"\x15")
-        terminal.expect("> ▏", mark)
+        _expect_frame(terminal, "> ▏")
         mark = terminal.mark()
         terminal.send(b"\x12")
         terminal.expect("live-job is still running", mark)
@@ -1272,7 +1286,7 @@ def _exercise_switcher_sections(environment: dict[str, str], tool_bin: Path) -> 
         terminal.expect("This clilane server")
         mark = terminal.mark()
         terminal.send(b"\x15")
-        terminal.expect("> ▏", mark)
+        _expect_frame(terminal, "> ▏")
         terminal.settle()
         frame = _last_frame(terminal, mark)
         assert "ONGOING (1)" in frame, frame
@@ -1313,7 +1327,7 @@ def _exercise_switcher_sections(environment: dict[str, str], tool_bin: Path) -> 
 
         mark = terminal.mark()
         terminal.send(b"\x15")
-        terminal.expect("> ▏", mark)
+        _expect_frame(terminal, "> ▏")
         terminal.send(b"\x1b[A\x1b[A\x1b[A")
         terminal.settle()
         mark = terminal.mark()
@@ -1836,7 +1850,7 @@ def main() -> int:
             discovery_terminal.expect("Enter open · Space preview", mark)
             handshake_mark = discovery_terminal.mark()
             discovery_terminal.send(b"\x15")
-            discovery_terminal.expect("> ▏", handshake_mark)
+            _expect_frame(discovery_terminal, "> ▏")
             discovery_terminal.send(b"\x11")
             assert discovery_terminal.wait() == 0
             discovery_terminal.close()
@@ -1891,7 +1905,7 @@ def main() -> int:
             discovery_terminal.expect("Enter open · Space preview", mark)
             handshake_mark = discovery_terminal.mark()
             discovery_terminal.send(b"\x15")
-            discovery_terminal.expect("> ▏", handshake_mark)
+            _expect_frame(discovery_terminal, "> ▏")
             discovery_terminal.send(b"\x11")
             assert discovery_terminal.wait() == 0
             discovery_terminal.close()
