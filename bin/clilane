@@ -3586,6 +3586,11 @@ def initial_task_queue(session: str, cwd: str, meta: Mapping[str, object]) -> li
         "start-server",
         ";",
         "set-option",
+        "-s",
+        "extended-keys",
+        "on",
+        ";",
+        "set-option",
         "-g",
         "history-limit",
         "50000",
@@ -4855,6 +4860,10 @@ def hub_left_check_command() -> str:
 def bind_hub_keys() -> None:
     open_command = hub_open_command()
     configure_hub_navigation()
+    tmux(["set-option", "-s", "extended-keys", "on"], check=False)
+    features = tmux(["show-options", "-s", "terminal-features"], check=False)
+    if b"extkeys" not in features.stdout:
+        tmux(["set-option", "-as", "terminal-features", ",xterm*:extkeys"], check=False)
     tmux(["set-option", "-g", "prefix", "None"])
     tmux(["set-option", "-g", "prefix2", "None"])
     tmux(["unbind-key", "-T", "root", "C-q"], check=False)
