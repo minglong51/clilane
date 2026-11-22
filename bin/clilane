@@ -4018,7 +4018,34 @@ def fleet_verb_target(hosts: Sequence[FleetHost], target: str) -> tuple[FleetHos
     return host, task
 
 
+TERMINAL_SEQUENCE = re.compile(
+    r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"
+    r"|\x1b[PX^_][^\x1b]*(?:\x1b\\)?"
+    r"|\x1b\[[0-?]*[ -/]*[@-~]"
+    r"|\x1b[ -/]*[0-~]"
+)
+TERMINAL_CURSOR_MOVE = re.compile(r"\x1b\[([0-9;]*)([ABCEFGHJdf])|\r")
+
+
+def terminal_log_rows(payload: str) -> str:
+    row: str | None = None
+
+    def moved(match: re.Match[str]) -> str:
+        nonlocal row
+        kind = match.group(2)
+        if kind in {"C", "G"}:
+            return " "
+        target = (match.group(1) or "").split(";")[0] or "1" if kind in {"H", "f", "d"} else None
+        if target is not None and target == row:
+            return " "
+        row = target
+        return "\n"
+
+    return TERMINAL_CURSOR_MOVE.sub(moved, payload)
+
+
 def sanitized_log_text(payload: str) -> str:
+    payload = TERMINAL_SEQUENCE.sub("", payload)
     kept = []
     for character in payload:
         if character in "\n\t" or character.isprintable():
@@ -6703,7 +6730,13 @@ def hub_peek_lines(task: Task) -> list[str]:
             with log.open("rb") as handle:
                 handle.seek(max(0, log.stat().st_size - 65536))
                 output.extend(handle.read(65536))
-        return [sanitized_log_text(line).rstrip() for line in output.decode(errors="replace").splitlines()][-HUB_PEEK_CAPTURE_LINES:] or ["no saved output available"]
+        text = terminal_log_rows(output.decode(errors="replace"))
+        lines: list[str] = []
+        for raw in text.splitlines()[1:] if len(output) >= 65536 else text.splitlines():
+            line = re.sub(r" {2,}", "  ", sanitized_log_text(raw)).rstrip()
+            if len(line.strip()) > 2 and any(map(str.isalnum, line)) and (not lines or lines[-1] != line):
+                lines.append(line)
+        return lines[-HUB_PEEK_CAPTURE_LINES:] or ["no saved output available"]
     try:
         captured = tmux(
             ["capture-pane", "-p", "-J", "-S", f"-{HUB_PEEK_CAPTURE_LINES}", "-t", task.pane],
