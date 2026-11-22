@@ -3714,7 +3714,7 @@ def run_task(
                 raise CliLaneError("original conversation binding changed; reopen history before recovering")
             if not source.dead or not source.committed:
                 raise CliLaneError("the original job has not finished")
-            if not source.recovery_receipt:
+            if not source.recovery_receipt and not unknown_job_resumable(source):
                 raise CliLaneError("Recovery unavailable: job outcome or cleanup unknown. Inspect saved logs first.")
             if not managed_session_empty(source):
                 raise CliLaneError("the original job still has live descendants")
@@ -6511,7 +6511,7 @@ def resume_hub_task(
         raise CliLaneError(f"task is still initializing: {task.name}")
     if not task.dead:
         raise CliLaneError(f"task is still running: {task.name}")
-    if not task.recovery_receipt:
+    if not task.recovery_receipt and not unknown_job_resumable(task):
         raise CliLaneError("Recovery unavailable: job outcome or cleanup unknown. Inspect saved logs first.")
     if task.binding is not None:
         spec = claude_resume_spec(task, context)
@@ -6570,7 +6570,7 @@ def hub_history_batch(environment: Mapping[str, object]) -> int:
 
 
 def hub_resume_kind(task: Task, presets: Sequence[dict[str, object]]) -> str | None:
-    if not task.recovery_receipt:
+    if not task.recovery_receipt and not unknown_job_resumable(task):
         return None
     try:
         if task.binding is not None:
@@ -6587,7 +6587,7 @@ def hub_resume_kind(task: Task, presets: Sequence[dict[str, object]]) -> str | N
 
 
 def hub_resume_action(task: Task, presets: Sequence[dict[str, object]]) -> str:
-    if not task.recovery_receipt:
+    if not task.recovery_receipt and not unknown_job_resumable(task):
         return "recovery unavailable"
     kind = hub_resume_kind(task, presets)
     if task.binding is not None:
@@ -6782,10 +6782,10 @@ def hub_task_line(task: Task, width: int = 80) -> str:
     attached = " attached" if task.attached else ""
     label = hub_task_title(task)
     if task.archived or task.resumed_from:
-        label = f"{task.id[:8]} · {label}"
+        label = f"{label} · {task.id[:8]}"
     if width < 80:
         return f"{marker} {hub_task_state(task):<9} {label} · {agent}"
-    title_width = max(22, width - 55)
+    title_width = min(64, max(22, width - 55))
     title = fleet_display_cell(label, title_width)
     return (
         f"{marker}  {title}{' ' * max(0, title_width - display_width(title))} {agent:<12.12} "
@@ -6971,7 +6971,7 @@ def hub_draw(
             width,
         ),
         fleet_display_cell(
-            f"   {'SESSION':<{max(22, width - 55)}} {'AGENT':<12} {'STATE':<12} "
+            f"   {'SESSION':<{min(64, max(22, width - 55))}} {'AGENT':<12} {'STATE':<12} "
             f"{'AGE':>4}  {'ORIGIN':<6} PROJECT",
             width,
         ),
@@ -7017,7 +7017,12 @@ def hub_draw(
             detail = f"{outcome} · {detail}"
         hints = [opening + " · " + action, detail]
         if target.state == TASK_STATE_UNKNOWN:
-            hints[1] = "No exit receipt · outcome unknown · inspect saved output before starting new work"
+            if hub_resume_kind(target, presets):
+                hints[1] = "Terminal was lost before this job finished · its process is gone · Ctrl-R continues the conversation"
+            elif target.pid is not None and not managed_session_empty(target):
+                hints[1] = f"Terminal was lost but process {target.pid} is still running · stop it before resuming"
+            else:
+                hints[1] = "Terminal was lost before this job finished · outcome unknown · inspect saved output before starting new work"
     elif selected > len(tasks):
         hints = [
             "Enter opens a new shell in this project; drafts stay" if selected == len(tasks) + 3
@@ -7947,6 +7952,17 @@ def validated_supervisor(task: Task) -> int:
     if server_pid is not None and task.pid == server_pid:
         raise CliLaneError("refusing to signal the tmux server")
     return task.pid
+
+
+def unknown_job_resumable(task: Task) -> bool:
+    return (
+        task.state == TASK_STATE_UNKNOWN
+        and task.binding is None
+        and hub_command_kind(task.command) in HUB_RESUME_ARGUMENTS
+        and task.pid is not None
+        and bool(task.process_started)
+        and managed_session_empty(task)
+    )
 
 
 def managed_session_empty(task: Task) -> bool:
