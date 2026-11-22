@@ -2877,6 +2877,17 @@ def resolve_task(target: str, *, include_history: bool = False, exact_id: bool =
         return prefixed[0]
     if len(prefixed) > 1:
         raise CliLaneError(f"ambiguous task id: {target}")
+    saved = [] if exact_id else sorted(
+        (task for task in saved_tasks() if task.name == target and task.id not in {item.id for item in tasks}),
+        key=lambda task: task.created, reverse=True,
+    )
+    if saved:
+        ids = ", ".join(task.id[:8] for task in saved[:3])
+        raise CliLaneError(
+            f"task not found: {target}; no live task has that name, but saved job"
+            f"{'s' if len(saved) > 1 else ''} {ids}{', …' if len(saved) > 3 else ''} did; "
+            f"use the id, for example: {PROGRAM} log {saved[0].id[:8]}"
+        )
     raise CliLaneError(
         f"task not found: {target}; run '{PROGRAM} list' or '{PROGRAM} history' to see jobs"
     )
@@ -4127,6 +4138,9 @@ def print_fleet_results(results: Sequence[FleetResult], as_json: bool) -> int:
                 f"{host:<{host_width}} {name:<{name_width}} {state:<10} "
                 f"{task_age:<6} {pid:<8} {project:<{project_width}} {command}"
             )
+        idle = [result.name for result in results if result.status == "ok" and not result.tasks]
+        if idle:
+            print(f"no tasks on: {', '.join(idle)}")
     else:
         healthy = sum(result.status == "ok" for result in results)
         print(f"no tasks across {healthy} healthy host{'s' if healthy != 1 else ''}")
@@ -8238,11 +8252,11 @@ def print_orphans(as_json: bool) -> int:
         name_width = max(len("NAME"), *(len(record.name) for record in orphans))
         project_width = max(len("PROJECT"), *(len(project) for project in projects))
         print(
-            f"{'NAME':<{name_width}} {'AGE':<6} {'PROJECT':<{project_width}} COMMAND"
+            f"{'ID':<8} {'NAME':<{name_width}} {'AGE':<6} {'PROJECT':<{project_width}} COMMAND"
         )
         for record, project in zip(orphans, projects):
             print(
-                f"{record.name:<{name_width}} {age(record.created):<6} "
+                f"{record.id[:8]} {record.name:<{name_width}} {age(record.created):<6} "
                 f"{project:<{project_width}} {shlex.join(record.command)}"
             )
     if not as_json:

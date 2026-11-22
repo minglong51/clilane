@@ -496,7 +496,7 @@ named `agt` for compatibility with tasks created before the project was renamed.
 | `stop TARGET` | Send TERM, then KILL after `--grace` seconds. The default grace is 3 seconds. |
 | `rm`, `remove TARGET` | Remove a finished task and its logs. `--force` stops a running task first. |
 | `clean` | Remove completed, stopped, incomplete, and lost tasks. Running tasks and orphaned logs remain. `--dry-run` reports only; `--orphans` also deletes orphaned logs. |
-| `orphans` | List tasks whose tmux server died but whose logs survive. Supports `--json`. `log` and `status` then use the id from `history`, not the task name. |
+| `orphans` | List tasks whose tmux server died but whose logs survive. Supports `--json`. `log` and `status` then use the id shown there or in `history`, not the task name. |
 | `watch` | Refresh the current-host task list. `--interval` defaults to 1 second. |
 
 The `--on-exit` hook runs through `/bin/sh -c` in the task's working directory
