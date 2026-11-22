@@ -7849,7 +7849,7 @@ def send_task(target: str, message: str, enter: bool) -> int:
         buffer_name = f"agt_{uuid.uuid4().hex}"
         tmux(["load-buffer", "-b", buffer_name, "-"], input_data=message.encode())
         try:
-            command = ["paste-buffer", "-b", buffer_name, "-d", "-t", task.pane]
+            command = ["paste-buffer", "-p", "-b", buffer_name, "-d", "-t", task.pane]
             if enter:
                 command.extend([";", "send-keys", "-t", task.pane, "Enter"])
             tmux(command)
