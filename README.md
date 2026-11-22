@@ -434,9 +434,11 @@ named `agt` for compatibility with tasks created before the project was renamed.
 
 | Command | Behavior |
 |---|---|
-| `run NAME [-C DIR] [--on-exit COMMAND] [--wait] -- COMMAND [ARG ...]` | Start a raw background task. `DIR` defaults to the current directory. `--wait` blocks and returns the command's exit status; `--timeout` returns 124. |
+| `run NAME [-C DIR] [--on-exit COMMAND] [--wait] -- COMMAND [ARG ...]` | Start a raw background task. `DIR` defaults to the current directory. `--wait` blocks and returns the command's exit status; `--timeout` returns 124. `--json` emits one task receipt. `--request-id KEY` makes a retry reuse the original launch instead of starting a second one. |
 | `run NAME --profile PROFILE [-C DIR] [--on-exit COMMAND] [--wait]` | Start a task from a clean launch profile. The profile's cwd rule determines whether `-C` is required or forbidden. |
 | `list`, `ls`, `ps` | List tasks on the current host. `--json` emits an array. |
+| `history` | List retained jobs by ID, including finished ones whose terminal is gone. `--json` adds `title`, `terminal_available`, and `resumed_from`. |
+| `rename TARGET [TITLE]` | Set the display title shown in Sessions and `status`; omit `TITLE` to reset it. The task name used by other commands does not change. |
 | `fleet` | Read the configured local and SSH hosts. Supports `--config`, `--timeout`, `--json`, and `--watch` (`--interval` defaults to 2 seconds). |
 | `fleet status HOST:TASK` | Show one task on a fleet host as JSON. |
 | `fleet log HOST:TASK` | Read a fleet task's persistent log. `--lines` defaults to 200. |

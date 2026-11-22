@@ -3055,7 +3055,10 @@ def parse_run_request(parts: Sequence[str]) -> RunRequest:
         if token.startswith("-"):
             raise CliLaneError(f"unknown run option: {token}")
         if name is not None:
-            raise CliLaneError(f"unexpected run argument: {token}")
+            raise CliLaneError(
+                f"unexpected run argument: {token}; put -- before the command, "
+                f"for example: {PROGRAM} run {name} -- {token}"
+            )
         name = token
         index += 1
 
@@ -4069,6 +4072,7 @@ def fleet_verb(
 def watch_fleet(configured: str | None, timeout: float, interval: float) -> int:
     if not math.isfinite(interval) or interval <= 0:
         raise CliLaneError("interval must be positive")
+    require_watch_terminal("fleet")
     hosts = load_fleet_hosts(configured)
     while True:
         results = collect_fleet(hosts, timeout)
@@ -4130,7 +4134,7 @@ def print_fleet_results(results: Sequence[FleetResult], as_json: bool) -> int:
         if result.status == "error":
             print(
                 f"{PROGRAM}: fleet {result.name}: {result.error_kind}: "
-                f"{result.error_message}",
+                f"{str(result.error_message).removeprefix(str(result.error_kind) + ': ')}",
                 file=sys.stderr,
             )
     return 0 if complete else 1
@@ -4141,6 +4145,7 @@ def print_status(task: Task, as_json: bool) -> None:
         print(json.dumps(task.as_dict(), indent=2))
         return
     values = task.as_dict()
+    title = hub_task_title(hub_display_tasks([task])[0])
     keys = (
         "name",
         "id",
@@ -4160,6 +4165,8 @@ def print_status(task: Task, as_json: bool) -> None:
         elif isinstance(value, bool):
             value = "yes" if value else "no"
         print(f"{key}: {value}")
+        if key == "name" and title != task.name:
+            print(f"title: {title}")
     print(f"command: {shlex.join(task.command)}")
 
 
@@ -4858,6 +4865,11 @@ def hub_display_text(value: str, limit: int = 64) -> str:
 
 def hub_task_title(task: Task) -> str:
     return task.display_title or task.name
+
+
+def hub_task_label(task: Task) -> str:
+    title = hub_task_title(task)
+    return task.name if title == task.name else f"{title} ({task.name})"
 
 
 def hub_task_state(task: Task) -> str:
@@ -6778,14 +6790,14 @@ def hub_composer_line(
 def hub_no_presets_notice(
     config: str, *, config_present: bool, config_required: bool
 ) -> str:
+    home = str(Path.home())
+    if config.startswith(home + os.sep):
+        config = "~" + config[len(home):]
     if config_required:
         return f"Add agent presets to {config}"
     if config_present:
         return f"Config disables discovery · Remove it or add agent presets to {config}"
-    return (
-        "Install Codex, Kimi, or Claude · Or Kiro, Gemini, OMP, OpenCode, or another "
-        f"supported CLI · Add agent presets to {config}"
-    )
+    return f"No agent found · Install Codex, Kimi, or Claude · Or add presets to {config}"
 
 
 def hub_terminal_size() -> os.terminal_size:
@@ -6953,6 +6965,9 @@ def hub_draw(
         )
         opening = "Enter saved log" if target.archived else "Enter open · Space preview"
         detail = f"Attempt {target.id[:8]} · from {target.resumed_from[:8]}" if target.resumed_from else "Esc back · Help and Leave below"
+        if target.state == TASK_STATE_FAILED and not target.resumed_from:
+            outcome = f"Signal {target.signal_name}" if target.signal_name else f"Exit code {target.exit_code}"
+            detail = f"{outcome} · {detail}"
         hints = [opening + " · " + action, detail]
         if target.state == TASK_STATE_UNKNOWN:
             hints[1] = "No exit receipt · outcome unknown · inspect saved output before starting new work"
@@ -6963,8 +6978,10 @@ def hub_draw(
             else "Enter leaves CliLane; jobs keep running",
             "Up/Down choose · Esc back",
         ]
+    elif not preset:
+        hints = ["No agent to open yet · New shell and Help still work", "Up/Down choose · Esc back"]
     else:
-        name = str(preset["name"]) if preset else "agent"
+        name = str(preset["name"])
         hints = [
             f"Enter {'starts' if prompt else 'opens'} {name} · Tab/Shift-Tab agent",
             "Type inside the agent" if preset and hub_requires_native_prompt(preset)
@@ -6989,6 +7006,8 @@ def hub_draw(
                     hints[0] = "Ctrl-X remove"
             else:
                 hints[0] = "Enter open · Space preview"
+        elif selected == len(tasks) and not preset:
+            hints[0] = "No agent to open yet"
         elif selected == len(tasks):
             hints[0] = "Enter start · Tab agent" if prompt else "Enter open · Tab agent"
             if prompt and preset and hub_requires_native_prompt(preset):
@@ -7403,17 +7422,17 @@ def hub_ui(
                 action = "remove" if target.dead else "stop"
                 if confirmed and confirm_task == target.id and confirm_action == action:
                     confirm_task = confirm_action = confirm_hint = ""
-                    redraw(f"{'Stopping' if action == 'stop' else 'Removing'} {target.name}…")
+                    redraw(f"{'Stopping' if action == 'stop' else 'Removing'} {hub_task_label(target)}…")
                     try:
                         if action == "stop":
                             stop_task(target.id, HUB_ACTION_GRACE_SECONDS)
-                            notice = f"Stopped {target.name}"
+                            notice = f"Stopped {hub_task_label(target)}"
                         else:
                             remove_task(target.id, False, HUB_ACTION_GRACE_SECONDS)
                             drafts.pop(target.id, None)
                             if draft_key == target.id:
                                 prompt, cursor = "", 0
-                            notice = f"Removed {target.name}"
+                            notice = f"Removed {hub_task_label(target)}"
                             survivors = [item.id for item in all_tasks if item.id != target.id]
                             position = [item.id for item in all_tasks].index(target.id)
                             selected_key = survivors[min(position, len(survivors) - 1)] if survivors else ""
@@ -7425,7 +7444,7 @@ def hub_ui(
                     continue
                 confirm_task = target.id
                 confirm_action = action
-                confirm_hint = f"{action.capitalize()} {target.name}? Enter confirms · Esc cancels"
+                confirm_hint = f"{action.capitalize()} {hub_task_label(target)}? Enter confirms · Esc cancels"
                 continue
             if key == "resume":
                 if selected >= len(tasks):
@@ -7493,6 +7512,11 @@ def hub_ui(
                 continue
             if key == "text":
                 if not peek_key:
+                    if not prompt and selected < len(tasks) and not tasks[selected].dead and presets:
+                        notice = (
+                            "Typing starts a new session · Space first to reply to "
+                            f"{hub_task_title(tasks[selected])}"
+                        )
                     selected_key = ""
                 available = HUB_PROMPT_MAX_CHARS - len(prompt)
                 inserted = text_value[:available]
@@ -7526,7 +7550,7 @@ def hub_ui(
                 prompt = ""
                 cursor = 0
                 refresh_peek = True
-                notice = f"Sent to {target.name}"
+                notice = f"Sent to {hub_task_label(target)}"
                 continue
             if preset is None:
                 notice = hub_no_presets_notice(
@@ -7717,7 +7741,9 @@ def read_task(task: Task, all_history: bool) -> int:
         return 0
     start = "-" if all_history else "-200"
     captured = tmux(["capture-pane", "-p", "-J", "-S", start, "-t", task.pane])
-    sys.stdout.buffer.write(captured.stdout)
+    output = captured.stdout.rstrip(b"\n")
+    if output:
+        sys.stdout.buffer.write(output + b"\n")
     return 0
 
 
@@ -8227,9 +8253,17 @@ def print_orphans(as_json: bool) -> int:
     return 0
 
 
+def require_watch_terminal(snapshot: str) -> None:
+    if not sys.stdout.isatty():
+        raise CliLaneError(
+            f"watching needs an interactive terminal; use '{PROGRAM} {snapshot}' for one snapshot"
+        )
+
+
 def watch_tasks(interval: float) -> int:
     if interval <= 0:
         raise CliLaneError("interval must be positive")
+    require_watch_terminal("list")
     while True:
         sys.stdout.write("\033[2J\033[H")
         print_tasks(list_tasks(), as_json=False)
@@ -8254,38 +8288,19 @@ def parser() -> argparse.ArgumentParser:
   clilane status codex-app
   clilane attach codex-app
 
-Only tasks started through clilane appear. Click a session tab to switch, or
-use Left/Right at a recognized empty Claude, Codex, Kimi, OMP, or Kiro prompt.
-With text in the prompt, arrows move the cursor.
-Click Back to sessions, or press Ctrl-B once.
-Use Up/Down and Enter to choose a session, Help, or Leave CliLane. Esc goes back.
-Ctrl-B uses Control on both Mac and PC;
-no Command, Option, Fn, or Page keys are required. Windows clients use WSL or SSH.
-Native Ctrl-Q/Ctrl-C/Ctrl-D and modified Tab/Page keys pass through to agents.
-For OMP: Ctrl-D exits with an empty editor; with a draft it deletes forward.
-Ctrl-C leaves OMP's first-run setup and enters chat.
+Only tasks started through clilane appear.
 
-In Sessions, Enter opens a selected job; Ctrl-R explicitly resumes/reruns it.
-New session + Enter opens any agent. Space previews output and lets you reply.
-Esc goes back and keeps drafts until you leave CliLane. Ctrl-U clears; Ctrl-Y restores.
-Ctrl-A/E or Home/End moves to the start/end; Ctrl-W erases the previous word.
-Ctrl-X asks before stopping/removing a job; Enter confirms and Esc cancels.
-Ctrl-Q leaves CliLane; if drafts exist, confirm discarding them. Jobs keep running.
-Select New shell to open a fresh terminal in the current project; drafts stay.
-Use its tab to return to an existing shell. Observed nested agents keep pinned names.
-Titles follow the native agent title, then the first message submitted here.
-Use clilane rename TARGET TITLE to override a display title; omit TITLE to reset.
-Open means process alive. A * marks observed screen activity or foreground program.
-History keeps job records and saved logs after terminal loss. Enter opens saved output.
-Ctrl-R creates a new attempt and keeps the original. Unknown outcomes cannot be resumed.
-Use clilane history to find saved IDs, then clilane status ID or clilane log ID.
+Sessions (bare clilane): Up/Down and Enter choose a job, New session, Help, or
+Leave CliLane. Inside a job, Ctrl-B returns to Sessions. Jobs keep running
+when you leave. Select Help in Sessions for the full key list.
+
+Scripts need no terminal for list, status, history, read, log, send, key,
+wait, stop, and rm; list, status, and history accept --json.
+Run clilane COMMAND --help for one command.
 
 Without hub.json, Sessions discovers installed Codex, Kimi, Claude, OMP,
 Kiro CLI, Gemini, OpenCode, Copilot, Aider, Amp, Goose, Pi, Cursor Agent,
-Droid, Qwen Code, and Hermes commands on PATH. Select New session, use
-Tab/Shift-Tab to choose an agent, and press Enter with an empty composer.
-Type messages inside the agent. Codex/Kimi/Claude/OMP and supported Kiro chat
-commands also accept a first message in the Sessions composer.""",
+Droid, Qwen Code, and Hermes commands on PATH.""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     root.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -8542,7 +8557,7 @@ def execute(arguments: argparse.Namespace) -> int:
         else:
             for task in tasks:
                 parent = f" · from {task.resumed_from[:8]}" if task.resumed_from else ""
-                terminal = "saved log" if task.archived else "terminal"
+                terminal = "saved log" if task.archived else "terminal available"
                 print(f"{task.id[:8]}  {task.state:<10} {task.name} · {terminal}{parent}")
             if not tasks:
                 print("no retained jobs")
