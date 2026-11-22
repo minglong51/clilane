@@ -3055,7 +3055,10 @@ def parse_run_request(parts: Sequence[str]) -> RunRequest:
         if token.startswith("-"):
             raise CliLaneError(f"unknown run option: {token}")
         if name is not None:
-            raise CliLaneError(f"unexpected run argument: {token}")
+            raise CliLaneError(
+                f"unexpected run argument: {token}; put -- before the command, "
+                f"for example: {PROGRAM} run {name} -- {token}"
+            )
         name = token
         index += 1
 
@@ -4131,7 +4134,7 @@ def print_fleet_results(results: Sequence[FleetResult], as_json: bool) -> int:
         if result.status == "error":
             print(
                 f"{PROGRAM}: fleet {result.name}: {result.error_kind}: "
-                f"{result.error_message}",
+                f"{str(result.error_message).removeprefix(str(result.error_kind) + ': ')}",
                 file=sys.stderr,
             )
     return 0 if complete else 1
@@ -6962,6 +6965,9 @@ def hub_draw(
         )
         opening = "Enter saved log" if target.archived else "Enter open · Space preview"
         detail = f"Attempt {target.id[:8]} · from {target.resumed_from[:8]}" if target.resumed_from else "Esc back · Help and Leave below"
+        if target.state == TASK_STATE_FAILED and not target.resumed_from:
+            outcome = f"Signal {target.signal_name}" if target.signal_name else f"Exit code {target.exit_code}"
+            detail = f"{outcome} · {detail}"
         hints = [opening + " · " + action, detail]
         if target.state == TASK_STATE_UNKNOWN:
             hints[1] = "No exit receipt · outcome unknown · inspect saved output before starting new work"
@@ -7735,7 +7741,9 @@ def read_task(task: Task, all_history: bool) -> int:
         return 0
     start = "-" if all_history else "-200"
     captured = tmux(["capture-pane", "-p", "-J", "-S", start, "-t", task.pane])
-    sys.stdout.buffer.write(captured.stdout)
+    output = captured.stdout.rstrip(b"\n")
+    if output:
+        sys.stdout.buffer.write(output + b"\n")
     return 0
 
 
@@ -8280,38 +8288,19 @@ def parser() -> argparse.ArgumentParser:
   clilane status codex-app
   clilane attach codex-app
 
-Only tasks started through clilane appear. Click a session tab to switch, or
-use Left/Right at a recognized empty Claude, Codex, Kimi, OMP, or Kiro prompt.
-With text in the prompt, arrows move the cursor.
-Click Back to sessions, or press Ctrl-B once.
-Use Up/Down and Enter to choose a session, Help, or Leave CliLane. Esc goes back.
-Ctrl-B uses Control on both Mac and PC;
-no Command, Option, Fn, or Page keys are required. Windows clients use WSL or SSH.
-Native Ctrl-Q/Ctrl-C/Ctrl-D and modified Tab/Page keys pass through to agents.
-For OMP: Ctrl-D exits with an empty editor; with a draft it deletes forward.
-Ctrl-C leaves OMP's first-run setup and enters chat.
+Only tasks started through clilane appear.
 
-In Sessions, Enter opens a selected job; Ctrl-R explicitly resumes/reruns it.
-New session + Enter opens any agent. Space previews output and lets you reply.
-Esc goes back and keeps drafts until you leave CliLane. Ctrl-U clears; Ctrl-Y restores.
-Ctrl-A/E or Home/End moves to the start/end; Ctrl-W erases the previous word.
-Ctrl-X asks before stopping/removing a job; Enter confirms and Esc cancels.
-Ctrl-Q leaves CliLane; if drafts exist, confirm discarding them. Jobs keep running.
-Select New shell to open a fresh terminal in the current project; drafts stay.
-Use its tab to return to an existing shell. Observed nested agents keep pinned names.
-Titles follow the native agent title, then the first message submitted here.
-Use clilane rename TARGET TITLE to override a display title; omit TITLE to reset.
-Open means process alive. A * marks observed screen activity or foreground program.
-History keeps job records and saved logs after terminal loss. Enter opens saved output.
-Ctrl-R creates a new attempt and keeps the original. Unknown outcomes cannot be resumed.
-Use clilane history to find saved IDs, then clilane status ID or clilane log ID.
+Sessions (bare clilane): Up/Down and Enter choose a job, New session, Help, or
+Leave CliLane. Inside a job, Ctrl-B returns to Sessions. Jobs keep running
+when you leave. Select Help in Sessions for the full key list.
+
+Scripts need no terminal for list, status, history, read, log, send, key,
+wait, stop, and rm; list, status, and history accept --json.
+Run clilane COMMAND --help for one command.
 
 Without hub.json, Sessions discovers installed Codex, Kimi, Claude, OMP,
 Kiro CLI, Gemini, OpenCode, Copilot, Aider, Amp, Goose, Pi, Cursor Agent,
-Droid, Qwen Code, and Hermes commands on PATH. Select New session, use
-Tab/Shift-Tab to choose an agent, and press Enter with an empty composer.
-Type messages inside the agent. Codex/Kimi/Claude/OMP and supported Kiro chat
-commands also accept a first message in the Sessions composer.""",
+Droid, Qwen Code, and Hermes commands on PATH.""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     root.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -8568,7 +8557,7 @@ def execute(arguments: argparse.Namespace) -> int:
         else:
             for task in tasks:
                 parent = f" · from {task.resumed_from[:8]}" if task.resumed_from else ""
-                terminal = "saved log" if task.archived else "terminal"
+                terminal = "saved log" if task.archived else "terminal available"
                 print(f"{task.id[:8]}  {task.state:<10} {task.name} · {terminal}{parent}")
             if not tasks:
                 print("no retained jobs")
