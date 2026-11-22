@@ -1313,7 +1313,7 @@ def _exercise_switcher_sections(environment: dict[str, str], tool_bin: Path) -> 
         before = {session for session in sessions if session.startswith("agt_")}
         mark = terminal.mark()
         terminal.send(b"\r")
-        terminal.expect("Pane is dead", mark)
+        terminal.expect("Job ended", mark)
         assert terminal.running(), "Enter on a finished plain job left the client"
         mark = terminal.mark()
         terminal.send(b"\x02")

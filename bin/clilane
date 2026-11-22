@@ -298,6 +298,14 @@ TMUX_MIN_VERSION = (3, 6)
 TMUX_VERSION_PATTERN = re.compile(r"(\d+)\.(\d+)")
 
 
+DEAD_PANE_FORMAT = (
+    "Job ended"
+    "#{?#{!=:#{pane_dead_signal},}, · signal #{pane_dead_signal},}"
+    "#{?#{!=:#{pane_dead_status},}, · exit code #{pane_dead_status},}"
+    " · Ctrl-B opens Sessions"
+)
+
+
 class CliLaneError(Exception):
     pass
 
@@ -1436,13 +1444,7 @@ def claude_plain_command(command: Sequence[str]) -> bool:
     )
 
 
-def claude_tracking_executable(spec: LaunchSpec) -> str | None:
-    if (
-        Path(spec.command[0]).name != "claude"
-        or spec.provider not in {None, "claude"}
-        or not claude_plain_command(spec.command)
-    ):
-        return None
+def launch_executable(spec: LaunchSpec) -> str | None:
     search_path = os.pathsep.join(
         value if os.path.isabs(value) else os.path.join(spec.cwd, value)
         for value in spec.environment.get("PATH", os.defpath).split(os.pathsep)
@@ -1450,7 +1452,17 @@ def claude_tracking_executable(spec: LaunchSpec) -> str | None:
     requested = spec.command[0]
     if os.sep in requested and not os.path.isabs(requested):
         requested = os.path.join(spec.cwd, requested)
-    executable = shutil.which(requested, path=search_path)
+    return shutil.which(requested, path=search_path)
+
+
+def claude_tracking_executable(spec: LaunchSpec) -> str | None:
+    if (
+        Path(spec.command[0]).name != "claude"
+        or spec.provider not in {None, "claude"}
+        or not claude_plain_command(spec.command)
+    ):
+        return None
+    executable = launch_executable(spec)
     if executable is None:
         return None
     try:
@@ -2108,8 +2120,14 @@ def supervise(encoded_command: str) -> int:
         )
         try:
             os.execvpe(command[0], command, child_environment)
+        except FileNotFoundError:
+            print(f"{PROGRAM}: command not found: {command[0]}", file=sys.stderr)
+            os._exit(127)
         except OSError as error:
-            print(f"{PROGRAM}: {error}", file=sys.stderr)
+            print(
+                f"{PROGRAM}: cannot run {command[0]}: {error.strerror or error}",
+                file=sys.stderr,
+            )
             os._exit(127)
     status = 0
     shutdown_deadline: float | None = None
@@ -3267,11 +3285,22 @@ def read_launch_request(path: Path) -> dict[str, object]:
         raise LaunchRequestError("request_corrupt", "Request record cannot be verified; no replacement was launched") from error
 
 
+def warn_missing_executable(spec: LaunchSpec) -> None:
+    if launch_executable(spec) is None:
+        print(
+            f"{PROGRAM}: warning: command not found: {spec.command[0]}; "
+            "the task will fail with exit code 127",
+            file=sys.stderr,
+        )
+
+
 def run_requested_task(
     request: RunRequest, environment: Mapping[str, str], default_cwd: str,
 ) -> Task:
     if request.request_id is None:
-        return run_task(resolve_run_request(request, environment, default_cwd))
+        spec = resolve_run_request(request, environment, default_cwd)
+        warn_missing_executable(spec)
+        return run_task(spec)
     intent = launch_request_intent(request, default_cwd)
     fingerprint = selection_digest(intent)
     with launch_request_lock(request.request_id) as path:
@@ -3291,6 +3320,7 @@ def run_requested_task(
             return replace(task, launch_reused=True)
         normalized = replace(request, cwd=str(intent["cwd"]), cwd_explicit=True) if intent["cwd"] is not None else request
         spec = resolve_run_request(normalized, environment, default_cwd)
+        warn_missing_executable(spec)
         try:
             return run_task(spec, launch_request=(path, fingerprint))
         except (CliLaneError, OSError) as error:
@@ -3572,6 +3602,13 @@ def initial_task_queue(session: str, cwd: str, meta: Mapping[str, object]) -> li
         "on",
         ";",
         "set-option",
+        "-w",
+        "-t",
+        session,
+        "remain-on-exit-format",
+        DEAD_PANE_FORMAT,
+        ";",
+        "set-option",
         "-t",
         session,
         "@agt_meta",
@@ -3789,6 +3826,7 @@ def run_task(
             pane = replacement.stdout.decode().strip()
             tmux(["set-option", "-t", session, "@agt_pane", pane])
             tmux(["set-option", "-w", "-t", pane, "remain-on-exit", "on"])
+            tmux(["set-option", "-w", "-t", pane, "remain-on-exit-format", DEAD_PANE_FORMAT])
             tmux(["kill-window", "-t", placeholder_pane])
             tmux(
                 ["set-window-option", "-t", pane, "automatic-rename", "off"],
@@ -4166,6 +4204,14 @@ def discard_unattached_hub_context(context: str) -> None:
     tmux(["set-option", "-gu", hub_draft_option(context)], check=False)
 
 
+def announce_left() -> None:
+    running = sum(task.state in {"initializing", "running"} for task in list_tasks())
+    jobs = "no jobs running" if not running else f"{running} job{'s' if running != 1 else ''} still running"
+    if shutil.get_terminal_size().columns >= 80:
+        sys.stdout.write("\033[1A\033[2K\r")
+    print(f"Left CliLane · {jobs} · run '{PROGRAM}' to return", flush=True)
+
+
 def attach_client(arguments: Sequence[str]) -> int:
     require_attach_terminal()
     environment = os.environ.copy()
@@ -4182,6 +4228,8 @@ def attach_client(arguments: Sequence[str]) -> int:
     ):
         sys.stderr.write(detail)
         sys.stderr.flush()
+        if completed.returncode == 0:
+            announce_left()
         return completed.returncode
     sys.stderr.write(
         f"{PROGRAM}: cannot find terminfo for {term}; using {TERM_FALLBACK} for this "
@@ -6035,6 +6083,8 @@ def launch_hub_preset(
         profile=profile_name,
         provider=provider,
     )
+    if launch_executable(spec) is None:
+        raise CliLaneError(f"{selected['name']} is not installed · command not found: {spec.command[0]}")
     task = run_task(spec)
     hub_launch_created(task)
     if prompt:
