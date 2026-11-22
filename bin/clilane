@@ -4069,6 +4069,7 @@ def fleet_verb(
 def watch_fleet(configured: str | None, timeout: float, interval: float) -> int:
     if not math.isfinite(interval) or interval <= 0:
         raise CliLaneError("interval must be positive")
+    require_watch_terminal("fleet")
     hosts = load_fleet_hosts(configured)
     while True:
         results = collect_fleet(hosts, timeout)
@@ -4141,6 +4142,7 @@ def print_status(task: Task, as_json: bool) -> None:
         print(json.dumps(task.as_dict(), indent=2))
         return
     values = task.as_dict()
+    title = hub_task_title(hub_display_tasks([task])[0])
     keys = (
         "name",
         "id",
@@ -4160,6 +4162,8 @@ def print_status(task: Task, as_json: bool) -> None:
         elif isinstance(value, bool):
             value = "yes" if value else "no"
         print(f"{key}: {value}")
+        if key == "name" and title != task.name:
+            print(f"title: {title}")
     print(f"command: {shlex.join(task.command)}")
 
 
@@ -4858,6 +4862,11 @@ def hub_display_text(value: str, limit: int = 64) -> str:
 
 def hub_task_title(task: Task) -> str:
     return task.display_title or task.name
+
+
+def hub_task_label(task: Task) -> str:
+    title = hub_task_title(task)
+    return task.name if title == task.name else f"{title} ({task.name})"
 
 
 def hub_task_state(task: Task) -> str:
@@ -6778,14 +6787,14 @@ def hub_composer_line(
 def hub_no_presets_notice(
     config: str, *, config_present: bool, config_required: bool
 ) -> str:
+    home = str(Path.home())
+    if config.startswith(home + os.sep):
+        config = "~" + config[len(home):]
     if config_required:
         return f"Add agent presets to {config}"
     if config_present:
         return f"Config disables discovery · Remove it or add agent presets to {config}"
-    return (
-        "Install Codex, Kimi, or Claude · Or Kiro, Gemini, OMP, OpenCode, or another "
-        f"supported CLI · Add agent presets to {config}"
-    )
+    return f"No agent found · Install Codex, Kimi, or Claude · Or add presets to {config}"
 
 
 def hub_terminal_size() -> os.terminal_size:
@@ -6963,8 +6972,10 @@ def hub_draw(
             else "Enter leaves CliLane; jobs keep running",
             "Up/Down choose · Esc back",
         ]
+    elif not preset:
+        hints = ["No agent to open yet · New shell and Help still work", "Up/Down choose · Esc back"]
     else:
-        name = str(preset["name"]) if preset else "agent"
+        name = str(preset["name"])
         hints = [
             f"Enter {'starts' if prompt else 'opens'} {name} · Tab/Shift-Tab agent",
             "Type inside the agent" if preset and hub_requires_native_prompt(preset)
@@ -6989,6 +7000,8 @@ def hub_draw(
                     hints[0] = "Ctrl-X remove"
             else:
                 hints[0] = "Enter open · Space preview"
+        elif selected == len(tasks) and not preset:
+            hints[0] = "No agent to open yet"
         elif selected == len(tasks):
             hints[0] = "Enter start · Tab agent" if prompt else "Enter open · Tab agent"
             if prompt and preset and hub_requires_native_prompt(preset):
@@ -7403,17 +7416,17 @@ def hub_ui(
                 action = "remove" if target.dead else "stop"
                 if confirmed and confirm_task == target.id and confirm_action == action:
                     confirm_task = confirm_action = confirm_hint = ""
-                    redraw(f"{'Stopping' if action == 'stop' else 'Removing'} {target.name}…")
+                    redraw(f"{'Stopping' if action == 'stop' else 'Removing'} {hub_task_label(target)}…")
                     try:
                         if action == "stop":
                             stop_task(target.id, HUB_ACTION_GRACE_SECONDS)
-                            notice = f"Stopped {target.name}"
+                            notice = f"Stopped {hub_task_label(target)}"
                         else:
                             remove_task(target.id, False, HUB_ACTION_GRACE_SECONDS)
                             drafts.pop(target.id, None)
                             if draft_key == target.id:
                                 prompt, cursor = "", 0
-                            notice = f"Removed {target.name}"
+                            notice = f"Removed {hub_task_label(target)}"
                             survivors = [item.id for item in all_tasks if item.id != target.id]
                             position = [item.id for item in all_tasks].index(target.id)
                             selected_key = survivors[min(position, len(survivors) - 1)] if survivors else ""
@@ -7425,7 +7438,7 @@ def hub_ui(
                     continue
                 confirm_task = target.id
                 confirm_action = action
-                confirm_hint = f"{action.capitalize()} {target.name}? Enter confirms · Esc cancels"
+                confirm_hint = f"{action.capitalize()} {hub_task_label(target)}? Enter confirms · Esc cancels"
                 continue
             if key == "resume":
                 if selected >= len(tasks):
@@ -7493,6 +7506,11 @@ def hub_ui(
                 continue
             if key == "text":
                 if not peek_key:
+                    if not prompt and selected < len(tasks) and not tasks[selected].dead and presets:
+                        notice = (
+                            "Typing starts a new session · Space first to reply to "
+                            f"{hub_task_title(tasks[selected])}"
+                        )
                     selected_key = ""
                 available = HUB_PROMPT_MAX_CHARS - len(prompt)
                 inserted = text_value[:available]
@@ -7526,7 +7544,7 @@ def hub_ui(
                 prompt = ""
                 cursor = 0
                 refresh_peek = True
-                notice = f"Sent to {target.name}"
+                notice = f"Sent to {hub_task_label(target)}"
                 continue
             if preset is None:
                 notice = hub_no_presets_notice(
@@ -8227,9 +8245,17 @@ def print_orphans(as_json: bool) -> int:
     return 0
 
 
+def require_watch_terminal(snapshot: str) -> None:
+    if not sys.stdout.isatty():
+        raise CliLaneError(
+            f"watching needs an interactive terminal; use '{PROGRAM} {snapshot}' for one snapshot"
+        )
+
+
 def watch_tasks(interval: float) -> int:
     if interval <= 0:
         raise CliLaneError("interval must be positive")
+    require_watch_terminal("list")
     while True:
         sys.stdout.write("\033[2J\033[H")
         print_tasks(list_tasks(), as_json=False)
