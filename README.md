@@ -384,13 +384,27 @@ the original profile and launch environment. If that exit record is missing or
 the launch identity changed, CLI Lane refuses automatic resume; use Claude's
 native session picker with the original profile instead.
 
-Other agent jobs preserve an explicit resume selection when present. Otherwise,
-Claude and Kimi use `--continue`, and Codex uses `resume --last`; these select the
-provider's latest conversation, which may differ from the job you selected.
-Automatic final-conversation tracking for Codex and Kimi is not available. These
-jobs relaunch through a matching configured preset, including its clean profile,
-or through the raw environment when no preset matches. Unsupported fork commands
-are refused; non-agent jobs rerun their saved command.
+Codex and OMP print a resume command with their conversation id when they exit.
+CLI Lane reads that id from the end of the job's own log, so `Ctrl-R` on such a
+job shows `resume recorded ID` and reopens that exact conversation. `status`
+shows it as `conversation:` and `history --json` as `session_id`. Nothing is
+recorded while the agent runs, so a job that never printed the line has no id.
+
+Without a recorded id, other agent jobs preserve an explicit resume selection
+when present. Otherwise, Claude and Kimi use `--continue`, Codex uses
+`resume --last`, and OMP opens its session picker; the footer says
+`resume latest`, because the provider's latest conversation may differ from the
+job you selected. These jobs relaunch through a matching configured preset,
+including its clean profile, or through the raw environment when no preset
+matches. Unsupported fork commands are refused; non-agent jobs rerun their saved
+command.
+
+A job whose terminal was lost before it finished has state `unknown`. A Codex,
+Kimi, or OMP job in that state can be resumed once its process is confirmed
+gone: the recorded process and its session no longer exist, or the job predates
+the last boot. If the process is still running, Sessions names its pid and
+refuses. Claude jobs keep the clean-exit rule above, and a plain command with an
+unknown outcome is never rerun.
 
 The list is split into `ONGOING` jobs and `HISTORY`, newest first. History shows
 the latest 20 finished jobs; moving the selection past the last one reveals the
@@ -615,7 +629,8 @@ logs under `~/.local/state/agt` remain readable for compatibility.
   on disk and `orphans` lists it. `log` and `status` then need the id from
   `history`, not the task name. If the supervisor is still able to wait for
   the child, it stores that exit in history. If it dies first, the saved
-  outcome stays `unknown`.
+  outcome stays `unknown`. An agent job in that state can still be resumed from
+  Sessions once its process is confirmed gone.
 - A descendant that creates a new POSIX session can escape lifecycle control.
 - No queueing, by design: a task starts immediately or not at all. Sequential
   workflows compose from `run --wait` and `--on-exit`; anything beyond that

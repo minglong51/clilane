@@ -4208,6 +4208,8 @@ def print_status(task: Task, as_json: bool) -> None:
         print(f"{key}: {value}")
         if key == "name" and title != task.name:
             print(f"title: {title}")
+        if key == "state" and (session_id := task_session_id(task)) is not None:
+            print(f"conversation: {session_id}")
     print(f"command: {shlex.join(task.command)}")
 
 
@@ -6288,6 +6290,62 @@ def hub_omp_resume_command(command: Sequence[str], name: str) -> list[str]:
     return [*result, "--resume"]
 
 
+SESSION_ID_PATTERN = r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}"
+EXIT_RESUME_HINTS = {
+    "codex": re.compile(rf"codex resume ({SESSION_ID_PATTERN})"),
+    "omp": re.compile(rf"omp --resume ({SESSION_ID_PATTERN})"),
+}
+EXIT_SESSION_IDS: dict[str, str | None] = {}
+
+
+def exit_session_id(task: Task, kind: str | None) -> str | None:
+    pattern = EXIT_RESUME_HINTS.get(kind or "")
+    if pattern is None or not task.dead:
+        return None
+    if task.state != TASK_STATE_UNKNOWN and (
+        task.exit_code != 0 or task.signal_name or task.stop_requested
+    ):
+        return None
+    if task.id in EXIT_SESSION_IDS:
+        return EXIT_SESSION_IDS[task.id]
+    found: str | None = None
+    try:
+        path = validated_log_path(task)
+        with path.open("rb") as handle:
+            handle.seek(max(0, path.stat().st_size - 16384))
+            text = handle.read(16384).decode(errors="replace")
+        text = re.sub(r"\s+", " ", TERMINAL_SEQUENCE.sub(" ", text))[-2000:]
+        matches = pattern.findall(text)
+        found = matches[-1] if matches else None
+    except (CliLaneError, OSError):
+        return None
+    EXIT_SESSION_IDS[task.id] = found
+    return found
+
+
+def task_session_id(task: Task) -> str | None:
+    if task.binding is not None:
+        try:
+            return claude_resume_id(task)
+        except CliLaneError:
+            return None
+    return exit_session_id(task, hub_command_kind(task.command))
+
+
+def hub_task_resume_command(task: Task, kind: str | None) -> list[str]:
+    generic = hub_resume_command(task.command, kind, task.name)
+    session_id = exit_session_id(task, kind)
+    if session_id is None:
+        return generic
+    if kind == "omp":
+        return [*hub_omp_resume_command(task.command, task.name), session_id]
+    command = list(task.command)
+    option_end = command.index("--") if "--" in command else len(command)
+    if hub_provider_subcommand(command, "codex") == "resume":
+        option_end = command.index("resume")
+    return [*command[:option_end], "resume", session_id]
+
+
 def hub_resume_command(command: Sequence[str], kind: str | None, name: str) -> list[str]:
     if kind is None:
         return list(command)
@@ -6529,7 +6587,7 @@ def resume_hub_task(
         spec = complete_launch_spec(
             name=task.name,
             cwd_value=task.cwd,
-            command=hub_resume_command(task.command, kind, task.name),
+            command=hub_task_resume_command(task, kind),
             wait=False,
             timeout=None,
             on_exit=None,
@@ -6592,6 +6650,8 @@ def hub_resume_action(task: Task, presets: Sequence[dict[str, object]]) -> str:
     kind = hub_resume_kind(task, presets)
     if task.binding is not None:
         return "resume recorded ID" if kind == "claude" else "resume unavailable"
+    if exit_session_id(task, kind) is not None:
+        return "resume recorded ID"
     if kind == "omp":
         return "choose saved session"
     if kind is None:
@@ -7954,14 +8014,47 @@ def validated_supervisor(task: Task) -> int:
     return task.pid
 
 
+BOOT_TIME: list[float | None] = []
+
+
+def system_boot_time() -> float | None:
+    if not BOOT_TIME:
+        value: float | None = None
+        try:
+            if sys.platform == "linux":
+                for line in Path("/proc/stat").read_text().splitlines():
+                    if line.startswith("btime "):
+                        value = float(line.split()[1])
+            else:
+                completed = subprocess.run(
+                    ["/usr/sbin/sysctl", "-n", "kern.boottime"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=2,
+                )
+                match = re.search(rb"sec = (\d+)", completed.stdout)
+                value = float(match.group(1)) if match else None
+        except (OSError, ValueError, subprocess.SubprocessError):
+            value = None
+        BOOT_TIME.append(value)
+    return BOOT_TIME[0]
+
+
+def created_before_boot(task: Task) -> bool:
+    boot = system_boot_time()
+    try:
+        return boot is not None and datetime.fromisoformat(task.created).timestamp() < boot
+    except ValueError:
+        return False
+
+
 def unknown_job_resumable(task: Task) -> bool:
     return (
         task.state == TASK_STATE_UNKNOWN
         and task.binding is None
         and hub_command_kind(task.command) in HUB_RESUME_ARGUMENTS
-        and task.pid is not None
-        and bool(task.process_started)
-        and managed_session_empty(task)
+        and (
+            created_before_boot(task)
+            or (task.pid is not None and bool(task.process_started) and managed_session_empty(task))
+        )
     )
 
 
@@ -8614,7 +8707,8 @@ def execute(arguments: argparse.Namespace) -> int:
         if arguments.json:
             print(json.dumps([
                 {**task.as_dict(), "terminal_available": not task.archived,
-                 "resumed_from": task.resumed_from or None, "title": hub_task_title(task)}
+                 "resumed_from": task.resumed_from or None, "title": hub_task_title(task),
+                 "session_id": task_session_id(task)}
                 for task in tasks
             ], indent=2))
         else:
