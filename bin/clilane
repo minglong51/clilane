@@ -5035,11 +5035,18 @@ def hub_navigation_status(source: str, columns: str) -> int:
     }
     back = "‹ Back to sessions [Ctrl-B]" if width >= 64 else "‹ Back [Ctrl-B]"
     status = "#[align=left range=left bold] " + back + " #[norange nobold] "
-    status += "#[list=on]#[list=left-marker range=user|previous]‹ #[list=right-marker range=user|next] ›#[norange list=on]"
+    current = next((task for task in tasks if task.session == source), None)
+    right = ""
+    if current is not None and width >= 95:
+        provider = Path(current.command[0]).name if current.command else ""
+        if current.observed_program:
+            provider = f"{current.observed_program}*"
+        right = hub_display_text(f"{provider} · {hub_task_state(current)}", 32) + " "
+    tabs: list[tuple[str, int, bool]] = []
     for task in visible:
         if not task.display_session:
             continue
-        title = labels[task.id].replace("#", "##")
+        title = labels[task.id]
         duplicate = sum(label == labels[task.id] for label in labels.values()) > 1
         if duplicate:
             title += " · " + task.id[:4]
@@ -5048,18 +5055,40 @@ def hub_navigation_status(source: str, columns: str) -> int:
             title = ("BOT" if task.origin == "bot" else "LOCAL") + " · " + title
         elif task.origin == "bot":
             title += " · bot"
+        suffix = " · " + task.state if selected and task.dead else ""
         style = " list=focus bold reverse" if selected else ""
-        status += f"#[range=session|{task.display_session}{style}] {title}"
-        if selected and task.dead:
-            status += " · " + task.state
-        status += " #[norange nobold noreverse list=on] "
+        markup = (
+            f"#[range=session|{task.display_session}{style}] {title.replace('#', '##')}{suffix}"
+            " #[norange nobold noreverse list=on] "
+        )
+        tabs.append((markup, display_width(title) + display_width(suffix) + 3, selected))
+    room = width - display_width(back) - 3 - display_width(right) - 6
+    first, last = 0, len(tabs)
+    focus = next((index for index, tab in enumerate(tabs) if tab[2]), None)
+
+    def fits(start: int, end: int) -> bool:
+        markers = 2 * (start > 0) + 2 * (end < len(tabs))
+        return sum(tab[1] for tab in tabs[start:end]) + markers <= room
+
+    if focus is not None and not fits(first, last):
+        first, last = focus, focus + 1
+        grew = True
+        while grew:
+            grew = False
+            if last < len(tabs) and fits(first, last + 1):
+                last += 1
+                grew = True
+            if first > 0 and fits(first - 1, last):
+                first -= 1
+                grew = True
+    status += "#[list=on]#[list=left-marker range=user|previous]‹ #[list=right-marker range=user|next] ›#[norange list=on]"
+    if first > 0:
+        status += "#[range=user|previous]‹ #[norange list=on]"
+    status += "".join(tab[0] for tab in tabs[first:last])
+    if last < len(tabs):
+        status += "#[range=user|next]› #[norange list=on]"
     status += "#[nolist align=right]"
-    current = next((task for task in tasks if task.session == source), None)
-    if current is not None and width >= 95:
-        provider = Path(current.command[0]).name if current.command else ""
-        if current.observed_program:
-            provider = f"{current.observed_program}*"
-        status += hub_display_text(f"{provider} · {hub_task_state(current)}", 32).replace("#", "##") + " "
+    status += right.replace("#", "##")
     status += "#[range=user|previous] ‹ #[range=user|next] › #[norange]"
     print(status)
     return 0
