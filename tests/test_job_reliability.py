@@ -117,6 +117,103 @@ class JobReliabilityTests(unittest.TestCase):
             clilane.resume_hub_task(archived, [], "")
         self.assertNotEqual(self.cli("wait", task.id).returncode, 0)
 
+    def fake_codex(self) -> str:
+        directory = self.root / "bin"
+        directory.mkdir(exist_ok=True)
+        script = directory / "codex"
+        script.write_text(
+            "#!" + sys.executable + "\n"
+            "import signal, sys, time\n"
+            "if '--stay' in sys.argv:\n"
+            "    signal.signal(signal.SIGHUP, signal.SIG_IGN)\n"
+            "    print('fake codex waiting', flush=True)\n"
+            "    time.sleep(60)\n"
+            "print('Token usage: total=1')\n"
+            "print('To continue this session, run codex resume " + self.conversation + "')\n"
+            "raise SystemExit(3 if '--fail' in sys.argv else 0)\n"
+        )
+        script.chmod(0o755)
+        path = f"{directory}{os.pathsep}{self.environment['PATH']}"
+        self.environment["PATH"] = path
+        os.environ["PATH"] = path
+        return str(script)
+
+    conversation = "01a20235-aaaa-bbbb-cccc-000000000001"
+
+    def test_unknown_agent_job_resumes_only_after_its_process_is_gone(self) -> None:
+        self.fake_codex()
+        self.launch("keeper", ["/bin/sleep", "60"])
+        result, data = self.launch("agent", ["codex", "--stay"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        task = clilane.resolve_task(str(data["id"]), exact_id=True)
+        deadline = time.monotonic() + 10
+        while b"fake codex waiting" not in Path(task.log).read_bytes():
+            self.assertLess(time.monotonic(), deadline, "stand-in agent did not start")
+            time.sleep(0.05)
+        os.kill(task.pid, signal.SIGKILL)
+        clilane.tmux(["kill-session", "-t", task.session])
+        archived = clilane.resolve_task(task.id, include_history=True, exact_id=True)
+        self.assertEqual(archived.state, "unknown")
+        self.assertFalse(clilane.managed_session_empty(archived))
+        self.assertFalse(clilane.unknown_job_resumable(archived))
+        with self.assertRaisesRegex(clilane.CliLaneError, "unknown"):
+            clilane.resume_hub_task(archived, [], self.context())
+        clilane.terminate_session_descendants(task.pid, 0, task.process_started)
+        self.assertTrue(clilane.unknown_job_resumable(archived))
+        self.assertEqual(clilane.hub_resume_action(archived, []), "resume latest in project")
+        resumed = clilane.resume_hub_task(archived, [], self.context())
+        self.assertEqual(resumed.command, ["codex", "--stay", "resume", "--last"])
+        self.assertEqual(resumed.resumed_from, task.id)
+
+    def test_exit_resume_line_selects_the_recorded_conversation(self) -> None:
+        self.fake_codex()
+        result, data = self.launch("done", ["codex", "--model", "x"], "--wait")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        task = clilane.resolve_task(str(data["id"]), exact_id=True)
+        self.assertEqual(clilane.task_session_id(task), self.conversation)
+        self.assertEqual(clilane.hub_resume_action(task, []), "resume recorded ID")
+        expected = ["codex", "--model", "x", "resume", self.conversation]
+        self.assertEqual(clilane.hub_task_resume_command(task, "codex"), expected)
+        self.assertIn(f"conversation: {self.conversation}", self.cli("status", "done").stdout)
+        resumed = clilane.resume_hub_task(task, [], self.context())
+        self.assertEqual(resumed.command, expected)
+        self.assertEqual(self.cli("wait", resumed.id, "--timeout", "10").returncode, 0)
+        again = clilane.resolve_task(resumed.id, exact_id=True)
+        self.assertEqual(clilane.hub_task_resume_command(again, "codex"), expected)
+
+        failed, failed_data = self.launch("broken", ["codex", "--fail"], "--wait")
+        self.assertEqual(failed.returncode, 3, failed.stderr)
+        broken = clilane.resolve_task(str(failed_data["id"]), exact_id=True)
+        self.assertIsNone(clilane.task_session_id(broken))
+
+    def test_send_pastes_in_bracketed_mode_before_enter(self) -> None:
+        received = self.root / "received"
+        reader = (
+            "import os, sys, termios, tty\n"
+            "fd = sys.stdin.fileno(); tty.setraw(fd)\n"
+            "sys.stdout.write('\\x1b[?2004hreader-ready'); sys.stdout.flush()\n"
+            "data = b''\n"
+            "while not data.endswith(b'\\r'):\n"
+            "    data += os.read(fd, 64)\n"
+            f"open({str(received)!r}, 'wb').write(data)\n"
+        )
+        result, data = self.launch("reader", [sys.executable, "-c", reader])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = Path(clilane.resolve_task(str(data["id"]), exact_id=True).log)
+        deadline = time.monotonic() + 10
+        while b"reader-ready" not in log.read_bytes():
+            self.assertLess(time.monotonic(), deadline, "reader did not start")
+            time.sleep(0.05)
+        self.assertEqual(self.cli("send", "reader", "two words").returncode, 0)
+        self.assertEqual(self.cli("wait", "reader", "--timeout", "10").returncode, 0)
+        self.assertEqual(received.read_bytes(), b"\x1b[200~two words\x1b[201~\r")
+
+    def test_read_of_a_finished_job_ends_at_its_last_line(self) -> None:
+        result, _ = self.launch("finished", ["/bin/sh", "-c", "echo first; echo last"], "--wait")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.cli("read", "finished").stdout, "first\nlast\n")
+        self.assertEqual(self.cli("read", "finished", "--all").stdout, "first\nlast\n")
+
     def test_failed_recovery_keeps_original_record_and_output(self) -> None:
         result, data = self.launch("original", ["/bin/echo", "preserved"], "--wait")
         self.assertEqual(result.returncode, 0, result.stderr)
