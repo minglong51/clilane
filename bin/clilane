@@ -7892,6 +7892,10 @@ def read_task(task: Task, all_history: bool) -> int:
     start = "-" if all_history else "-200"
     captured = tmux(["capture-pane", "-p", "-J", "-S", start, "-t", task.pane])
     output = captured.stdout.rstrip(b"\n")
+    if task.dead:
+        body, _, last = output.rpartition(b"\n")
+        if last.startswith(b"Job ended"):
+            output = body.rstrip(b"\n")
     if output:
         sys.stdout.buffer.write(output + b"\n")
     return 0
